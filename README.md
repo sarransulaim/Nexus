@@ -531,7 +531,7 @@ For omnichannel testing, a tunnel (e.g. ngrok) exposes the local webhook to Twil
 
 ## Built By
 
-Nexus Command is built by a **solo founder**, designed feature-by-feature and architected from the ground up — multi-agent model, negotiation, omnichannel, and all. It's a living project, still early and still rough in places, shared in the spirit of building in public.
+Nexus Command is built by a **SOLO FOUNDER : SULAIM MAHSAN SARRAN**, designed feature-by-feature and architected from the ground up — multi-agent model, negotiation, omnichannel, and all. It's a living project, still early and still rough in places, shared in the spirit of building in public.
 
 The philosophy: **ship the wow, stay honest about the gaps, and move faster than anyone could copy.**
 
