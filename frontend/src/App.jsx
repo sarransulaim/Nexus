@@ -7,6 +7,7 @@ import { Icon, ICON, PriorityBadge, StatusBadge, TypingIndicator, Avatar, Progre
 import Login      from './pages/Login';
 import Dashboard  from './pages/Dashboard';
 import Commands   from './pages/Commands';
+import ChatPage   from './pages/ChatPage';
 import Database   from './pages/Database';
 import TeamMatrix from './pages/TeamMatrix';
 import Directives from './pages/Directives';
@@ -19,11 +20,15 @@ import SettingsPage    from './pages/SettingsPage';
 import ApprovalsPage   from './pages/ApprovalsPage';
 import GoalsPage       from './pages/GoalsPage';
 import MeetingsPage    from './pages/MeetingsPage';
+import AdminPage       from './pages/AdminPage';
+import ConnectionsPage from './pages/ConnectionsPage';
+
 
 /* ─── Page metadata ──────────────────────────────────────────── */
 const PAGE_META = {
   dashboard:   { title: 'Dashboard',        sub: 'Real-time org overview and agent telemetry' },
   commands:    { title: 'AI Commands',       sub: 'Natural language interface to Nexus' },
+  chat:        { title: 'Team Chat',          sub: 'Project channels with AI summaries' },
   tasks:       { title: 'Task Registry',     sub: 'All directives across the organization' },
   team:        { title: 'Team Matrix',       sub: 'Workload distribution and team coordination' },
   database:    { title: 'Database',          sub: 'Raw schema and AI-driven CRUD operations' },
@@ -35,6 +40,8 @@ const PAGE_META = {
   approvals:   { title: 'Approvals',         sub: 'Pending agent action reviews' },
   goals:       { title: 'Goals',             sub: 'OKRs and objective tracking' },
   meetings:    { title: 'Meetings',          sub: 'Scheduled meetings and transcripts' },
+  admin:       { title: 'Admin',             sub: 'User management and system configuration' },
+  connections: { title: 'Connections',      sub: 'Integration and service connection status' },
 };
 
 /* ─── Sidebar ────────────────────────────────────────────────── */
@@ -47,6 +54,7 @@ function Sidebar({ currentUser, activeTab, setActiveTab, isSyncing, handleDiscon
       items: [
         { id: 'dashboard',  label: 'Dashboard',   icon: ICON.dashboard  },
         { id: 'commands',   label: 'AI Commands', icon: ICON.commands   },
+        { id: 'chat',       label: 'Team Chat',   icon: ICON.team       },
       ],
     },
     {
@@ -62,7 +70,7 @@ function Sidebar({ currentUser, activeTab, setActiveTab, isSyncing, handleDiscon
       label: 'Intelligence',
       items: [
         { id: 'google',    label: 'Google Workspace', icon: ICON.gmail,      soon: true },
-        { id: 'analytics', label: 'Analytics',        icon: ICON.analytics,  soon: true },
+        { id: 'analytics', label: 'Analytics',        icon: ICON.analytics},
       ],
     },
     {
@@ -71,6 +79,8 @@ function Sidebar({ currentUser, activeTab, setActiveTab, isSyncing, handleDiscon
         { id: 'integrations', label: 'Integrations', icon: ICON.integrations, soon: true },
         { id: 'approvals',    label: 'Approvals',    icon: ICON.approvals,   soon: true },
         { id: 'database',     label: 'Database',     icon: ICON.database     },
+        { id: 'admin',        label: 'Admin',        icon: ICON.settings     },
+        { id: 'connections',  label: 'Connections',  icon: ICON.integrations },
         { id: 'settings',     label: 'Settings',     icon: ICON.settings,    soon: true },
       ],
     },
@@ -82,6 +92,8 @@ function Sidebar({ currentUser, activeTab, setActiveTab, isSyncing, handleDiscon
       items: [
         { id: 'directives', label: 'My Directives', icon: ICON.directives },
         { id: 'commands',   label: 'AI Co-Pilot',   icon: ICON.commands   },
+        { id: 'chat',       label: 'Team Chat',     icon: ICON.team       },
+        { id: 'connections', label: 'Connections',  icon: ICON.integrations },
       ],
     },
     {
@@ -261,14 +273,12 @@ function TopBar({ activeTab, currentUser, notifications, unreadCount, markNotifi
             System Audit
           </button>
         )}
-        {currentUser?.role === 'Employee' && (
-          <NotificationBell
-            notifications={notifications}
-            unreadCount={unreadCount}
-            markNotificationRead={markNotificationRead}
-            markAllNotificationsRead={markAllNotificationsRead}
-          />
-        )}
+        <NotificationBell
+          notifications={notifications}
+          unreadCount={unreadCount}
+          markNotificationRead={markNotificationRead}
+          markAllNotificationsRead={markAllNotificationsRead}
+        />
       </div>
     </header>
   );
@@ -486,6 +496,7 @@ function MainApp() {
         <main className="nx-page">
           {activeTab === 'dashboard'    && <Dashboard />}
           {activeTab === 'commands'     && <Commands />}
+          {activeTab === 'chat'         && <ChatPage />}
           {activeTab === 'team'         && <TeamMatrix />}
           {activeTab === 'directives'   && <Directives />}
           {activeTab === 'database'     && <Database />}
@@ -499,6 +510,8 @@ function MainApp() {
           {activeTab === 'tasks' && currentUser?.role === 'Manager' && (
             <TaskRegistry tasks={tasks || []} employees={employees || []} setSelectedTask={setSelectedTask} />
           )}
+          {activeTab === 'admin'        && currentUser?.role === 'Manager' && <AdminPage />}
+          {activeTab === 'connections' && <ConnectionsPage />}
         </main>
       </div>
 

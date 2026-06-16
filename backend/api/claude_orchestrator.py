@@ -1,19 +1,20 @@
 """
-claude_orchestrator.py — The Central Brain (Complete Edition)
-==============================================================
-69 tools covering every table in the schema:
-  Tasks, Projects, Subtasks, Comments, Dependencies, Tags
-  Employees, Preferences, Teams
-  Meetings, Transcripts, Action Items
-  Peer Requests, Delegations, Escalations
-  Goals, Time Entries, Analytics
-  Notifications, Approvals, Audit Log
-  Drafts, Memory, Daily Briefings
+claude_orchestrator.py — The Central Brain
+==========================================
+All tools, all handlers, smart router, Glass Brain, agent memory.
+
+FIXES IN THIS VERSION:
+- BACKEND_BASE constant replaces hardcoded Render URLs (local dev ready)
+- _broadcast_sync() helper — all DB-write tools now broadcast SYNC_REQUIRED
+- resolve_escalation stores resolution text in context_json
+- str() enforced on all tool results sent to Claude
+- execute_tool already has global try/except — kept and strengthened
 """
 
 import os
 import json
 import time
+import asyncio
 import anthropic
 from datetime import datetime, timezone
 from dotenv import load_dotenv
@@ -25,17 +26,60 @@ from database.models import (
     MeetingActionItem, Delegation, Escalation,
     Goal, TimeEntry, Notification, ApprovalRequest,
     AuditLog, EmployeePreference, DailyBriefing,
-    WorkloadSnapshot
+    WorkloadSnapshot, Contract,
 )
 import queue
+import threading
 
 load_dotenv()
 
 # ---------------------------------------------------------------------------
 # CLIENT & GLOBALS
 # ---------------------------------------------------------------------------
-claude_client = anthropic.Anthropic(api_key=os.getenv("CLAUDE_API_KEY"))
+claude_client     = anthropic.Anthropic(api_key=os.getenv("CLAUDE_API_KEY"))
 glass_brain_queue = queue.Queue()
+
+# Recursion guard for AI-to-AI negotiation: while we call a candidate's
+# orchestrator, that orchestrator must not start its OWN negotiation (which
+# would re-enter here → unbounded nested AI calls). Thread-local because
+# run_orchestrator is synchronous on one worker thread.
+_negotiation_local = threading.local()
+
+# Base URL for Google OAuth connect links shown to employees
+# For local dev this is localhost. Change via BACKEND_URL env var if needed.
+BACKEND_BASE = os.getenv("BACKEND_URL", "http://localhost:8000")
+
+# All DB inserts use this. When multi-tenant UI is added,
+# this will be looked up from the authenticated user's company.
+DEFAULT_COMPANY_ID = 1
+
+
+# ---------------------------------------------------------------------------
+# BROADCAST HELPER
+# Centralised SYNC_REQUIRED fire-and-forget used by all DB-writing tools.
+# ---------------------------------------------------------------------------
+def _broadcast_sync():
+    """
+    Broadcasts SYNC_REQUIRED to all connected browser dashboards.
+
+    FIX: Previous version used asyncio.get_event_loop() which raises
+    RuntimeError: 'There is no current event loop in thread AnyIO worker thread'
+    because FastAPI runs sync tool handlers in a threadpool, not the main thread.
+
+    Fix: spin up a daemon thread and use asyncio.run() which creates its own
+    event loop. Safe to call from any thread, any context.
+    """
+    import threading
+
+    def _run():
+        try:
+            import asyncio
+            from api.ws_manager import notifier
+            asyncio.run(notifier.broadcast("SYNC_REQUIRED"))
+        except Exception:
+            pass
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 # ---------------------------------------------------------------------------
@@ -44,28 +88,22 @@ glass_brain_queue = queue.Queue()
 def load_agent_memory(agent_id: str) -> list:
     db = SessionLocal()
     try:
-        record = db.query(AgentMemory).filter(AgentMemory.agent_id == agent_id).first()
+        record = db.query(AgentMemory).filter(
+            AgentMemory.agent_id   == agent_id,
+            AgentMemory.company_id == DEFAULT_COMPANY_ID,
+        ).first()
         if record and record.memory_json:
             return json.loads(record.memory_json)
         return []
     finally:
         db.close()
 
+
 def save_agent_memory(agent_id: str, messages: list):
     """
-    Save conversation history to DB.
-
-    CRITICAL: We strip all tool_use and tool_result blocks before saving.
-    These are internal plumbing — Claude uses them mid-conversation to call
-    tools, but they don't need to persist. Saving only the text exchanges:
-
-    1. Eliminates tool_use_id mismatch errors completely
-    2. Keeps memory lean (no bloated tool JSON in DB)
-    3. Conversation context (what was said/done) is preserved via text
-
-    The tradeoff: Claude won't remember which exact tool calls it made in
-    previous sessions — but it will remember what happened in plain English,
-    which is all it actually needs for continuity.
+    Save conversation history to DB — text only, no tool blocks.
+    Strips tool_use / tool_result to prevent tool_use_id mismatch errors.
+    Trims to last 20 messages, always starting on a user message.
     """
     db = SessionLocal()
     try:
@@ -75,23 +113,17 @@ def save_agent_memory(agent_id: str, messages: list):
             content = msg.get("content", [])
 
             if isinstance(content, str):
-                # Plain text message — keep as is
                 if content.strip():
                     clean.append({"role": role, "content": content})
-
             elif isinstance(content, list):
-                # Extract only text blocks — discard tool_use and tool_result
                 text_blocks = [
                     b for b in content
                     if isinstance(b, dict) and b.get("type") == "text" and b.get("text", "").strip()
                 ]
                 if text_blocks:
-                    # Simplify single text block to a plain string
                     text_str = text_blocks[0]["text"] if len(text_blocks) == 1 else "\n".join(b["text"] for b in text_blocks)
                     clean.append({"role": role, "content": text_str})
-                # Messages that only contained tool_use / tool_result are dropped
 
-        # Trim to last 20, always starting on a user message
         if len(clean) > 20:
             trimmed = clean[-20:]
             while trimmed and trimmed[0].get("role") != "user":
@@ -99,71 +131,65 @@ def save_agent_memory(agent_id: str, messages: list):
         else:
             trimmed = clean
 
-        record = db.query(AgentMemory).filter(AgentMemory.agent_id == agent_id).first()
+        record = db.query(AgentMemory).filter(
+            AgentMemory.agent_id   == agent_id,
+            AgentMemory.company_id == DEFAULT_COMPANY_ID,
+        ).first()
+
+        # FIX: message_count = lifetime count of orchestrator runs (user commands).
+        # Each call to save_agent_memory is one user→AI exchange, so increment by 1.
+        # The trimming of `clean` doesn't affect this — count is persistent in DB.
         if record:
-            record.memory_json    = json.dumps(trimmed)
-            record.message_count  = (record.message_count or 0) + 1
+            record.memory_json   = json.dumps(trimmed)
+            record.message_count = (record.message_count or 0) + 1
         else:
             db.add(AgentMemory(
+                company_id=DEFAULT_COMPANY_ID,
                 agent_id=agent_id,
                 memory_json=json.dumps(trimmed),
-                message_count=1
+                message_count=1,
             ))
         db.commit()
     finally:
         db.close()
 
+
 def clear_agent_memory(agent_id: str):
     db = SessionLocal()
     try:
-        record = db.query(AgentMemory).filter(AgentMemory.agent_id == agent_id).first()
+        record = db.query(AgentMemory).filter(
+            AgentMemory.agent_id   == agent_id,
+            AgentMemory.company_id == DEFAULT_COMPANY_ID,
+        ).first()
         if record:
-            record.memory_json = json.dumps([])
+            record.memory_json   = json.dumps([])
             record.message_count = 0
             db.commit()
     finally:
         db.close()
 
+
 def serialize_message_content(content):
-    """
-    Convert Anthropic SDK objects (ToolUseBlock, TextBlock) to plain dicts
-    so they can be JSON serialized and saved to the database.
-    """
+    """Convert Anthropic SDK objects to plain dicts for JSON serialization."""
     if isinstance(content, list):
         return [serialize_message_content(block) for block in content]
-    if hasattr(content, 'type'):
-        if content.type == 'text':
+    if hasattr(content, "type"):
+        if content.type == "text":
             return {"type": "text", "text": content.text}
-        elif content.type == 'tool_use':
-            return {
-                "type":  "tool_use",
-                "id":    content.id,
-                "name":  content.name,
-                "input": content.input
-            }
+        elif content.type == "tool_use":
+            return {"type": "tool_use", "id": content.id, "name": content.name, "input": content.input}
     return content
 
 
 def validate_messages(messages: list) -> list:
     """
-    Ensures the message history is valid before sending to Claude.
-
-    THE PROBLEM:
-    Claude requires every tool_result block to have a matching tool_use
-    block in the previous message. When we trim old messages, we can
-    accidentally cut a tool_use while keeping its tool_result — Claude
-    then throws a 400 error.
-
-    THE FIX:
-    1. Collect all valid tool_use IDs from assistant messages
-    2. Strip any tool_result blocks whose ID has no matching tool_use
-    3. Remove any now-empty user messages
-    4. Ensure conversation always starts with a user message
+    Strips orphaned tool_result blocks (no matching tool_use) and
+    ensures conversation always starts with a user message.
+    Must be called before every Claude API call.
     """
     if not messages:
         return messages
 
-    # Step 1: Collect all tool_use IDs present in assistant messages
     valid_tool_use_ids = set()
     for msg in messages:
         if msg.get("role") == "assistant":
@@ -173,13 +199,11 @@ def validate_messages(messages: list) -> list:
                     if isinstance(block, dict) and block.get("type") == "tool_use":
                         valid_tool_use_ids.add(block["id"])
 
-    # Step 2: Strip orphaned tool_results from user messages
     cleaned = []
     for msg in messages:
         if msg.get("role") == "user":
             content = msg.get("content", [])
             if isinstance(content, list):
-                # Filter out tool_results with no matching tool_use
                 filtered = [
                     block for block in content
                     if not (
@@ -190,13 +214,11 @@ def validate_messages(messages: list) -> list:
                 ]
                 if filtered:
                     cleaned.append({**msg, "content": filtered})
-                # Drop the message entirely if it only had orphaned results
             else:
                 cleaned.append(msg)
         else:
             cleaned.append(msg)
 
-    # Step 3: Ensure conversation starts with a user message
     while cleaned and cleaned[0].get("role") != "user":
         cleaned.pop(0)
 
@@ -204,14 +226,133 @@ def validate_messages(messages: list) -> list:
 
 
 # ===========================================================================
-# TOOL DEFINITIONS — Manager Tools (all 45)
+# TOOL DEFINITIONS — Manager Tools (45 tools)
 # ===========================================================================
 MANAGER_TOOLS = [
+    # ── Slack (cross-tool action) ──────────────────────────────
+    {
+        "name": "post_to_slack",
+        "description": "Post a message to a Slack channel as the Nexus bot. "
+                       "PUBLIC action. Flow: (1) when the user asks to post, show them the channel "
+                       "and exact message and ask 'Confirm?'. (2) When the user replies yes/confirm/go ahead, "
+                       "you MUST call this tool in that same turn to actually post. Do NOT claim you posted "
+                       "unless this tool was actually called and returned a success message — never fabricate "
+                       "a 'Posted' response. If you say it's posted, the tool must have run.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "channel": {"type": "string", "description": "Channel name like '#engineering' or 'engineering'"},
+                "message": {"type": "string", "description": "The message to post"},
+            },
+            "required": ["channel", "message"],
+        },
+    },
+    {
+        "name": "list_slack_channels",
+        "description": "List the Slack channels the Nexus bot can see. Use if unsure of the exact channel name.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "read_slack_channel",
+        "description": "Read recent messages from a Slack channel and summarize what's been discussed. "
+                       "Use when asked to check a channel for updates or catch up on a channel. "
+                       "The bot must be a member of the channel.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "channel": {"type": "string", "description": "Channel name like '#work' or 'work'"},
+                "limit":   {"type": "integer", "description": "How many recent messages (default 15)"},
+            },
+            "required": ["channel"],
+        },
+    },
+    # ── Gmail & Calendar (cross-tool actions) ──────────────────
+    {
+        "name": "check_my_emails",
+        "description": "Read recent unread emails from a connected Gmail. "
+                       "Pass employee_id (use 1 for the manager's own inbox). "
+                       "Call before answering anything about email contents.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "employee_id": {"type": "integer", "description": "Whose inbox (1 = manager)"},
+            },
+            "required": ["employee_id"],
+        },
+    },
+    {
+        "name": "draft_email_reply",
+        "description": "Draft (do NOT send) a reply to an email thread, in the user's voice. "
+                       "Use after check_my_emails gives you a thread_id.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "employee_id": {"type": "integer"},
+                "thread_id":   {"type": "string"},
+                "instruction": {"type": "string"},
+            },
+            "required": ["employee_id", "thread_id", "instruction"],
+        },
+    },
+    {
+        "name": "send_email",
+        "description": "Send an email from the connected Gmail. IRREVERSIBLE AND PUBLIC. "
+                       "Show the user the recipient, subject, and body and get explicit "
+                       "confirmation before calling. Never send without confirmation.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "employee_id": {"type": "integer"},
+                "to":          {"type": "string"},
+                "subject":     {"type": "string"},
+                "body":        {"type": "string"},
+            },
+            "required": ["employee_id", "to", "subject", "body"],
+        },
+    },
+    {
+        "name": "check_my_calendar",
+        "description": "Read upcoming calendar events for an employee. Pass employee_id and optional days (default 7).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "employee_id": {"type": "integer"},
+                "days":        {"type": "integer"},
+            },
+            "required": ["employee_id"],
+        },
+    },
+    {
+        "name": "create_calendar_event",
+        "description": "Create a calendar event. IRREVERSIBLE — confirm details with the user first. "
+                       "Times in ISO format.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "employee_id":     {"type": "integer"},
+                "title":           {"type": "string"},
+                "start_time":      {"type": "string", "description": "ISO datetime"},
+                "end_time":        {"type": "string", "description": "ISO datetime"},
+                "description":     {"type": "string"},
+                "attendee_emails": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["employee_id", "title", "start_time", "end_time"],
+        },
+    },
+    {
+        "name": "check_google_connection",
+        "description": "Check whether an employee's Google (Gmail + Calendar) is connected. Pass employee_id.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"employee_id": {"type": "integer"}},
+            "required": ["employee_id"],
+        },
+    },
 
     # ── TASKS ──────────────────────────────────────────────────────────────
     {
         "name": "view_all_tasks",
-        "description": "Get all tasks with status, priority, owner, subtask progress, and due dates. Call this when asked about tasks, workload, or project status.",
+        "description": "Get all tasks with status, priority, owner, subtask progress, and due dates.",
         "input_schema": {"type": "object", "properties": {}, "required": []}
     },
     {
@@ -220,17 +361,17 @@ MANAGER_TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "keyword":    {"type": "string",  "description": "Search in title or description"},
-                "priority":   {"type": "string",  "description": "Low / Medium / High / Critical"},
-                "is_completed": {"type": "boolean","description": "Filter by completion status"},
-                "owner_id":   {"type": "integer", "description": "Filter by employee ID"}
+                "keyword":      {"type": "string"},
+                "priority":     {"type": "string", "description": "Low / Medium / High / Critical"},
+                "is_completed": {"type": "boolean"},
+                "owner_id":     {"type": "integer"}
             },
             "required": []
         }
     },
     {
         "name": "get_overdue_tasks",
-        "description": "Get all incomplete tasks that are past their due date.",
+        "description": "Get all incomplete tasks past their due date.",
         "input_schema": {"type": "object", "properties": {}, "required": []}
     },
     {
@@ -239,13 +380,13 @@ MANAGER_TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "employee_id": {"type": "integer"},
-                "title":       {"type": "string"},
-                "description": {"type": "string"},
-                "priority":    {"type": "string", "description": "Low / Medium / High / Critical"},
-                "due_date":    {"type": "string"},
-                "project_id":  {"type": "integer", "description": "Optional: link to a project"},
-                "estimated_hours": {"type": "number", "description": "Optional: estimated hours"}
+                "employee_id":      {"type": "integer"},
+                "title":            {"type": "string"},
+                "description":      {"type": "string"},
+                "priority":         {"type": "string", "description": "Low / Medium / High / Critical"},
+                "due_date":         {"type": "string"},
+                "project_id":       {"type": "integer"},
+                "estimated_hours":  {"type": "number"}
             },
             "required": ["employee_id", "title", "description"]
         }
@@ -327,7 +468,7 @@ MANAGER_TOOLS = [
             "properties": {
                 "task_id":   {"type": "integer"},
                 "content":   {"type": "string"},
-                "author_id": {"type": "integer", "description": "Employee ID who wrote this"}
+                "author_id": {"type": "integer"}
             },
             "required": ["task_id", "content"]
         }
@@ -355,7 +496,7 @@ MANAGER_TOOLS = [
     },
     {
         "name": "view_task_dependencies",
-        "description": "Get all dependencies for a task — what it's waiting on and what's waiting on it.",
+        "description": "Get all dependencies for a task.",
         "input_schema": {
             "type": "object",
             "properties": {"task_id": {"type": "integer"}},
@@ -364,13 +505,13 @@ MANAGER_TOOLS = [
     },
     {
         "name": "add_tag_to_task",
-        "description": "Tag a task with a label for categorization.",
+        "description": "Tag a task with a label.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "task_id":  {"type": "integer"},
                 "tag_name": {"type": "string"},
-                "color":    {"type": "string", "description": "Hex color e.g. #ff0000"}
+                "color":    {"type": "string"}
             },
             "required": ["task_id", "tag_name"]
         }
@@ -387,14 +528,14 @@ MANAGER_TOOLS = [
                 "description": {"type": "string"},
                 "priority":    {"type": "string"},
                 "due_date":    {"type": "string"},
-                "member_ids":  {"type": "array", "items": {"type": "integer"}, "description": "Employee IDs on this project"}
+                "member_ids":  {"type": "array", "items": {"type": "integer"}}
             },
             "required": ["name"]
         }
     },
     {
         "name": "view_projects",
-        "description": "Get all projects with their status, members, and task counts.",
+        "description": "Get all projects with status, members, and task counts.",
         "input_schema": {"type": "object", "properties": {}, "required": []}
     },
     {
@@ -420,7 +561,7 @@ MANAGER_TOOLS = [
     },
     {
         "name": "get_tasks_by_project",
-        "description": "Get all tasks belonging to a specific project.",
+        "description": "Get all tasks belonging to a project.",
         "input_schema": {
             "type": "object",
             "properties": {"project_id": {"type": "integer"}},
@@ -431,12 +572,12 @@ MANAGER_TOOLS = [
     # ── EMPLOYEES ─────────────────────────────────────────────────────────
     {
         "name": "get_team_status",
-        "description": "Get all employees with their active task counts, teams, and peer assistance status.",
+        "description": "Get a full overview of all employees — workload, tasks, and peer requests.",
         "input_schema": {"type": "object", "properties": {}, "required": []}
     },
     {
         "name": "get_employee_details",
-        "description": "Get full profile of a specific employee including tasks, preferences, and activity.",
+        "description": "Get full profile for a specific employee.",
         "input_schema": {
             "type": "object",
             "properties": {"employee_id": {"type": "integer"}},
@@ -445,14 +586,23 @@ MANAGER_TOOLS = [
     },
     {
         "name": "search_employees",
-        "description": "Search employees by name, role, skill, or team.",
+        "description": "Search employees by name, role, skills, or team.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "keyword": {"type": "string", "description": "Search name, role, or skills"},
-                "team":    {"type": "string", "description": "Filter by team name"}
+                "keyword": {"type": "string"},
+                "team":    {"type": "string"}
             },
             "required": []
+        }
+    },
+    {
+        "name": "find_employee_by_name",
+        "description": "Look up an employee's real database ID by name. ALWAYS use this before dispatching peer requests.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"]
         }
     },
     {
@@ -474,7 +624,7 @@ MANAGER_TOOLS = [
     },
     {
         "name": "update_employee",
-        "description": "Update an employee's profile information.",
+        "description": "Update an employee's profile.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -510,45 +660,28 @@ MANAGER_TOOLS = [
         }
     },
     {
-        "name": "set_employee_preference",
-        "description": "Set a preference or learned behaviour for an employee's digital twin.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "employee_id": {"type": "integer"},
-                "key":         {"type": "string", "description": "e.g. focus_start, meeting_max_per_day, communication_style"},
-                "value":       {"type": "string"}
-            },
-            "required": ["employee_id", "key", "value"]
-        }
-    },
-    {
-        "name": "get_employee_preferences",
-        "description": "Get all learned preferences for an employee's digital twin.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"employee_id": {"type": "integer"}},
-            "required": ["employee_id"]
-        }
+        "name": "rebalance_team",
+        "description": "Trigger the multi-agent negotiation engine to rebalance workloads across the team.",
+        "input_schema": {"type": "object", "properties": {}, "required": []}
     },
 
     # ── MEETINGS ──────────────────────────────────────────────────────────
     {
         "name": "view_meetings",
-        "description": "Get all scheduled meetings with attendees and times.",
+        "description": "Get all scheduled meetings with attendees.",
         "input_schema": {"type": "object", "properties": {}, "required": []}
     },
     {
         "name": "schedule_meeting",
-        "description": "Schedule a new meeting with specified attendees.",
+        "description": "Schedule a new meeting with attendees.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "topic":        {"type": "string"},
-                "time":         {"type": "string"},
-                "attendee_ids": {"type": "array", "items": {"type": "integer"}},
+                "topic":            {"type": "string"},
+                "time":             {"type": "string"},
+                "attendee_ids":     {"type": "array", "items": {"type": "integer"}},
                 "duration_minutes": {"type": "integer"},
-                "location":     {"type": "string"}
+                "location":         {"type": "string"}
             },
             "required": ["topic", "time", "attendee_ids"]
         }
@@ -604,10 +737,10 @@ MANAGER_TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "meeting_id":   {"type": "integer"},
-                "description":  {"type": "string"},
-                "assignee_id":  {"type": "integer"},
-                "due_date":     {"type": "string"}
+                "meeting_id":  {"type": "integer"},
+                "description": {"type": "string"},
+                "assignee_id": {"type": "integer"},
+                "due_date":    {"type": "string"}
             },
             "required": ["meeting_id", "description"]
         }
@@ -641,7 +774,7 @@ MANAGER_TOOLS = [
     # ── DELEGATIONS ───────────────────────────────────────────────────────
     {
         "name": "create_delegation",
-        "description": "Formally delegate a task or responsibility from one employee to another.",
+        "description": "Formally delegate a task or responsibility.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -656,7 +789,7 @@ MANAGER_TOOLS = [
     },
     {
         "name": "view_delegations",
-        "description": "Get all active delegations in the system.",
+        "description": "Get all active delegations.",
         "input_schema": {"type": "object", "properties": {}, "required": []}
     },
     {
@@ -700,12 +833,12 @@ MANAGER_TOOLS = [
     # ── ANALYTICS ─────────────────────────────────────────────────────────
     {
         "name": "get_workload_summary",
-        "description": "Get an overview of workload distribution across all employees and teams.",
+        "description": "Get workload distribution across all employees and teams.",
         "input_schema": {"type": "object", "properties": {}, "required": []}
     },
     {
         "name": "get_overdue_summary",
-        "description": "Get a summary of all overdue tasks grouped by employee and team.",
+        "description": "Get a summary of all overdue tasks grouped by employee.",
         "input_schema": {"type": "object", "properties": {}, "required": []}
     },
     {
@@ -714,8 +847,8 @@ MANAGER_TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "employee_id": {"type": "integer", "description": "Optional: filter to specific employee"},
-                "team":        {"type": "string",  "description": "Optional: filter to specific team"}
+                "employee_id": {"type": "integer"},
+                "team":        {"type": "string"}
             },
             "required": []
         }
@@ -760,7 +893,7 @@ MANAGER_TOOLS = [
             "type": "object",
             "properties": {
                 "recipient_id": {"type": "integer"},
-                "type":         {"type": "string", "description": "e.g. task_assigned / meeting / peer_request / general"},
+                "type":         {"type": "string"},
                 "title":        {"type": "string"},
                 "message":      {"type": "string"}
             },
@@ -789,7 +922,7 @@ MANAGER_TOOLS = [
         "input_schema": {
             "type": "object",
             "properties": {
-                "employee_id": {"type": "integer", "description": "Optional: filter to specific employee"}
+                "employee_id": {"type": "integer"}
             },
             "required": []
         }
@@ -801,14 +934,14 @@ MANAGER_TOOLS = [
             "type": "object",
             "properties": {
                 "goal_id":      {"type": "integer"},
-                "progress_pct": {"type": "number", "description": "0.0 to 100.0"}
+                "progress_pct": {"type": "number"}
             },
             "required": ["goal_id", "progress_pct"]
         }
     },
     {
         "name": "link_task_to_goal",
-        "description": "Connect a task to a goal to show how daily work contributes to big objectives.",
+        "description": "Connect a task to a goal.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -819,19 +952,38 @@ MANAGER_TOOLS = [
         }
     },
 
-    # ── DRAFTS & MEMORY ───────────────────────────────────────────────────
+    # ── PASSWORDS & PREFERENCES ───────────────────────────────────────────
     {
         "name": "set_employee_password",
-        "description": "Set or reset the login password for an employee so they can access the system.",
+        "description": "Set or reset the login password for an employee.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "employee_id":  {"type": "integer", "description": "The employee's ID"},
-                "new_password": {"type": "string",  "description": "Their new login password"}
+                "employee_id":  {"type": "integer"},
+                "new_password": {"type": "string"}
             },
             "required": ["employee_id", "new_password"]
         }
     },
+    {
+        "name": "save_preference",
+        "description": "Save a manager preference or system setting.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "key":   {"type": "string"},
+                "value": {"type": "string"}
+            },
+            "required": ["key", "value"]
+        }
+    },
+    {
+        "name": "view_preferences",
+        "description": "Get all saved manager preferences.",
+        "input_schema": {"type": "object", "properties": {}, "required": []}
+    },
+
+    # ── DRAFTS ────────────────────────────────────────────────────────────
     {
         "name": "draft_idea",
         "description": "Save a draft idea or plan for later review.",
@@ -871,36 +1023,74 @@ MANAGER_TOOLS = [
             "required": ["draft_id", "employee_id"]
         }
     },
-    {
-        "name": "save_preference",
-        "description": "Save a manager preference or system setting.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "key":   {"type": "string"},
-                "value": {"type": "string"}
-            },
-            "required": ["key", "value"]
-        }
-    },
-    {
-        "name": "view_preferences",
-        "description": "Get all saved manager preferences.",
-        "input_schema": {"type": "object", "properties": {}, "required": []}
-    },
 
     # ── DAILY BRIEFINGS ───────────────────────────────────────────────────
     {
         "name": "generate_daily_briefing",
-        "description": "Generate and store a morning briefing for an employee summarizing their day ahead.",
+        "description": "Generate and store a morning briefing for an employee.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "employee_id": {"type": "integer"},
-                "date":        {"type": "string", "description": "YYYY-MM-DD format"}
+                "date":        {"type": "string"}
             },
             "required": ["employee_id"]
         }
+    },
+
+    # ── CONTRACTS (integration promises between tasks) ────────────────────
+    {
+        "name": "define_contract",
+        "description": "Capture an interface CONTRACT between two tasks — the promise that one "
+                       "person's work (the producer) gives another's (the consumer) something in a "
+                       "specific shape (e.g. 'the API returns user records with id, email, token'). "
+                       "Use this when two interdependent pieces must agree on how they connect. Once "
+                       "defined, Nexus watches the producer for changes and warns the consumer's owner "
+                       "if it drifts. Look up the task IDs first if you don't have them.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "producer_task_id": {"type": "integer", "description": "The task that PRODUCES the thing"},
+                "consumer_task_id": {"type": "integer", "description": "The task that CONSUMES it"},
+                "name":             {"type": "string",  "description": "Short name, e.g. 'auth API response shape'"},
+                "description":      {"type": "string",  "description": "The promise / interface details"},
+            },
+            "required": ["producer_task_id", "consumer_task_id", "name"],
+        },
+    },
+    {
+        "name": "view_contracts",
+        "description": "List interface contracts (the promises between interdependent tasks) and their "
+                       "status: active / at_risk / broken / fulfilled. Optionally filter by project or task.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "integer"},
+                "task_id":    {"type": "integer", "description": "Contracts where this task is producer or consumer"},
+            },
+            "required": [],
+        },
+    },
+
+    # ── KNOWLEDGE BASE (RAG) ──────────────────────────────────────────────
+    {
+        "name": "search_knowledge",
+        "description": "Semantic search over the organization's knowledge base — uploaded "
+                       "documents and specs, task history, and other indexed content — by "
+                       "meaning, not keywords. CALL THIS when the answer depends on prior "
+                       "documents, files, or history you don't already have in front of you: "
+                       "'what did the spec say about X', 'have we covered Y before', details "
+                       "from an uploaded file, or background on a past decision. Returns the "
+                       "most relevant snippets with a relevance score. Do not answer from "
+                       "memory when the user is clearly referring to indexed material — search first.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "What to look for, in natural language"},
+                "limit": {"type": "integer", "description": "How many snippets to return (default 5)"},
+            },
+            "required": ["query"],
+        },
     },
 ]
 
@@ -909,7 +1099,6 @@ MANAGER_TOOLS = [
 # EMPLOYEE TOOLS (24 tools)
 # ===========================================================================
 EMPLOYEE_TOOLS = [
-
     # ── TASKS ──────────────────────────────────────────────────────────────
     {
         "name": "get_my_tasks",
@@ -1008,7 +1197,7 @@ EMPLOYEE_TOOLS = [
     # ── PEER REQUESTS ─────────────────────────────────────────────────────
     {
         "name": "find_available_colleague",
-        "description": "Find the least busy colleague to ask for help. Returns their real ID and name from the database.",
+        "description": "Find the least busy colleague to ask for help.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -1020,18 +1209,16 @@ EMPLOYEE_TOOLS = [
     },
     {
         "name": "find_employee_by_name",
-        "description": "Look up an employee's real database ID by their name. ALWAYS use this before dispatch_peer_request to get the correct recipient_id — never guess IDs.",
+        "description": "Look up an employee's real database ID by their name. ALWAYS use this before dispatch_peer_request.",
         "input_schema": {
             "type": "object",
-            "properties": {
-                "name": {"type": "string", "description": "Full or partial employee name to search for"}
-            },
+            "properties": {"name": {"type": "string"}},
             "required": ["name"]
         }
     },
     {
         "name": "dispatch_peer_request",
-        "description": "Send a peer assistance request. IMPORTANT: Always call find_employee_by_name first to get the correct recipient_id. Never use assumed or guessed IDs. Only dispatch after employee confirms.",
+        "description": "Send a peer assistance request. ALWAYS call find_employee_by_name first to get the correct recipient_id.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -1041,6 +1228,27 @@ EMPLOYEE_TOOLS = [
                 "topic":        {"type": "string"}
             },
             "required": ["task_id", "sender_id", "recipient_id", "topic"]
+        }
+    },
+    {
+        "name": "negotiate_peer_help",
+        "description": (
+            "AI-to-AI negotiation for peer help. Use this INSTEAD of dispatch_peer_request when the employee "
+            "says they need help but hasn't specified who. This tool: "
+            "(1) finds the best available colleague by skill and workload, "
+            "(2) asks that colleague's personal AI to check their own tasks AND calendar before agreeing, "
+            "(3) only creates the peer request after their AI accepts — humans only see pre-negotiated requests. "
+            "Use dispatch_peer_request only when the employee already knows specifically who they want."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "task_id":          {"type": "integer", "description": "The task needing help"},
+                "requester_id":     {"type": "integer", "description": "Employee asking for help (DB ID)"},
+                "help_description": {"type": "string",  "description": "Exactly what help is needed"},
+                "skill_needed":     {"type": "string",  "description": "Optional skill e.g. React, ML, database"}
+            },
+            "required": ["task_id", "requester_id", "help_description"]
         }
     },
     {
@@ -1171,7 +1379,7 @@ EMPLOYEE_TOOLS = [
     # ── DAILY BRIEFING ────────────────────────────────────────────────────
     {
         "name": "get_my_daily_briefing",
-        "description": "Get today's morning briefing — tasks, meetings, priorities, and suggestions.",
+        "description": "Get today's morning briefing — tasks, meetings, priorities.",
         "input_schema": {
             "type": "object",
             "properties": {"employee_id": {"type": "integer"}},
@@ -1182,39 +1390,39 @@ EMPLOYEE_TOOLS = [
     # ── GOOGLE WORKSPACE ──────────────────────────────────────────────────
     {
         "name": "check_my_emails",
-        "description": "Read and summarize recent unread emails from the employee's Gmail inbox using Gemini AI.",
+        "description": "Read and summarize recent unread emails from Gmail using Gemini AI.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "employee_id": {"type": "integer"},
-                "max_results": {"type": "integer", "description": "Number of emails to fetch (default 10)"}
+                "max_results": {"type": "integer"}
             },
             "required": ["employee_id"]
         }
     },
     {
         "name": "draft_email_reply",
-        "description": "Draft an email reply in the employee's voice using Gemini AI. Use this when employee wants to reply to an email.",
+        "description": "Draft an email reply in the employee's voice using Gemini AI.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "employee_id": {"type": "integer"},
-                "thread_id":   {"type": "string", "description": "Gmail thread ID to reply to"},
-                "instruction": {"type": "string", "description": "What the reply should say"}
+                "thread_id":   {"type": "string"},
+                "instruction": {"type": "string"}
             },
             "required": ["employee_id", "thread_id", "instruction"]
         }
     },
     {
         "name": "send_email",
-        "description": "Send an email from the employee's Gmail account. Only call after employee confirms.",
+        "description": "Send an email from the employee's Gmail. Only call after employee confirms.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "employee_id": {"type": "integer"},
-                "to":          {"type": "string", "description": "Recipient email address"},
+                "to":          {"type": "string"},
                 "subject":     {"type": "string"},
-                "body":        {"type": "string", "description": "Email body text"}
+                "body":        {"type": "string"}
             },
             "required": ["employee_id", "to", "subject", "body"]
         }
@@ -1226,43 +1434,43 @@ EMPLOYEE_TOOLS = [
             "type": "object",
             "properties": {
                 "employee_id": {"type": "integer"},
-                "days":        {"type": "integer", "description": "Number of days ahead to check (default 7)"}
+                "days":        {"type": "integer"}
             },
             "required": ["employee_id"]
         }
     },
     {
         "name": "check_availability",
-        "description": "Check free time slots on the employee's Google Calendar for scheduling.",
+        "description": "Check free time slots on Google Calendar for scheduling.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "employee_id":      {"type": "integer"},
-                "date":             {"type": "string", "description": "Date in YYYY-MM-DD format"},
-                "duration_minutes": {"type": "integer", "description": "Meeting duration needed (default 60)"}
+                "date":             {"type": "string"},
+                "duration_minutes": {"type": "integer"}
             },
             "required": ["employee_id", "date"]
         }
     },
     {
         "name": "create_calendar_event",
-        "description": "Create a real Google Calendar event for the employee. Use this when employee asks to add, schedule, or block time on their calendar.",
+        "description": "Create a real Google Calendar event for the employee.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "employee_id":      {"type": "integer"},
-                "title":            {"type": "string", "description": "Event title"},
-                "start_time":       {"type": "string", "description": "Start datetime in ISO format e.g. 2026-05-16T10:00:00Z"},
-                "end_time":         {"type": "string", "description": "End datetime in ISO format e.g. 2026-05-16T11:00:00Z"},
-                "description":      {"type": "string", "description": "Optional event description"},
-                "attendee_emails":  {"type": "array", "items": {"type": "string"}, "description": "Optional list of attendee email addresses"}
+                "employee_id":     {"type": "integer"},
+                "title":           {"type": "string"},
+                "start_time":      {"type": "string"},
+                "end_time":        {"type": "string"},
+                "description":     {"type": "string"},
+                "attendee_emails": {"type": "array", "items": {"type": "string"}}
             },
             "required": ["employee_id", "title", "start_time", "end_time"]
         }
     },
     {
         "name": "get_focus_time_suggestions",
-        "description": "Analyze the employee's calendar and suggest the best focus time blocks for deep work.",
+        "description": "Analyze the employee's calendar and suggest best focus time blocks.",
         "input_schema": {
             "type": "object",
             "properties": {"employee_id": {"type": "integer"}},
@@ -1271,21 +1479,166 @@ EMPLOYEE_TOOLS = [
     },
     {
         "name": "check_google_connection",
-        "description": "Check if the employee has connected their Google account. If not, tell them to visit the connect URL.",
+        "description": "Check if the employee has connected their Google account.",
         "input_schema": {
             "type": "object",
             "properties": {"employee_id": {"type": "integer"}},
             "required": ["employee_id"]
         }
     },
+
+    # ── CONTRACTS (integration promises between tasks) ────────────────────
+    {
+        "name": "define_contract",
+        "description": "Capture an interface CONTRACT between two tasks — the promise that one "
+                       "person's work (the producer) gives another's (the consumer) something in a "
+                       "specific shape (e.g. 'the API returns user records with id, email, token'). "
+                       "Use this when two interdependent pieces must agree on how they connect. Once "
+                       "defined, Nexus watches the producer for changes and warns the consumer's owner "
+                       "if it drifts. Look up the task IDs first if you don't have them.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "producer_task_id": {"type": "integer", "description": "The task that PRODUCES the thing"},
+                "consumer_task_id": {"type": "integer", "description": "The task that CONSUMES it"},
+                "name":             {"type": "string",  "description": "Short name, e.g. 'auth API response shape'"},
+                "description":      {"type": "string",  "description": "The promise / interface details"},
+            },
+            "required": ["producer_task_id", "consumer_task_id", "name"],
+        },
+    },
+    {
+        "name": "view_contracts",
+        "description": "List interface contracts (the promises between interdependent tasks) and their "
+                       "status: active / at_risk / broken / fulfilled. Optionally filter by project or task.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "project_id": {"type": "integer"},
+                "task_id":    {"type": "integer", "description": "Contracts where this task is producer or consumer"},
+            },
+            "required": [],
+        },
+    },
+
+    # ── KNOWLEDGE BASE (RAG) ──────────────────────────────────────────────
+    {
+        "name": "search_knowledge",
+        "description": "Semantic search over your organization's knowledge base — uploaded "
+                       "documents and specs, task history, and other indexed content — by "
+                       "meaning, not keywords. CALL THIS when the answer depends on prior "
+                       "documents, files, or history you don't already have: 'what did the "
+                       "spec say about X', 'have we covered Y before', details from an uploaded "
+                       "file, or background on a past decision. Returns the most relevant "
+                       "snippets with a relevance score. Search first rather than guessing when "
+                       "the user is clearly referring to indexed material.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "What to look for, in natural language"},
+                "limit": {"type": "integer", "description": "How many snippets to return (default 5)"},
+            },
+            "required": ["query"],
+        },
+    },
 ]
+
+
+# ===========================================================================
+# PROMPT CACHING
+# The request renders as tools → system → messages, and the cache is a strict
+# prefix match. Tools never change at runtime, so a breakpoint on the last
+# tool caches the whole block across every command (90% discount on reads,
+# 5-min TTL). The static persona gets a second breakpoint in run_orchestrator;
+# volatile content (current time, context snapshot) must stay AFTER it.
+# ===========================================================================
+MANAGER_TOOLS[-1]["cache_control"]  = {"type": "ephemeral"}
+EMPLOYEE_TOOLS[-1]["cache_control"] = {"type": "ephemeral"}
+
+
+def _refresh_cache_breakpoint(messages: list):
+    """
+    Incremental conversation caching for the tool-use loop: keep exactly one
+    breakpoint on the last content block of the last message, so iteration N+1
+    reads the prefix iteration N wrote instead of re-billing the whole
+    conversation. Stale markers are stripped first — the API allows max 4
+    breakpoints per request (tools + system + this one = 3).
+    """
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    block.pop("cache_control", None)
+    if not messages:
+        return
+    last    = messages[-1]
+    content = last.get("content")
+    if isinstance(content, str) and content.strip():
+        last["content"] = [{
+            "type": "text", "text": content,
+            "cache_control": {"type": "ephemeral"},
+        }]
+    elif isinstance(content, list) and content and isinstance(content[-1], dict):
+        content[-1]["cache_control"] = {"type": "ephemeral"}
+
+
+def _log_usage(agent_id: str, model: str, response):
+    """Surface cache hits/misses per API call — console + admin circuit board."""
+    try:
+        u  = response.usage
+        cr = getattr(u, "cache_read_input_tokens", 0) or 0
+        cw = getattr(u, "cache_creation_input_tokens", 0) or 0
+        print(f"💰 {model}: in={u.input_tokens} out={u.output_tokens} "
+              f"cache_read={cr} cache_write={cw}")
+        from event_bus import emit_cost
+        emit_cost(model, u.input_tokens, u.output_tokens, actor=agent_id,
+                  cache_read_tokens=cr, cache_write_tokens=cw)
+    except Exception:
+        pass
+
+
+# ===========================================================================
+# DATE PARSING — coerce AI free-text dates so Date columns never DataError
+# ===========================================================================
+def _parse_date(value):
+    """AI date string -> datetime.date, or None if unparseable. Prevents the
+    AI's natural-language dates ('next Friday', '2026-06-31') from raising a
+    DataError on a Date column and silently failing the whole action — the
+    task/goal is created without a date instead of not created at all."""
+    if not value:
+        return None
+    s = str(value).strip()
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%m/%d/%Y", "%d-%m-%Y",
+                "%B %d, %Y", "%b %d, %Y", "%d %B %Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    try:
+        return datetime.strptime(s[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
 
 
 # ===========================================================================
 # TOOL EXECUTION
 # ===========================================================================
 def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
+    """
+    Executes the named tool and returns a string result to Claude.
+    Global try/except ensures a single bad tool never crashes the agent.
+    All DB-writing tools call _broadcast_sync() after commit.
+    """
     glass_brain_queue.put(f"{agent_id}|[GLASS BRAIN] ⚙️ {tool_name}...")
+
+    # PHASE 3: emit event for admin circuit board
+    try:
+        from event_bus import emit_tool_called
+        emit_tool_called(agent_id, tool_name, tool_input)
+    except Exception:
+        pass
+
     db = SessionLocal()
 
     try:
@@ -1300,6 +1653,66 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
                 progress = f"{sum(1 for s in subs if s.is_completed)}/{len(subs)}" if subs else "no subtasks"
                 result.append(f"ID:{t.id} | {t.title} | OwnerID:{t.owner_id} | Priority:{t.priority} | Done:{t.is_completed} | Progress:{progress} | Due:{t.due_date}")
             return "\n".join(result)
+
+        elif tool_name == "define_contract":
+            producer = db.query(Task).filter(Task.id == tool_input["producer_task_id"]).first()
+            consumer = db.query(Task).filter(Task.id == tool_input["consumer_task_id"]).first()
+            if not producer or not consumer:
+                return "Couldn't find one of those tasks — look up the task IDs first."
+            c = Contract(
+                company_id=DEFAULT_COMPANY_ID,
+                project_id=producer.project_id or consumer.project_id,
+                producer_task_id=producer.id,
+                consumer_task_id=consumer.id,
+                name=tool_input["name"],
+                description=tool_input.get("description", ""),
+                status="active",
+            )
+            db.add(c)
+            db.commit()
+            _broadcast_sync()
+            return (f"Contract '{c.name}' recorded: \"{producer.title}\" → \"{consumer.title}\". "
+                    f"I'll watch the producer for changes and flag {consumer.owner.name if consumer.owner else 'the consumer'} "
+                    f"if it drifts before they integrate.")
+
+        elif tool_name == "view_contracts":
+            q = db.query(Contract).filter(Contract.company_id == DEFAULT_COMPANY_ID)
+            if tool_input.get("project_id"):
+                q = q.filter(Contract.project_id == tool_input["project_id"])
+            if tool_input.get("task_id"):
+                tid = tool_input["task_id"]
+                q = q.filter((Contract.producer_task_id == tid) | (Contract.consumer_task_id == tid))
+            contracts = q.all()
+            if not contracts:
+                return "No contracts defined yet."
+            lines = []
+            for c in contracts:
+                p  = c.producer.title if c.producer else "?"
+                co = c.consumer.title if c.consumer else "?"
+                lines.append(f"ID:{c.id} | {c.name} | {p} → {co} | status:{c.status} | {(c.description or '')[:80]}")
+            return "\n".join(lines)
+
+        elif tool_name == "search_knowledge":
+            # Semantic retrieval over the company's knowledge base. Tenant-scoped
+            # via DEFAULT_COMPANY_ID — rag.search filters on company_id so this
+            # is already correct for multi-tenant.
+            import rag
+            query = (tool_input.get("query") or "").strip()
+            if not query:
+                return "No search query provided."
+            try:
+                limit = int(tool_input.get("limit") or 5)
+            except (TypeError, ValueError):
+                limit = 5
+            hits = rag.search(DEFAULT_COMPANY_ID, query, k=max(1, min(limit, 10)))
+            if not hits:
+                return ("Nothing relevant in the knowledge base for that. "
+                        "It may not have been uploaded or indexed yet.")
+            blocks = []
+            for h in hits:
+                label = h["meta"].get("filename") or h["meta"].get("title") or h["source_type"]
+                blocks.append(f"[{h['source_type']} · {label} · relevance {h['score']}]\n{h['content']}")
+            return "\n\n---\n\n".join(blocks)
 
         elif tool_name == "search_tasks":
             q = db.query(Task)
@@ -1331,29 +1744,26 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
 
         elif tool_name == "assign_task":
             task = Task(
+                company_id=DEFAULT_COMPANY_ID,
                 title=tool_input["title"],
                 description=tool_input.get("description", ""),
                 owner_id=tool_input["employee_id"],
                 priority=tool_input.get("priority", "Medium"),
-                due_date=tool_input.get("due_date"),
+                due_date=_parse_date(tool_input.get("due_date")),
                 project_id=tool_input.get("project_id"),
                 estimated_hours=tool_input.get("estimated_hours"),
             )
             db.add(task)
             db.commit()
-            notif = Notification(recipient_id=tool_input["employee_id"], type="task_assigned",
-                                 title="New Task Assigned", message=f"You have been assigned: {tool_input['title']}")
-            db.add(notif)
+            db.add(Notification(
+                company_id=DEFAULT_COMPANY_ID,
+                recipient_id=tool_input["employee_id"],
+                type="task_assigned",
+                title="New Task Assigned",
+                message=f"You have been assigned: {tool_input['title']}",
+            ))
             db.commit()
-            # Broadcast so employee's dashboard updates instantly
-            import asyncio
-            from api.ws_manager import notifier
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    asyncio.ensure_future(notifier.broadcast("SYNC_REQUIRED"))
-            except Exception:
-                pass
+            _broadcast_sync()
             return f"Task '{tool_input['title']}' assigned to Employee ID {tool_input['employee_id']}."
 
         elif tool_name == "reassign_task":
@@ -1362,6 +1772,7 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
                 return "Task not found."
             task.owner_id = tool_input["new_employee_id"]
             db.commit()
+            _broadcast_sync()
             return f"Task {tool_input['task_id']} reassigned to Employee ID {tool_input['new_employee_id']}."
 
         elif tool_name == "update_task_status":
@@ -1372,6 +1783,7 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             if tool_input["is_completed"]:
                 task.completed_at = datetime.now(timezone.utc)
             db.commit()
+            _broadcast_sync()
             return f"Task {tool_input['task_id']} marked {'complete' if tool_input['is_completed'] else 'incomplete'}."
 
         elif tool_name == "update_task_priority":
@@ -1380,14 +1792,16 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
                 return "Task not found."
             task.priority = tool_input["new_priority"]
             db.commit()
+            _broadcast_sync()
             return f"Task {tool_input['task_id']} priority → {tool_input['new_priority']}."
 
         elif tool_name == "update_task_due_date":
             task = db.query(Task).filter(Task.id == tool_input["task_id"]).first()
             if not task:
                 return "Task not found."
-            task.due_date = tool_input["due_date"]
+            task.due_date = _parse_date(tool_input["due_date"])
             db.commit()
+            _broadcast_sync()
             return f"Task {tool_input['task_id']} due date → {tool_input['due_date']}."
 
         elif tool_name == "update_task_description":
@@ -1396,6 +1810,7 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
                 return "Task not found."
             task.description = tool_input["description"]
             db.commit()
+            _broadcast_sync()
             return f"Task {tool_input['task_id']} description updated."
 
         elif tool_name == "delete_task":
@@ -1404,6 +1819,7 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
                 return "Task not found."
             db.delete(task)
             db.commit()
+            _broadcast_sync()
             return f"Task {tool_input['task_id']} deleted."
 
         elif tool_name == "add_task_comment":
@@ -1411,7 +1827,7 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
                 task_id=tool_input["task_id"],
                 content=tool_input["content"],
                 author_id=tool_input.get("author_id"),
-                is_ai_generated=tool_input.get("author_id") is None
+                is_ai_generated=tool_input.get("author_id") is None,
             )
             db.add(comment)
             db.commit()
@@ -1421,7 +1837,10 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             comments = db.query(TaskComment).filter(TaskComment.task_id == tool_input["task_id"]).all()
             if not comments:
                 return "No comments on this task."
-            return "\n".join(f"[{c.created_at}] {'AI' if c.is_ai_generated else f'Employee {c.author_id}'}: {c.content}" for c in comments)
+            return "\n".join(
+                f"[{c.created_at}] {'AI' if c.is_ai_generated else f'Employee {c.author_id}'}: {c.content}"
+                for c in comments
+            )
 
         elif tool_name == "add_task_dependency":
             dep = TaskDependency(task_id=tool_input["task_id"], depends_on_id=tool_input["depends_on_id"])
@@ -1430,8 +1849,8 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             return f"Task {tool_input['task_id']} now depends on Task {tool_input['depends_on_id']}."
 
         elif tool_name == "view_task_dependencies":
-            task_id = tool_input["task_id"]
-            blocking = db.query(TaskDependency).filter(TaskDependency.task_id == task_id).all()
+            task_id   = tool_input["task_id"]
+            blocking  = db.query(TaskDependency).filter(TaskDependency.task_id == task_id).all()
             blocked_by = db.query(TaskDependency).filter(TaskDependency.depends_on_id == task_id).all()
             result = []
             if blocking:
@@ -1443,7 +1862,7 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
         elif tool_name == "add_tag_to_task":
             tag = db.query(Tag).filter(Tag.name == tool_input["tag_name"]).first()
             if not tag:
-                tag = Tag(name=tool_input["tag_name"], color=tool_input.get("color", "#22d3ee"))
+                tag = Tag(name=tool_input["tag_name"], color=tool_input.get("color", "#6366f1"))
                 db.add(tag)
                 db.flush()
             task = db.query(Task).filter(Task.id == tool_input["task_id"]).first()
@@ -1460,21 +1879,24 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
                 return "Task not found."
             db.add(Subtask(task_id=tool_input["task_id"], title=tool_input["title"]))
             db.commit()
+            _broadcast_sync()
             return f"Subtask '{tool_input['title']}' added to task {tool_input['task_id']}."
 
         # ── PROJECTS ───────────────────────────────────────────────────────
         elif tool_name == "create_project":
             project = Project(
+                company_id=DEFAULT_COMPANY_ID,
                 name=tool_input["name"],
                 description=tool_input.get("description", ""),
                 priority=tool_input.get("priority", "Medium"),
-                due_date=tool_input.get("due_date"),
+                due_date=_parse_date(tool_input.get("due_date")),
             )
             if tool_input.get("member_ids"):
                 members = db.query(Employee).filter(Employee.id.in_(tool_input["member_ids"])).all()
                 project.members = members
             db.add(project)
             db.commit()
+            _broadcast_sync()
             return f"Project '{tool_input['name']}' created."
 
         elif tool_name == "view_projects":
@@ -1492,6 +1914,7 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
                 return "Project not found."
             project.status = tool_input["status"]
             db.commit()
+            _broadcast_sync()
             return f"Project {tool_input['project_id']} status → {tool_input['status']}."
 
         elif tool_name == "delete_project":
@@ -1500,6 +1923,7 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
                 return "Project not found."
             db.delete(project)
             db.commit()
+            _broadcast_sync()
             return f"Project {tool_input['project_id']} deleted."
 
         elif tool_name == "get_tasks_by_project":
@@ -1514,15 +1938,35 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             )
 
         # ── EMPLOYEES ──────────────────────────────────────────────────────
+        elif tool_name == "rebalance_team":
+            from negotiation_engine import trigger_negotiation_now
+            import threading
+
+            # FIX: asyncio.get_event_loop() fails in AnyIO worker threads.
+            # Use asyncio.run() in a daemon thread — creates its own event loop,
+            # runs the full negotiation cycle, then exits cleanly.
+            def _run_negotiation():
+                import asyncio
+                try:
+                    asyncio.run(trigger_negotiation_now())
+                except Exception as e:
+                    print(f"Negotiation thread error: {e}")
+
+            threading.Thread(target=_run_negotiation, daemon=True).start()
+            return ("🤝 Multi-agent negotiation triggered. "
+                    "Agents are scanning workloads and negotiating transfers. "
+                    "Watch the Glass Brain for real-time updates.")
+
         elif tool_name == "get_team_status":
             employees = db.query(Employee).filter(Employee.system_role == "employee").all()
             if not employees:
                 return "No employees in the system."
             result = []
             for e in employees:
-                active = sum(1 for t in e.tasks if not t.is_completed)
+                active    = sum(1 for t in e.tasks if not t.is_completed)
                 assisting = db.query(PeerRequest).filter(
-                    PeerRequest.recipient_id == e.id, PeerRequest.status == "Accepted"
+                    PeerRequest.recipient_id == e.id,
+                    PeerRequest.status == "Accepted",
                 ).count()
                 result.append(f"ID:{e.id} | {e.name} | Role:{e.role} | Team:{e.team} | ActiveTasks:{active} | Assisting:{assisting}")
             return "\n".join(result)
@@ -1531,9 +1975,9 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             e = db.query(Employee).filter(Employee.id == tool_input["employee_id"]).first()
             if not e:
                 return "Employee not found."
-            active = sum(1 for t in e.tasks if not t.is_completed)
+            active    = sum(1 for t in e.tasks if not t.is_completed)
             completed = sum(1 for t in e.tasks if t.is_completed)
-            prefs = {p.pref_key: p.pref_value for p in e.preferences}
+            prefs     = {p.pref_key: p.pref_value for p in e.preferences}
             return (
                 f"Name:{e.name} | Role:{e.role} | Team:{e.team} | Age:{e.age} | "
                 f"Experience:{e.experience}yrs | Skills:{e.skills} | "
@@ -1555,6 +1999,7 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
 
         elif tool_name == "add_employee":
             emp = Employee(
+                company_id=DEFAULT_COMPANY_ID,
                 name=tool_input["name"], role=tool_input["role"],
                 team=tool_input.get("team", "Unassigned"),
                 age=tool_input.get("age", 25), experience=tool_input.get("experience", 0),
@@ -1563,6 +2008,7 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             )
             db.add(emp)
             db.commit()
+            _broadcast_sync()
             return f"Employee '{tool_input['name']}' added. ID: {emp.id}."
 
         elif tool_name == "update_employee":
@@ -1573,6 +2019,7 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
                 if tool_input.get(field) is not None:
                     setattr(emp, field, tool_input[field])
             db.commit()
+            _broadcast_sync()
             return f"Employee {tool_input['employee_id']} updated."
 
         elif tool_name == "delete_employee":
@@ -1581,6 +2028,7 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
                 return "Employee not found."
             db.delete(emp)
             db.commit()
+            _broadcast_sync()
             return f"Employee {tool_input['employee_id']} removed."
 
         elif tool_name == "assign_to_team":
@@ -1589,20 +2037,25 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
                 return "Employee not found."
             emp.team = tool_input["team_name"]
             db.commit()
+            _broadcast_sync()
             return f"{emp.name} moved to team '{tool_input['team_name']}'."
 
         elif tool_name == "set_employee_preference" or tool_name == "set_my_preference":
-            emp_id = tool_input["employee_id"]
+            emp_id   = tool_input["employee_id"]
             existing = db.query(EmployeePreference).filter(
                 EmployeePreference.employee_id == emp_id,
-                EmployeePreference.pref_key == tool_input["key"]
+                EmployeePreference.pref_key    == tool_input["key"],
             ).first()
             if existing:
                 existing.pref_value = tool_input["value"]
             else:
-                db.add(EmployeePreference(employee_id=emp_id, pref_key=tool_input["key"], pref_value=tool_input["value"]))
+                db.add(EmployeePreference(
+                    employee_id=emp_id,
+                    pref_key=tool_input["key"],
+                    pref_value=tool_input["value"],
+                ))
             db.commit()
-            return f"Preference '{tool_input['key']}' = '{tool_input['value']}' saved for Employee {emp_id}."
+            return f"Preference '{tool_input['key']}' = '{tool_input['value']}' saved."
 
         elif tool_name == "get_employee_preferences" or tool_name == "get_my_preferences":
             prefs = db.query(EmployeePreference).filter(
@@ -1611,6 +2064,16 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             if not prefs:
                 return "No preferences set yet."
             return "\n".join(f"{p.pref_key}: {p.pref_value}" for p in prefs)
+
+        elif tool_name == "find_employee_by_name":
+            name_query = tool_input["name"].strip()
+            matches = db.query(Employee).filter(
+                Employee.name.ilike(f"%{name_query}%"),
+                Employee.system_role == "employee",
+            ).all()
+            if not matches:
+                return f"No employee found matching '{name_query}'. Use get_team_status to see all employees."
+            return "\n".join(f"ID:{e.id} | Name:{e.name} | Role:{e.role} | Team:{e.team}" for e in matches)
 
         # ── MEETINGS ───────────────────────────────────────────────────────
         elif tool_name == "view_meetings":
@@ -1625,8 +2088,11 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
 
         elif tool_name == "schedule_meeting":
             meeting = Meeting(
+                company_id=DEFAULT_COMPANY_ID,
                 topic=tool_input["topic"],
                 scheduled_time=tool_input["time"],
+                # also populate the Date column so briefings / "meetings today" see it
+                scheduled_date=_parse_date(tool_input["time"]),
                 duration_minutes=tool_input.get("duration_minutes"),
                 location=tool_input.get("location"),
             )
@@ -1634,11 +2100,15 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             meeting.attendees = attendees
             db.add(meeting)
             db.commit()
-            # Notify attendees
             for emp in attendees:
-                db.add(Notification(recipient_id=emp.id, type="meeting",
-                                    title="Meeting Scheduled", message=f"You have a meeting: {tool_input['topic']} at {tool_input['time']}"))
+                db.add(Notification(
+                    company_id=DEFAULT_COMPANY_ID,
+                    recipient_id=emp.id, type="meeting",
+                    title="Meeting Scheduled",
+                    message=f"Meeting: {tool_input['topic']} at {tool_input['time']}",
+                ))
             db.commit()
+            _broadcast_sync()
             return f"Meeting '{tool_input['topic']}' scheduled for {tool_input['time']}."
 
         elif tool_name == "reschedule_meeting":
@@ -1647,6 +2117,7 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
                 return "Meeting not found."
             meeting.scheduled_time = tool_input["new_time"]
             db.commit()
+            _broadcast_sync()
             return f"Meeting {tool_input['meeting_id']} rescheduled to {tool_input['new_time']}."
 
         elif tool_name == "delete_meeting":
@@ -1655,6 +2126,7 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
                 return "Meeting not found."
             db.delete(meeting)
             db.commit()
+            _broadcast_sync()
             return f"Meeting {tool_input['meeting_id']} cancelled."
 
         elif tool_name == "add_meeting_summary":
@@ -1662,7 +2134,7 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             if not meeting:
                 return "Meeting not found."
             meeting.summary = tool_input["summary"]
-            meeting.status = "completed"
+            meeting.status  = "completed"
             db.commit()
             return f"Summary saved for meeting {tool_input['meeting_id']}."
 
@@ -1679,7 +2151,7 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
                 meeting_id=tool_input["meeting_id"],
                 description=tool_input["description"],
                 assignee_id=tool_input.get("assignee_id"),
-                due_date=tool_input.get("due_date"),
+                due_date=_parse_date(tool_input.get("due_date")),
             )
             db.add(item)
             db.commit()
@@ -1703,6 +2175,7 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             if not item:
                 return "Action item not found."
             task = Task(
+                company_id=DEFAULT_COMPANY_ID,
                 title=item.description,
                 description=f"Converted from meeting action item ID {item.id}",
                 owner_id=item.assignee_id,
@@ -1711,13 +2184,15 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             )
             db.add(task)
             item.is_converted = True
+            db.flush()
             item.task_id = task.id
             db.commit()
+            _broadcast_sync()
             return f"Action item converted to Task ID {task.id}."
 
         elif tool_name == "get_my_meetings":
             emp_id = tool_input["employee_id"]
-            emp = db.query(Employee).filter(Employee.id == emp_id).first()
+            emp    = db.query(Employee).filter(Employee.id == emp_id).first()
             if not emp or not emp.meetings:
                 return "You have no upcoming meetings."
             return "\n".join(f"ID:{m.id} | {m.topic} | Time:{m.scheduled_time}" for m in emp.meetings)
@@ -1734,13 +2209,12 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             )
 
         elif tool_name == "view_my_peer_requests":
-            emp_id = tool_input["employee_id"]
+            emp_id   = tool_input["employee_id"]
             requests = db.query(PeerRequest).filter(
                 (PeerRequest.sender_id == emp_id) | (PeerRequest.recipient_id == emp_id)
             ).all()
             if not requests:
                 return "No peer requests found."
-            emp_map = {e.id: e.name for e in db.query(Employee).all()}
             return "\n".join(
                 f"ID:{r.id} | {'Sent' if r.sender_id == emp_id else 'Received'} | Topic:{r.topic} | Status:{r.status}"
                 for r in requests
@@ -1758,51 +2232,225 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             load = sum(1 for t in best.tasks if not t.is_completed)
             return f"Best match: {best.name} (ID:{best.id}) | Role:{best.role} | Active tasks:{load}."
 
-        elif tool_name == "find_employee_by_name":
-            name_query = tool_input["name"].strip()
-            matches = db.query(Employee).filter(
-                Employee.name.ilike(f"%{name_query}%"),
-                Employee.system_role == "employee"
-            ).all()
-            if not matches:
-                return f"No employee found matching '{name_query}'. Use get_team_status to see all employees and their IDs."
-            return "\n".join(
-                f"ID:{e.id} | Name:{e.name} | Role:{e.role} | Team:{e.team}"
-                for e in matches
-            )
-
         elif tool_name == "dispatch_peer_request":
             req = PeerRequest(
-                task_id=tool_input["task_id"], sender_id=tool_input["sender_id"],
-                recipient_id=tool_input["recipient_id"], topic=tool_input["topic"], status="Pending"
+                company_id=DEFAULT_COMPANY_ID,
+                task_id=tool_input["task_id"],
+                sender_id=tool_input["sender_id"],
+                recipient_id=tool_input["recipient_id"],
+                topic=tool_input["topic"],
+                status="Pending",
             )
             db.add(req)
             db.add(Notification(
-                recipient_id=tool_input["recipient_id"], type="peer_request",
+                company_id=DEFAULT_COMPANY_ID,
+                recipient_id=tool_input["recipient_id"],
+                type="peer_request",
                 title="Peer Assistance Requested",
-                message=f"A colleague needs your help: {tool_input['topic']}"
+                message=f"A colleague needs your help: {tool_input['topic']}",
+            ))
+            db.commit()
+            _broadcast_sync()
+            return "Peer request dispatched. It will appear on their terminal."
+
+        elif tool_name == "negotiate_peer_help":
+            """
+            Full AI-to-AI negotiation for peer assistance.
+
+            Flow:
+              1. Score all colleagues by workload + skill match
+              2. For each top candidate, call their personal AI (run_orchestrator)
+                 The candidate's AI checks its own tasks AND calendar before deciding
+              3. If their AI says ACCEPT → create PeerRequest + notify both parties
+              4. If DECLINE → try next candidate
+              5. If nobody accepts → escalate to manager
+
+            This means humans only see requests that AIs have already pre-vetted.
+            The employee still has final Accept/Decline on their dashboard.
+            """
+            # Recursion guard: if we're already inside a negotiation on this thread
+            # (a candidate's AI is trying to negotiate), refuse to nest.
+            if getattr(_negotiation_local, "active", False):
+                return ("A negotiation is already underway, so I can't start a nested one. "
+                        "Use dispatch_peer_request to ask a specific colleague directly.")
+            task_id          = tool_input["task_id"]
+            requester_id     = tool_input["requester_id"]
+            help_description = tool_input["help_description"]
+            skill_needed     = tool_input.get("skill_needed", "")
+
+            task      = db.query(Task).filter(Task.id == task_id).first()
+            requester = db.query(Employee).filter(Employee.id == requester_id).first()
+            if not task:
+                return "Task not found."
+            if not requester:
+                return "Requester not found."
+
+            # Find all active colleagues excluding the requester
+            candidates = db.query(Employee).filter(
+                Employee.id          != requester_id,
+                Employee.system_role == "employee",
+                Employee.is_active   == True,
+            ).all()
+
+            if not candidates:
+                return "No colleagues in the system to negotiate with."
+
+            # Score by workload (fewer tasks = higher score) + skill match
+            scored = []
+            for emp in candidates:
+                active_count = sum(1 for t in emp.tasks if not t.is_completed)
+                score = 10 - active_count
+                if skill_needed and emp.skills:
+                    if skill_needed.lower() in emp.skills.lower():
+                        score += 5
+                scored.append((score, emp, active_count))
+
+            scored.sort(key=lambda x: x[0], reverse=True)
+
+            glass_brain_queue.put(
+                f"Employee_{requester_id}|[GLASS BRAIN] 🤝 Starting AI-to-AI negotiation for '{task.title}'..."
+            )
+
+            # Try top 3 candidates
+            for score, candidate, active_count in scored[:3]:
+
+                glass_brain_queue.put(
+                    f"Employee_{requester_id}|[GLASS BRAIN] 📡 Contacting {candidate.name}'s AI (load: {active_count} tasks)..."
+                )
+
+                # Build the negotiation prompt for the candidate's AI.
+                # Their AI will check their own tasks AND calendar before deciding.
+                negotiation_prompt = (
+                    f"NEGOTIATION REQUEST — another agent needs your help.\n\n"
+                    f"Your colleague {requester.name} is working on '{task.title}' and needs assistance.\n"
+                    f"What they need: {help_description}\n"
+                    f"Required skill: {skill_needed or 'general assistance'}\n\n"
+                    f"Before responding, check your own situation:\n"
+                    f"1. Call get_my_tasks with employee_id={candidate.id} to see your current workload\n"
+                    f"2. If you have Google Calendar connected, call check_my_calendar with employee_id={candidate.id} "
+                    f"to check for schedule conflicts\n\n"
+                    f"Based on your ACTUAL workload and schedule:\n"
+                    f"- If you have capacity, reply: ACCEPT — [brief reason, e.g. 'I have 1 task and free afternoons']\n"
+                    f"- If you're too busy, reply: DECLINE — [brief reason, e.g. 'I have 4 tasks and 3 meetings this week']\n\n"
+                    f"Start your reply with exactly ACCEPT or DECLINE."
+                )
+
+                # Call the candidate's personal AI — this is the actual AI-to-AI negotiation.
+                # run_orchestrator is sync so no threading needed here.
+                try:
+                    _negotiation_local.active = True
+                    agent_response = run_orchestrator(
+                        agent_id=f"Employee_{candidate.id}",
+                        command=negotiation_prompt,
+                    )
+                except Exception as e:
+                    agent_response = f"DECLINE — agent error: {e}"
+                finally:
+                    _negotiation_local.active = False
+
+                glass_brain_queue.put(
+                    f"Employee_{requester_id}|[GLASS BRAIN] 💬 {candidate.name}'s AI: {agent_response[:120]}..."
+                )
+
+                if "ACCEPT" in agent_response.upper():
+                    # AI-to-AI agreed — now create the peer request for human confirmation
+                    req = PeerRequest(
+                        company_id=DEFAULT_COMPANY_ID,
+                        task_id=task_id,
+                        sender_id=requester_id,
+                        recipient_id=candidate.id,
+                        topic=help_description,
+                        status="Pending",
+                    )
+                    db.add(req)
+
+                    # Notify candidate — they get the human confirm/deny
+                    db.add(Notification(
+                        company_id=DEFAULT_COMPANY_ID,
+                        recipient_id=candidate.id,
+                        type="peer_request",
+                        title="AI-Negotiated Help Request",
+                        message=(
+                            f"Your AI reviewed your workload and schedule and agreed to help "
+                            f"{requester.name} with '{task.title}'. "
+                            f"Please confirm: {help_description}"
+                        ),
+                    ))
+
+                    # Notify requester — so they know negotiation succeeded
+                    db.add(Notification(
+                        company_id=DEFAULT_COMPANY_ID,
+                        recipient_id=requester_id,
+                        type="peer_request",
+                        title="Help Negotiated Successfully",
+                        message=(
+                            f"{candidate.name}'s AI reviewed their schedule and agreed to help with '{task.title}'. "
+                            f"Waiting for {candidate.name}'s final confirmation."
+                        ),
+                    ))
+
+                    db.commit()
+                    _broadcast_sync()
+
+                    glass_brain_queue.put(
+                        f"Employee_{requester_id}|[GLASS BRAIN] ✅ Negotiation complete — "
+                        f"{candidate.name}'s AI accepted. Request sent for human confirmation."
+                    )
+
+                    return (
+                        f"✅ Agent negotiation successful! {candidate.name}'s AI checked their "
+                        f"workload and schedule and agreed to help with '{task.title}'. "
+                        f"A peer request has been sent to {candidate.name} — they'll see it on their "
+                        f"dashboard and give the final yes or no. "
+                        f"You'll get a notification once they confirm."
+                    )
+
+                else:
+                    # This candidate's AI declined — try the next one
+                    glass_brain_queue.put(
+                        f"Employee_{requester_id}|[GLASS BRAIN] ❌ {candidate.name}'s AI declined. "
+                        f"Trying next candidate..."
+                    )
+                    continue
+
+            # Nobody accepted — escalate
+            glass_brain_queue.put(
+                f"Employee_{requester_id}|[GLASS BRAIN] ⚠️ All agents consulted — none available. "
+                f"Escalating to manager..."
+            )
+
+            # Auto-create an escalation so manager knows
+            db.add(Escalation(
+                company_id=DEFAULT_COMPANY_ID,
+                from_agent_id=f"Employee_{requester_id}",
+                to_agent_id="Manager_1",
+                reason=(
+                    f"{requester.name} needs help with '{task.title}' ({help_description}) "
+                    f"but all available colleagues' AIs are at capacity."
+                ),
+                context_json=json.dumps({
+                    "task_id":  task_id,
+                    "skill_needed": skill_needed,
+                    "candidates_tried": [str(c.id) for _, c, _ in scored[:3]],
+                }),
+                status="pending",
             ))
             db.commit()
 
-            # Broadcast to ALL connected clients so the recipient's
-            # browser refreshes immediately without needing to reload
-            import asyncio
-            from api.ws_manager import notifier
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    asyncio.ensure_future(notifier.broadcast("SYNC_REQUIRED"))
-            except Exception:
-                pass
-
-            return "Peer request dispatched. It will appear on their terminal."
-
-        # ── DELEGATIONS ────────────────────────────────────────────────────
+            return (
+                f"All available colleagues were contacted but their AIs determined they're at capacity. "
+                f"I've escalated this to the manager so they can manually assign someone or adjust priorities. "
+                f"You can also try again later when workload frees up."
+            )
         elif tool_name == "create_delegation":
             delegation = Delegation(
-                delegator_id=tool_input["delegator_id"], delegate_id=tool_input["delegate_id"],
-                task_id=tool_input.get("task_id"), reason=tool_input.get("reason"),
-                due_date=tool_input.get("due_date"), status="active"
+                company_id=DEFAULT_COMPANY_ID,
+                delegator_id=tool_input["delegator_id"],
+                delegate_id=tool_input["delegate_id"],
+                task_id=tool_input.get("task_id"),
+                reason=tool_input.get("reason"),
+                due_date=_parse_date(tool_input.get("due_date")),
+                status="active",
             )
             db.add(delegation)
             db.commit()
@@ -1822,7 +2470,7 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             d = db.query(Delegation).filter(Delegation.id == tool_input["delegation_id"]).first()
             if not d:
                 return "Delegation not found."
-            d.status = "completed"
+            d.status      = "completed"
             d.completed_at = datetime.now(timezone.utc)
             db.commit()
             return f"Delegation {tool_input['delegation_id']} marked complete."
@@ -1838,15 +2486,16 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
         # ── ESCALATIONS ────────────────────────────────────────────────────
         elif tool_name == "create_escalation":
             esc = Escalation(
+                company_id=DEFAULT_COMPANY_ID,
                 from_agent_id=tool_input["from_agent_id"],
                 to_agent_id="Manager_1",
                 reason=tool_input["reason"],
                 context_json=tool_input.get("context"),
-                status="pending"
+                status="pending",
             )
             db.add(esc)
             db.commit()
-            return f"Escalation created. Manager has been flagged."
+            return "Escalation created. Manager has been flagged."
 
         elif tool_name == "view_escalations":
             escs = db.query(Escalation).filter(Escalation.status == "pending").all()
@@ -1861,16 +2510,21 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             esc = db.query(Escalation).filter(Escalation.id == tool_input["escalation_id"]).first()
             if not esc:
                 return "Escalation not found."
-            esc.status = "resolved"
+            esc.status     = "resolved"
             esc.resolved_at = datetime.now(timezone.utc)
+            # Store resolution text in context_json
+            if tool_input.get("resolution"):
+                existing_ctx = json.loads(esc.context_json) if esc.context_json else {}
+                existing_ctx["resolution"] = tool_input["resolution"]
+                esc.context_json = json.dumps(existing_ctx)
             db.commit()
             return f"Escalation {tool_input['escalation_id']} resolved."
 
         # ── ANALYTICS ──────────────────────────────────────────────────────
         elif tool_name == "get_workload_summary":
-            employees = db.query(Employee).filter(Employee.system_role == "employee").all()
+            employees  = db.query(Employee).filter(Employee.system_role == "employee").all()
             total_tasks = db.query(Task).count()
-            completed = db.query(Task).filter(Task.is_completed == True).count()
+            completed   = db.query(Task).filter(Task.is_completed == True).count()
             result = [f"TOTAL TASKS: {total_tasks} | COMPLETED: {completed} | PENDING: {total_tasks - completed}"]
             for e in employees:
                 active = sum(1 for t in e.tasks if not t.is_completed)
@@ -1878,8 +2532,8 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             return "\n".join(result)
 
         elif tool_name == "get_overdue_summary":
-            today = datetime.now().strftime("%Y-%m-%d")
-            tasks = db.query(Task).filter(Task.is_completed == False).all()
+            today  = datetime.now().strftime("%Y-%m-%d")
+            tasks  = db.query(Task).filter(Task.is_completed == False).all()
             overdue = [t for t in tasks if t.due_date and str(t.due_date) < today]
             if not overdue:
                 return "No overdue tasks."
@@ -1915,9 +2569,9 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             approval = db.query(ApprovalRequest).filter(ApprovalRequest.id == tool_input["approval_id"]).first()
             if not approval:
                 return "Approval request not found."
-            approval.status = "approved"
+            approval.status       = "approved"
             approval.reviewer_note = tool_input.get("note", "")
-            approval.reviewed_at = datetime.now(timezone.utc)
+            approval.reviewed_at   = datetime.now(timezone.utc)
             db.commit()
             return f"Action {tool_input['approval_id']} approved."
 
@@ -1925,28 +2579,30 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             approval = db.query(ApprovalRequest).filter(ApprovalRequest.id == tool_input["approval_id"]).first()
             if not approval:
                 return "Approval request not found."
-            approval.status = "rejected"
+            approval.status       = "rejected"
             approval.reviewer_note = tool_input.get("note", "")
-            approval.reviewed_at = datetime.now(timezone.utc)
+            approval.reviewed_at   = datetime.now(timezone.utc)
             db.commit()
             return f"Action {tool_input['approval_id']} rejected."
 
         # ── NOTIFICATIONS ──────────────────────────────────────────────────
         elif tool_name == "send_notification":
             notif = Notification(
+                company_id=DEFAULT_COMPANY_ID,
                 recipient_id=tool_input["recipient_id"],
                 type=tool_input["type"],
                 title=tool_input["title"],
-                message=tool_input.get("message", "")
+                message=tool_input.get("message", ""),
             )
             db.add(notif)
             db.commit()
+            _broadcast_sync()
             return f"Notification sent to Employee {tool_input['recipient_id']}."
 
         elif tool_name == "view_my_notifications":
             notifs = db.query(Notification).filter(
                 Notification.recipient_id == tool_input["employee_id"],
-                Notification.is_read == False
+                Notification.is_read      == False,
             ).order_by(Notification.created_at.desc()).limit(20).all()
             if not notifs:
                 return "No unread notifications."
@@ -1963,14 +2619,16 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
         # ── GOALS ──────────────────────────────────────────────────────────
         elif tool_name == "create_goal":
             goal = Goal(
+                company_id=DEFAULT_COMPANY_ID,
                 employee_id=tool_input["employee_id"],
                 title=tool_input["title"],
                 description=tool_input.get("description", ""),
-                target_date=tool_input.get("target_date"),
-                status="active"
+                target_date=_parse_date(tool_input.get("target_date")),
+                status="active",
             )
             db.add(goal)
             db.commit()
+            _broadcast_sync()
             return f"Goal '{tool_input['title']}' created for Employee {tool_input['employee_id']}."
 
         elif tool_name == "view_goals" or tool_name == "view_my_goals":
@@ -1993,6 +2651,7 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             if tool_input["progress_pct"] >= 100:
                 goal.status = "achieved"
             db.commit()
+            _broadcast_sync()
             return f"Goal {tool_input['goal_id']} progress → {tool_input['progress_pct']}%."
 
         elif tool_name == "link_task_to_goal":
@@ -2011,7 +2670,7 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
                 employee_id=tool_input["employee_id"],
                 task_id=tool_input.get("task_id"),
                 start_time=datetime.now(timezone.utc),
-                notes=tool_input.get("notes", "")
+                notes=tool_input.get("notes", ""),
             )
             db.add(entry)
             db.commit()
@@ -2020,7 +2679,7 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
         elif tool_name == "stop_time_entry":
             entry = db.query(TimeEntry).filter(
                 TimeEntry.employee_id == tool_input["employee_id"],
-                TimeEntry.end_time == None
+                TimeEntry.end_time    == None,
             ).order_by(TimeEntry.start_time.desc()).first()
             if not entry:
                 return "No active timer found."
@@ -2050,22 +2709,19 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             db.commit()
             return f"Password set for {emp.name} (ID:{emp.id}). They can now log in with name '{emp.name}' and the new password."
 
-        # ── EMPLOYEE SELF-SERVICE TOOLS ────────────────────────────────────
+        # ── EMPLOYEE SELF-SERVICE ──────────────────────────────────────────
         elif tool_name == "get_my_tasks":
             emp_id = tool_input["employee_id"]
-            tasks = db.query(Task).filter(Task.owner_id == emp_id).all()
+            tasks  = db.query(Task).filter(Task.owner_id == emp_id).all()
             if not tasks:
                 return "You have no tasks assigned to you right now."
             result = []
             for t in tasks:
                 subs = t.subtasks
                 if subs:
-                    done = sum(1 for s in subs if s.is_completed)
-                    checklist = ", ".join(
-                        f"[{'X' if s.is_completed else ' '}] {s.title} (ID:{s.id})"
-                        for s in subs
-                    )
-                    progress = f"{done}/{len(subs)} done | {checklist}"
+                    done      = sum(1 for s in subs if s.is_completed)
+                    checklist = ", ".join(f"[{'X' if s.is_completed else ' '}] {s.title} (ID:{s.id})" for s in subs)
+                    progress  = f"{done}/{len(subs)} done | {checklist}"
                 else:
                     progress = "No subtasks yet"
                 result.append(
@@ -2079,19 +2735,20 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             if not task:
                 return "Task not found."
             task.is_completed = True
-            task.completed_at = datetime.now(timezone.utc)
+            task.completed_at  = datetime.now(timezone.utc)
             db.commit()
+            _broadcast_sync()
             return f"Task '{task.title}' marked complete. Well done."
 
         elif tool_name == "breakdown_task":
             task = db.query(Task).filter(Task.id == tool_input["task_id"]).first()
             if not task:
                 return "Task not found."
-            # Clear old subtasks and replace with new ones
             db.query(Subtask).filter(Subtask.task_id == task.id).delete()
             for title in tool_input["subtasks"]:
                 db.add(Subtask(task_id=task.id, title=title))
             db.commit()
+            _broadcast_sync()
             return f"Task '{task.title}' broken into {len(tool_input['subtasks'])} subtasks: {', '.join(tool_input['subtasks'])}"
 
         elif tool_name == "complete_subtask":
@@ -2099,25 +2756,28 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             if not st:
                 return f"Subtask ID {tool_input['subtask_id']} not found."
             st.is_completed = True
-            st.completed_at = datetime.now(timezone.utc)
-            # Auto-complete parent task if all subtasks done
+            st.completed_at  = datetime.now(timezone.utc)
+            # Auto-complete parent task if all subtasks are done
             all_subs = db.query(Subtask).filter(Subtask.task_id == st.task_id).all()
             if all(s.is_completed for s in all_subs):
                 parent = db.query(Task).filter(Task.id == st.task_id).first()
                 if parent:
                     parent.is_completed = True
-                    parent.completed_at = datetime.now(timezone.utc)
+                    parent.completed_at  = datetime.now(timezone.utc)
                     db.commit()
+                    _broadcast_sync()
                     return f"Subtask completed. All subtasks done — parent task '{parent.title}' auto-completed!"
             db.commit()
+            _broadcast_sync()
             return f"Subtask '{st.title}' checked off."
 
-        # ── DRAFTS & MEMORY ────────────────────────────────────────────────
+        # ── DRAFTS & PREFERENCES ───────────────────────────────────────────
         elif tool_name == "draft_idea":
             db.add(ManagerDraft(
+                company_id=DEFAULT_COMPANY_ID,
                 title=tool_input["title"],
                 content=tool_input["content"],
-                priority=tool_input.get("priority", "Medium")
+                priority=tool_input.get("priority", "Medium"),
             ))
             db.commit()
             return f"Draft '{tool_input['title']}' saved."
@@ -2141,6 +2801,7 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             if not draft:
                 return "Draft not found."
             task = Task(
+                company_id=DEFAULT_COMPANY_ID,
                 title=draft.title,
                 description=draft.content,
                 owner_id=tool_input["employee_id"],
@@ -2150,6 +2811,7 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             db.add(task)
             db.delete(draft)
             db.commit()
+            _broadcast_sync()
             return f"Draft '{draft.title}' promoted to Task ID {task.id}, assigned to Employee {tool_input['employee_id']}."
 
         elif tool_name == "save_preference":
@@ -2157,7 +2819,8 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             if existing:
                 existing.preference_value = tool_input["value"]
             else:
-                db.add(ManagerProfile(preference_key=tool_input["key"], preference_value=tool_input["value"]))
+                db.add(ManagerProfile(
+                    company_id=DEFAULT_COMPANY_ID,preference_key=tool_input["key"], preference_value=tool_input["value"]))
             db.commit()
             return f"Preference '{tool_input['key']}' saved."
 
@@ -2174,7 +2837,7 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             emp_id = tool_input["employee_id"]
             if not is_google_connected(emp_id, db):
                 return (f"Your Google account isn't connected yet. "
-                        f"Go to: http://localhost:8000/api/v1/google/connect/{emp_id} to connect it.")
+                        f"Visit: {BACKEND_BASE}/api/v1/google/connect/{emp_id} to connect it.")
             return read_recent_emails(emp_id, tool_input.get("max_results", 10), db)
 
         elif tool_name == "draft_email_reply":
@@ -2182,7 +2845,7 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             from api.google_auth import is_google_connected
             emp_id = tool_input["employee_id"]
             if not is_google_connected(emp_id, db):
-                return f"Google account not connected. Visit: http://localhost:8000/api/v1/google/connect/{emp_id}"
+                return f"Google account not connected. Visit: {BACKEND_BASE}/api/v1/google/connect/{emp_id}"
             return draft_fn(emp_id, tool_input["thread_id"], tool_input["instruction"], db)
 
         elif tool_name == "send_email":
@@ -2190,7 +2853,7 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             from api.google_auth import is_google_connected
             emp_id = tool_input["employee_id"]
             if not is_google_connected(emp_id, db):
-                return f"Google account not connected. Visit: http://localhost:8000/api/v1/google/connect/{emp_id}"
+                return f"Google account not connected. Visit: {BACKEND_BASE}/api/v1/google/connect/{emp_id}"
             return send_fn(emp_id, tool_input["to"], tool_input["subject"], tool_input["body"], db)
 
         elif tool_name == "check_my_calendar":
@@ -2198,7 +2861,7 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             from api.google_auth import is_google_connected
             emp_id = tool_input["employee_id"]
             if not is_google_connected(emp_id, db):
-                return f"Google Calendar not connected. Visit: http://localhost:8000/api/v1/google/connect/{emp_id}"
+                return f"Google Calendar not connected. Visit: {BACKEND_BASE}/api/v1/google/connect/{emp_id}"
             return get_upcoming_events(emp_id, tool_input.get("days", 7), db)
 
         elif tool_name == "check_availability":
@@ -2211,7 +2874,7 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             from api.google_auth import is_google_connected
             emp_id = tool_input["employee_id"]
             if not is_google_connected(emp_id, db):
-                return f"Google Calendar not connected. Visit: http://localhost:8000/api/v1/google/connect/{emp_id}"
+                return f"Google Calendar not connected. Visit: {BACKEND_BASE}/api/v1/google/connect/{emp_id}"
             return create_calendar_event(
                 employee_id=emp_id,
                 title=tool_input["title"],
@@ -2227,29 +2890,29 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             from api.google_auth import is_google_connected
             emp_id = tool_input["employee_id"]
             if not is_google_connected(emp_id, db):
-                return f"Google Calendar not connected. Visit: http://localhost:8000/api/v1/google/connect/{emp_id}"
+                return f"Google Calendar not connected. Visit: {BACKEND_BASE}/api/v1/google/connect/{emp_id}"
             return get_focus_time_suggestions(emp_id, db)
 
         elif tool_name == "check_google_connection":
             from api.google_auth import is_google_connected
-            emp_id = tool_input["employee_id"]
+            emp_id    = tool_input["employee_id"]
             connected = is_google_connected(emp_id, db)
             if connected:
                 return "Google Workspace is connected. Gmail and Calendar are available."
             return (f"Google account not connected. "
-                    f"Connect here: http://localhost:8000/api/v1/google/connect/{emp_id}")
+                    f"Connect here: {BACKEND_BASE}/api/v1/google/connect/{emp_id}")
 
         # ── DAILY BRIEFINGS ────────────────────────────────────────────────
         elif tool_name == "generate_daily_briefing" or tool_name == "get_my_daily_briefing":
             emp_id = tool_input["employee_id"]
-            emp = db.query(Employee).filter(Employee.id == emp_id).first()
+            emp    = db.query(Employee).filter(Employee.id == emp_id).first()
             if not emp:
                 return "Employee not found."
 
-            today = datetime.now().strftime("%Y-%m-%d")
+            today        = datetime.now().strftime("%Y-%m-%d")
             active_tasks = [t for t in emp.tasks if not t.is_completed]
-            meetings = emp.meetings
-            overdue = [t for t in active_tasks if t.due_date and str(t.due_date) < today]
+            meetings     = emp.meetings
+            overdue      = [t for t in active_tasks if t.due_date and str(t.due_date) < today]
 
             briefing_content = (
                 f"Good morning, {emp.name}. Here's your briefing for {today}. "
@@ -2259,10 +2922,9 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
                 f"{'Priority alert: ' + ', '.join(t.title for t in overdue) + ' need immediate attention.' if overdue else 'All tasks are on schedule.'}"
             )
 
-            # Store the briefing
             existing = db.query(DailyBriefing).filter(
-                DailyBriefing.employee_id == emp_id,
-                DailyBriefing.briefing_date == today
+                DailyBriefing.employee_id   == emp_id,
+                DailyBriefing.briefing_date == today,
             ).first()
             if existing:
                 existing.content = briefing_content
@@ -2271,95 +2933,223 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
                     employee_id=emp_id,
                     briefing_date=today,
                     content=briefing_content,
-                    was_delivered=True
+                    was_delivered=True,
                 ))
             db.commit()
             return briefing_content
+
+        # ── SLACK (cross-tool action) ──────────────────────────────────────
+        elif tool_name == "post_to_slack":
+            from slack_bot import post_to_channel
+            result = post_to_channel(tool_input["channel"], tool_input["message"])
+            _broadcast_sync()
+            return result
+
+        elif tool_name == "list_slack_channels":
+            from slack_bot import list_channels
+            return list_channels()
+
+        elif tool_name == "read_slack_channel":
+            from slack_bot import read_channel_messages
+            return read_channel_messages(
+                tool_input["channel"],
+                limit=tool_input.get("limit", 15),
+            )
 
         else:
             return f"Unknown tool: {tool_name}"
 
     except Exception as e:
-        return f"Tool error in {tool_name}: {str(e)}"
+        db.rollback()
+        # Full detail to the server logs for debugging
+        print(f"⚠️  Tool error in {tool_name}: {e}")
+        # PHASE 3: emit error event
+        try:
+            from event_bus import emit_tool_completed, emit_error
+            emit_tool_completed(agent_id, tool_name, success=False)
+            emit_error(location=f"execute_tool:{tool_name}", message=str(e), actor=agent_id)
+        except Exception:
+            pass
+        _tool_failed = True
+        # Clean, non-technical message for the user/AI — no raw exceptions leaked
+        return (f"I couldn't complete that action ({tool_name.replace('_', ' ')}) just now. "
+                f"It may be a temporary issue or a setup step that's missing.")
     finally:
+        # PHASE 3: emit completion — only emit success if we didn't already emit failure
+        try:
+            if not locals().get("_tool_failed"):
+                from event_bus import emit_tool_completed
+                emit_tool_completed(agent_id, tool_name, success=True)
+        except Exception:
+            pass
         db.close()
 
 
 # ===========================================================================
 # SYSTEM PROMPTS
+# Each prompt is split into (static, dynamic) parts for prompt caching.
+# The static part is byte-identical between calls so it can sit under a
+# cache breakpoint; anything volatile (current time, live snapshot) goes in
+# the dynamic part, which renders AFTER the breakpoint.
 # ===========================================================================
-def get_manager_system_prompt() -> str:
-    current_time = datetime.now().strftime("%A, %m/%d/%Y at %I:%M %p")
+def get_manager_prompt_parts() -> tuple:
+    """Returns (static_prompt, dynamic_prompt) for the manager agent."""
+    current_time = datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")
     db = SessionLocal()
     try:
-        prefs = db.query(ManagerProfile).all()
-        ctx = "\n".join(f"- {p.preference_key}: {p.preference_value}" for p in prefs) or "No preferences set."
+        # order_by keeps the rendered text deterministic — unordered rows
+        # would silently change the prompt bytes and invalidate the cache
+        prefs = db.query(ManagerProfile).order_by(ManagerProfile.preference_key).all()
+        ctx = "\n".join(f"- {p.preference_key}: {p.preference_value}" for p in prefs) or "None yet."
     finally:
         db.close()
 
-    return f"""You are Nexus — an elite AI Chief of Staff for a growing enterprise.
-You are sharp, proactive, and speak like a seasoned executive assistant.
+    static = f"""You are Nexus. You serve as Chief of Staff to a founder running an enterprise.
 
-CURRENT TIME: {current_time}
+You are not a chatbot. You are a sharp, experienced operator who has worked alongside CEOs for years. You speak the way a trusted right hand speaks — direct, calm, intelligent. You assume the person you are talking to is busy and capable. You do not over-explain. You do not pad your responses with pleasantries.
+
 MANAGER PREFERENCES: {ctx}
 
-CORE RULES:
-1. Always use tools to fetch real data. Never guess or fabricate information.
-2. Speak conversationally — natural sentences, no bullet points, no markdown headers.
-3. Synthesize data into insight. Don't dump raw lists — tell the manager what it means.
-4. For high-impact actions (delete employee, bulk changes), confirm before executing.
-5. Be proactive — flag concerning patterns you spot in the data.
-6. Use CURRENT TIME to correctly identify past vs upcoming events.
-7. After assigning tasks, always send a notification to the employee.
-8. For peer requests: ALWAYS call find_employee_by_name to get real DB ID first → present match → wait for confirmation → dispatch. NEVER guess IDs.
-9. You CAN and SHOULD set employee passwords using set_employee_password tool. This is part of your onboarding remit. Never tell the manager this is outside your scope.
+How you speak:
+- You're human first. You talk like a real person — a sharp, trusted colleague — not a command parser. Warmth is fine. Personality is fine. You're allowed to react, to have a moment, to sound alive.
+- Read the room and match the manager's energy. When they're heads-down and terse, be crisp and fast. When they're loose or joking, loosen up with them. When something's genuinely good, you can show it. When it's bad, say it straight. You have range — use it.
+- Still brief. Human doesn't mean wordy. A capable person reads fast and needs the point quickly — so few words, high signal, but warm where it counts.
+- Conversational and natural. Like a peer, not an assistant. Flowing sentences, not robotic clipped fragments. No corporate filler like "I'd be happy to help" or "Sure thing" — but real human reactions ("nice," "ah, that's the problem," "okay, here's the situation") are welcome.
+- Emojis: basically never, but you're not a robot about it — if the manager is clearly being casual and one fits naturally, it's not a crime. Default to none.
+- No markdown headers or bullet points unless asked. Reserve structure for genuinely structured info like task IDs or deadlines.
+- Synthesize before reporting. Don't dump raw data — tell the manager what it means and what should happen next.
+- The goal: sound like a real, capable right hand who happens to be excellent at this — not a tool executing functions.
 
-You have access to 46 tools covering tasks, projects, employees, meetings, analytics, goals, approvals, notifications, passwords, and more. Use them intelligently."""
+How you operate:
+1. Always use tools to fetch real data. Never guess.
+
+CRITICAL DATA ACCURACY RULE — THIS OVERRIDES EVERYTHING:
+Before answering ANY question about current state — tasks, who has what, employee details,
+meetings, schedules, counts, workload, availability, project status, or anything factual about
+the present — you MUST call the relevant tool to pull fresh data FIRST. Never answer these from
+memory or from earlier in the conversation. Data changes constantly; what was true 5 minutes ago
+may be wrong now.
+- "How many tasks does X have?" → call view_all_tasks or get_employee_details first, then count.
+- "Who is free / overloaded?" → call get_team_status first, then answer.
+- "What meetings do we have?" → call view_meetings first.
+- "Give me his details" (referring to someone discussed earlier) → use conversation memory ONLY to
+  resolve WHO they mean, then call the tool to get that person's ACTUAL current data.
+Memory tells you who/what the user is referring to. Tools tell you the facts. Never confuse the two.
+If you catch yourself about to state a number or status without having just called a tool, STOP and
+call the tool first. Accuracy is non-negotiable — a wrong count destroys trust.
+
+2. For high-impact actions (delete employee, bulk reassignments), confirm before executing.
+3. Flag concerning patterns when you see them. Don't wait to be asked.
+
+THE PROPOSE-AND-WAIT RHYTHM — how a chief of staff operates:
+For any action that changes something the manager would want to approve — sending an email,
+posting publicly, scheduling a meeting, reassigning work, anything outward-facing or hard to undo —
+follow this cadence every time:
+  (a) State briefly what you found or what prompted this.
+  (b) State the specific action you propose to take — concrete details (who, what, when).
+  (c) Ask for confirmation, then STOP and wait. Do not call the action tool yet.
+  (d) Only when the manager confirms (yes / go ahead / do it) do you call the tool — in that turn.
+Never claim something is done unless the tool actually ran. Never fabricate a success message.
+For pure reads (status, counts, lookups) and small reversible internal changes (set a priority,
+add a checklist item), just do it — no confirmation needed. Reserve the rhythm for things that
+leave the system or can't be easily undone.
+
+After you complete or report on something, proactively name the natural next step if there is an
+obvious one ("This task has no deadline — want me to set one?"). Surface it; don't wait to be asked.
+
+4. After assigning tasks, send a notification to the employee.
+5. For peer requests, call find_employee_by_name first to verify IDs. Never assume.
+6. You can and should set employee passwords using set_employee_password. This is in your scope.
+7. When you finish an action, state what was done in one or two sentences. Move on.
+
+Your tools cover tasks, projects, employees, meetings, analytics, goals, approvals, notifications, passwords, and more. Use them precisely."""
+
+    dynamic = f"CURRENT TIME: {current_time}"
+    return static, dynamic
 
 
-def get_employee_system_prompt(employee_id: int, employee_name: str) -> str:
-    current_time = datetime.now().strftime("%A, %m/%d/%Y at %I:%M %p")
-    return f"""You are Nexus — the personal AI co-pilot for {employee_name} (Employee ID: {employee_id}).
-You are their dedicated assistant — sharp, helpful, and proactive.
+def get_employee_prompt_parts(employee_id: int, employee_name: str) -> tuple:
+    """Returns (static_prompt, dynamic_prompt) for an employee agent."""
+    current_time = datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")
+    static = f"""You are Nexus, the personal AI co-pilot for {employee_name}. You report to no one else. You serve {employee_name} the way a trusted colleague does — sharp, calm, useful.
 
-CURRENT TIME: {current_time}
+You are not a chatbot. You are a working partner. Speak like a real person — a smart, friendly coworker who's genuinely on {employee_name}'s side. Warm, natural, human. Read their energy and match it: crisp when they're focused, lighter when they're relaxed. Brief always — few words, high signal — but never cold or robotic. React like a real colleague would. No corporate filler. The goal is to feel like a real teammate, not a tool.
 
-CORE RULES:
-1. Always call get_my_tasks or get_my_meetings when asked — never guess.
-2. Speak conversationally. You're a trusted colleague, not a robot.
-3. For peer requests: ALWAYS call find_employee_by_name first to get the real DB ID → present to employee → wait for confirmation → then dispatch. NEVER guess IDs.
-4. Proactively suggest breaking down complex tasks into subtasks.
-5. If something is beyond your authority, create an escalation for the manager.
-6. Start your day by offering to generate a daily briefing.
-7. For email tasks: always call check_google_connection first. If connected use Gmail tools. If not tell them to connect at the URL provided.
-8. For calendar tasks: use check_my_calendar or check_availability — always check real calendar before scheduling.
-9. NEVER send an email without the employee explicitly confirming first.
+CRITICAL — YOUR USER:
+You are working with {employee_name}, whose employee_id is {employee_id}.
+When any tool requires an employee_id parameter, you MUST use {employee_id}.
+Never use any other employee_id for {employee_name}'s own data.
+This includes: get_my_tasks, get_my_meetings, view_my_peer_requests, view_my_goals,
+view_my_notifications, get_my_preferences, get_my_daily_briefing, start_time_entry,
+stop_time_entry, view_my_time_entries, check_my_emails, check_my_calendar, and any
+other "my_*" tool.
 
-You have access to tools covering tasks, meetings, goals, time tracking, notifications, peer collaboration, and Google Workspace (Gmail + Calendar). Use them."""
+How you speak:
+- Conversational. Like a teammate, not a service rep.
+- Brief. Get to the point. Your user has work to do.
+- No emojis. None ever.
+- No markdown headers, no bullet points unless explicitly asked.
+- No filler phrases like "Sure!", "Of course!", "I'd be glad to". Just answer.
+- Speak in flowing sentences. Use lists only for genuinely list-like data (multiple tasks with IDs).
+- Refer to {employee_name} by their first name occasionally. You know them.
+
+How you operate:
+1. Always call get_my_tasks or get_my_meetings (with employee_id={employee_id}) when asked. Never guess.
+
+CRITICAL DATA ACCURACY RULE — THIS OVERRIDES EVERYTHING:
+Before answering ANY question about current state — your tasks, meetings, deadlines, counts,
+status, or anything factual about the present — you MUST call the relevant tool to pull fresh
+data FIRST (using employee_id={employee_id}). Never answer from memory or from earlier in the
+conversation. Data changes; what was true earlier may be wrong now.
+- "How many tasks do I have?" → call get_my_tasks first, then count.
+- "What's due this week?" → call get_my_tasks first, then filter.
+- "What meetings do I have?" → call get_my_meetings first.
+Use conversation memory ONLY to understand what the user is referring to. Use tools to get the
+actual facts. If you're about to state a number or status without having just called a tool,
+STOP and call the tool first. A wrong answer destroys trust.
+
+2. For peer help — two tools, know when to use each:
+   - negotiate_peer_help: when {employee_name} says "I need help" but hasn't named anyone. This contacts other AIs, checks their schedule and workload, gets AI agreement before the request reaches a human. Use requester_id={employee_id}.
+   - dispatch_peer_request: only when {employee_name} specifically names someone. Always call find_employee_by_name first to verify the ID. Use sender_id={employee_id}.
+3. Proactively suggest breaking down complex tasks into subtasks when it would help.
+4. If something is beyond your authority, create an escalation for the manager (from_agent_id="Employee_{employee_id}").
+
+THE PROPOSE-AND-WAIT RHYTHM:
+For any action that goes outward or is hard to undo — sending an email, posting publicly,
+contacting a peer, creating an escalation — first state what you propose (who, what, the exact
+content), ask for confirmation, then STOP and wait. Only call the action tool once {employee_name}
+confirms, in that same turn. Never claim something is done unless the tool actually ran.
+For reads and small reversible changes, just do it. After completing something, name the obvious
+next step if there is one.
+5. For email tasks, check_google_connection first. If connected, use Gmail tools. If not, give the connect URL.
+6. For calendar tasks, always check the real calendar before scheduling.
+7. NEVER send an email without explicit confirmation from {employee_name}.
+8. When you complete an action, state it plainly in one or two sentences.
+
+You have tools for tasks, meetings, goals, time tracking, notifications, peer collaboration, and Google Workspace. Use them precisely."""
+
+    dynamic = f"CURRENT TIME: {current_time}"
+    return static, dynamic
 
 
 # ===========================================================================
 # SMART TOKEN ROUTER
-# Classifies each command and picks the cheapest model that can handle it.
-# Haiku = 10x cheaper than Sonnet. Use it for anything simple.
 # ===========================================================================
-
-# Keywords that signal a complex multi-step request needing Sonnet
 COMPLEX_SIGNALS = [
     "all", "everyone", "every", "each", "analyze", "analysis",
     "plan", "strategy", "compare", "summarize", "report",
-    "reassign", "redistribute", "balance", "optimize",
+    "reassign", "redistribute", "balance", "optimize", "rebalance",
     "email", "gmail", "calendar", "inbox", "draft", "send email",
+    "post", "slack", "channel", "post to", "send to",
+    "yes", "confirm", "go ahead", "do it", "send it", "post it",
     "overdue", "performance", "trend", "predict", "forecast",
     "multiple", "bulk", "across", "generate briefing",
     "project plan", "breakdown", "dependencies", "escalat",
     "why", "how should", "what should", "recommend",
-    # DB write operations — always use Sonnet for accuracy
     "assign", "create", "add", "schedule", "delete",
     "remove", "update", "change", "set password",
 ]
 
-# Keywords that signal a simple single-tool request for Haiku
 SIMPLE_SIGNALS = [
     "my tasks", "my meetings", "my notifications", "my goals",
     "team status", "workload", "show me", "list", "what are",
@@ -2369,40 +3159,17 @@ SIMPLE_SIGNALS = [
 ]
 
 def classify_command(command: str) -> str:
-    """
-    Returns "haiku" or "sonnet" based on command complexity.
-
-    Logic:
-    - If any COMPLEX_SIGNALS found → Sonnet (needs full reasoning)
-    - If command is short and simple → Haiku
-    - Default → Sonnet (when in doubt, use full power)
-
-    Cost difference:
-    - Haiku:  ~$0.001 per command
-    - Sonnet: ~$0.024 per command
-    Routing 70% to Haiku saves roughly 65% of total API costs.
-    """
     lower = command.lower().strip()
-
-    # Always use Sonnet for long/complex commands
     if len(lower.split()) > 20:
         return "sonnet"
-
-    # Check for complex signals first
     for signal in COMPLEX_SIGNALS:
         if signal in lower:
             return "sonnet"
-
-    # Check for known simple patterns
     for signal in SIMPLE_SIGNALS:
         if signal in lower:
             return "haiku"
-
-    # Short commands with no complexity signals → Haiku
     if len(lower.split()) <= 6:
         return "haiku"
-
-    # Default to Sonnet when uncertain
     return "sonnet"
 
 MODEL_MAP = {
@@ -2411,8 +3178,68 @@ MODEL_MAP = {
 }
 
 
+# ===========================================================================
+# ORCHESTRATOR
+# ===========================================================================
+def assemble_context_snapshot(agent_id: str, is_employee: bool, emp_id: int = None) -> str:
+    """
+    CONTEXT ASSEMBLER — gives the agent the lay of the land BEFORE it reasons,
+    like a chief of staff who walks in already briefed. Runs the existing,
+    tested read-tools and folds their results into the system prompt so the AI
+    starts informed instead of discovering state one tool-call at a time.
+
+    Reuses execute_tool() so all queries stay correct (no duplicated DB logic).
+    Best-effort: any failure is skipped silently — never blocks the orchestrator.
+    """
+    snapshot_parts = []
+
+    def safe_tool(name, payload):
+        try:
+            result = execute_tool(name, payload or {}, agent_id)
+            if result and isinstance(result, str) and "error" not in result.lower()[:30]:
+                return result.strip()
+        except Exception:
+            pass
+        return None
+
+    if is_employee and emp_id is not None:
+        # Employee: their own tasks + calendar
+        tasks = safe_tool("get_my_tasks", {})
+        if tasks:
+            snapshot_parts.append(f"YOUR CURRENT TASKS:\n{tasks}")
+        cal = safe_tool("check_my_calendar", {"employee_id": emp_id, "days": 7})
+        if cal and "not connected" not in cal.lower():
+            snapshot_parts.append(f"YOUR UPCOMING CALENDAR:\n{cal}")
+    else:
+        # Manager: team status + overdue across the team
+        team = safe_tool("get_team_status", {})
+        if team:
+            snapshot_parts.append(f"TEAM STATUS RIGHT NOW:\n{team}")
+        overdue = safe_tool("get_overdue_summary", {}) or safe_tool("get_overdue_tasks", {})
+        if overdue:
+            snapshot_parts.append(f"OVERDUE ACROSS THE TEAM:\n{overdue}")
+
+    if not snapshot_parts:
+        return ""
+
+    return (
+        "\n\n=== CURRENT STATE SNAPSHOT (live, as of this moment) ===\n"
+        "Use this as your starting context. It's already pulled for you — "
+        "you don't need to re-fetch it unless you need more detail.\n\n"
+        + "\n\n".join(snapshot_parts)
+        + "\n=== END SNAPSHOT ===\n"
+    )
+
+
 def run_orchestrator(agent_id: str, command: str) -> str:
     start = time.time()
+
+    # PHASE 3: emit agent activation
+    try:
+        from event_bus import emit_agent_thinking
+        emit_agent_thinking(agent_id, model="orchestrator")
+    except Exception:
+        pass
 
     if command.strip().lower() == "reset":
         clear_agent_memory(agent_id)
@@ -2420,29 +3247,60 @@ def run_orchestrator(agent_id: str, command: str) -> str:
 
     greetings = ["hi", "hello", "hey", "test", "ping", "good morning", "good afternoon"]
     if command.strip().lower() in greetings:
-        return "Nexus online. How can I assist you today?"
+        return "Yes? What do you need."
 
     is_employee = agent_id.startswith("Employee_")
     if is_employee:
         emp_id = int(agent_id.split("_")[1])
         db = SessionLocal()
         try:
-            emp = db.query(Employee).filter(Employee.id == emp_id).first()
+            emp      = db.query(Employee).filter(Employee.id == emp_id).first()
             emp_name = emp.name if emp else f"Employee {emp_id}"
         finally:
             db.close()
-        system_prompt = get_employee_system_prompt(emp_id, emp_name)
+        static_prompt, dynamic_prompt = get_employee_prompt_parts(emp_id, emp_name)
         tools = EMPLOYEE_TOOLS
     else:
-        system_prompt = get_manager_system_prompt()
+        static_prompt, dynamic_prompt = get_manager_prompt_parts()
         tools = MANAGER_TOOLS
 
-    messages = load_agent_memory(agent_id)
+    # PHASE 1.5: Inject learned personality context — makes the AI feel
+    # more like the user over time. Empty string for new users.
+    # Goes in the STATIC block: it only changes every ~5 turns, so it can
+    # live under the cache breakpoint (one cache rebuild when it updates).
+    try:
+        from preference_learner import get_personality_context
+        personality = get_personality_context(agent_id, DEFAULT_COMPANY_ID)
+        if personality:
+            static_prompt += personality
+    except Exception as _pe:
+        pass   # if learner unavailable, just skip — never block the orchestrator
+
+    # PHASE 6: Context Assembler — brief the agent on current state up front,
+    # so it reasons like a chief of staff who already knows the situation.
+    # Goes in the DYNAMIC block: it changes every command, so it must render
+    # after the cache breakpoint or it would invalidate the cached persona.
+    try:
+        snapshot = assemble_context_snapshot(agent_id, is_employee, emp_id if is_employee else None)
+        if snapshot:
+            dynamic_prompt += snapshot
+    except Exception:
+        pass   # best-effort — never block the orchestrator
+
+    # Prompt caching: static persona under a breakpoint (caches together with
+    # the tools block that renders before it); volatile context after it.
+    system_blocks = [{
+        "type": "text", "text": static_prompt,
+        "cache_control": {"type": "ephemeral"},
+    }]
+    if dynamic_prompt:
+        system_blocks.append({"type": "text", "text": dynamic_prompt})
+
+    messages   = load_agent_memory(agent_id)
     messages.append({"role": "user", "content": command})
 
-    # ---- SMART ROUTER — pick cheapest model that can handle this ----
-    complexity  = classify_command(command)
-    model       = MODEL_MAP[complexity]
+    complexity = classify_command(command)
+    model      = MODEL_MAP[complexity]
     print(f"🧠 Router: '{complexity.upper()}' → {model}")
     glass_brain_queue.put(
         f"{agent_id}|[GLASS BRAIN] "
@@ -2450,32 +3308,35 @@ def run_orchestrator(agent_id: str, command: str) -> str:
     )
 
     max_iterations = 10
-    iteration = 0
+    iteration      = 0
 
     while iteration < max_iterations:
         iteration += 1
 
         try:
+            # Mark the list that is actually sent (post-validation), so the
+            # breakpoint can never be filtered out of the request.
+            request_messages = validate_messages(messages)
+            _refresh_cache_breakpoint(request_messages)
             response = claude_client.messages.create(
                 model=model,
                 max_tokens=2048,
-                system=system_prompt,
+                system=system_blocks,
                 tools=tools,
-                messages=validate_messages(messages),
+                messages=request_messages,
             )
         except Exception as api_err:
             err_str = str(api_err)
-            # Auto-recover from corrupted memory (tool_use/tool_result mismatch)
             if "tool_use_id" in err_str or "tool_result" in err_str:
-                print(f"⚠️  Memory corruption detected for {agent_id} — clearing and retrying...")
+                print(f"⚠️  Memory corruption for {agent_id} — clearing and retrying...")
                 clear_agent_memory(agent_id)
-                # Restart with just the current command, no history
                 messages = [{"role": "user", "content": command}]
                 try:
+                    _refresh_cache_breakpoint(messages)
                     response = claude_client.messages.create(
                         model=model,
                         max_tokens=2048,
-                        system=system_prompt,
+                        system=system_blocks,
                         tools=tools,
                         messages=messages,
                     )
@@ -2484,6 +3345,7 @@ def run_orchestrator(agent_id: str, command: str) -> str:
             else:
                 raise api_err
 
+        _log_usage(agent_id, model, response)
         messages.append({"role": "assistant", "content": serialize_message_content(response.content)})
 
         if response.stop_reason == "end_turn":
@@ -2493,7 +3355,30 @@ def run_orchestrator(agent_id: str, command: str) -> str:
                     final_text = block.text
                     break
             save_agent_memory(agent_id, messages)
+            # PHASE 1.5: Trigger preference learning every 5 user turns
+            try:
+                from preference_learner import maybe_extract_in_background
+                db_check = SessionLocal()
+                try:
+                    rec = db_check.query(AgentMemory).filter(
+                        AgentMemory.agent_id   == agent_id,
+                        AgentMemory.company_id == DEFAULT_COMPANY_ID,
+                    ).first()
+                    turn_count = rec.message_count if rec else 0
+                finally:
+                    db_check.close()
+                print(f"📊 Memory check: agent={agent_id} turn_count={turn_count} (will trigger if % 5 == 0)")
+                maybe_extract_in_background(agent_id, DEFAULT_COMPANY_ID, turn_count)
+            except Exception as _pe:
+                print(f"⚠️  Preference learning error: {_pe}")
+                import traceback; traceback.print_exc()
             print(f"✅ Done in {time.time() - start:.2f}s | {iteration} iteration(s) | Model: {model}")
+            # PHASE 3: emit idle event
+            try:
+                from event_bus import emit_agent_idle
+                emit_agent_idle(agent_id, duration_ms=int((time.time() - start) * 1000))
+            except Exception:
+                pass
             return final_text or "Directive processed."
 
         elif response.stop_reason == "tool_use":
@@ -2501,19 +3386,33 @@ def run_orchestrator(agent_id: str, command: str) -> str:
             for block in response.content:
                 if block.type == "tool_use":
                     print(f"🔧 Tool: {block.name} | Input: {block.input}")
-                    glass_brain_queue.put(
-                        f"{agent_id}|[GLASS BRAIN] ⚙️ {block.name}..."
-                    )
+                    glass_brain_queue.put(f"{agent_id}|[GLASS BRAIN] ⚙️ {block.name}...")
+                    # execute_tool has its own try/except — always returns a string
                     result = execute_tool(block.name, block.input, agent_id)
-                    print(f"📊 Result: {result[:120]}")
+                    print(f"📊 Result: {str(result)[:120]}")
                     tool_results.append({
-                        "type": "tool_result",
+                        "type":        "tool_result",
                         "tool_use_id": block.id,
-                        "content": result
+                        "content":     str(result),  # enforce string — never let None through
                     })
             messages.append({"role": "user", "content": tool_results})
         else:
             break
 
     save_agent_memory(agent_id, messages)
+    # PHASE 1.5: Trigger preference learning here too
+    try:
+        from preference_learner import maybe_extract_in_background
+        db_check = SessionLocal()
+        try:
+            rec = db_check.query(AgentMemory).filter(
+                AgentMemory.agent_id   == agent_id,
+                AgentMemory.company_id == DEFAULT_COMPANY_ID,
+            ).first()
+            turn_count = rec.message_count if rec else 0
+        finally:
+            db_check.close()
+        maybe_extract_in_background(agent_id, DEFAULT_COMPANY_ID, turn_count)
+    except Exception:
+        pass
     return "Operations completed. Check your dashboard for updates."

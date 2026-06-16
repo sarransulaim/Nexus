@@ -4,6 +4,7 @@ from typing import List, Optional
 from sqlalchemy.orm import Session
 from database.core import get_db
 from database.models import Meeting, Employee
+from api.security import get_current_user, require_manager
 
 router = APIRouter()
 
@@ -44,19 +45,30 @@ def format_meeting(meeting: Meeting) -> dict:
 # Routes
 # ---------------------------------------------------------------------------
 @router.get("/")
-def get_all_meetings(db: Session = Depends(get_db)):
-    meetings = db.query(Meeting).all()
+def get_all_meetings(
+    db: Session = Depends(get_db),
+    current_user: Employee = Depends(get_current_user),
+):
+    meetings = db.query(Meeting).filter(Meeting.company_id == current_user.company_id).all()
     return {"meetings": [format_meeting(m) for m in meetings]}
 
 
 @router.post("/")
-def create_meeting(payload: MeetingCreate, db: Session = Depends(get_db)):
+def create_meeting(
+    payload: MeetingCreate,
+    db: Session = Depends(get_db),
+    current_user: Employee = Depends(require_manager),
+):
     meeting = Meeting(
+        company_id=current_user.company_id,
         topic=payload.topic,
         scheduled_time=payload.scheduled_time,
     )
-    # Attach employees via the junction table
-    employees = db.query(Employee).filter(Employee.id.in_(payload.attendee_ids)).all()
+    # Attach employees via the junction table (scoped to the manager's company)
+    employees = db.query(Employee).filter(
+        Employee.id.in_(payload.attendee_ids),
+        Employee.company_id == current_user.company_id,
+    ).all()
     if not employees:
         raise HTTPException(status_code=404, detail="No valid employees found for provided IDs")
     meeting.attendees = employees
@@ -67,8 +79,16 @@ def create_meeting(payload: MeetingCreate, db: Session = Depends(get_db)):
 
 
 @router.patch("/{meeting_id}")
-def update_meeting(meeting_id: int, payload: MeetingUpdate, db: Session = Depends(get_db)):
-    meeting = db.query(Meeting).filter(Meeting.id == meeting_id).first()
+def update_meeting(
+    meeting_id: int,
+    payload: MeetingUpdate,
+    db: Session = Depends(get_db),
+    current_user: Employee = Depends(require_manager),
+):
+    meeting = db.query(Meeting).filter(
+        Meeting.id == meeting_id,
+        Meeting.company_id == current_user.company_id,
+    ).first()
     if not meeting:
         raise HTTPException(status_code=404, detail="Meeting not found")
 
@@ -77,7 +97,10 @@ def update_meeting(meeting_id: int, payload: MeetingUpdate, db: Session = Depend
     if payload.scheduled_time is not None:
         meeting.scheduled_time = payload.scheduled_time
     if payload.attendee_ids is not None:
-        employees = db.query(Employee).filter(Employee.id.in_(payload.attendee_ids)).all()
+        employees = db.query(Employee).filter(
+            Employee.id.in_(payload.attendee_ids),
+            Employee.company_id == current_user.company_id,
+        ).all()
         meeting.attendees = employees
 
     db.commit()
@@ -86,8 +109,15 @@ def update_meeting(meeting_id: int, payload: MeetingUpdate, db: Session = Depend
 
 
 @router.delete("/{meeting_id}")
-def delete_meeting(meeting_id: int, db: Session = Depends(get_db)):
-    meeting = db.query(Meeting).filter(Meeting.id == meeting_id).first()
+def delete_meeting(
+    meeting_id: int,
+    db: Session = Depends(get_db),
+    current_user: Employee = Depends(require_manager),
+):
+    meeting = db.query(Meeting).filter(
+        Meeting.id == meeting_id,
+        Meeting.company_id == current_user.company_id,
+    ).first()
     if not meeting:
         raise HTTPException(status_code=404, detail="Meeting not found")
     db.delete(meeting)

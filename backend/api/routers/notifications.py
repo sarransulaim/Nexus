@@ -6,11 +6,12 @@ POST /notifications/read     → mark one as read
 POST /notifications/read-all → mark all as read
 """
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from database.core import get_db
 from database.models import Notification, Employee
+from api.security import get_current_user
 
 router = APIRouter()
 
@@ -20,11 +21,14 @@ class MarkReadPayload(BaseModel):
 
 
 @router.get("/{employee_id}")
-def get_notifications(employee_id: int, db: Session = Depends(get_db)):
-    """
-    Get the 20 most recent notifications for an employee.
-    Unread ones come first.
-    """
+def get_notifications(
+    employee_id: int,
+    db: Session = Depends(get_db),
+    current_user: Employee = Depends(get_current_user),
+):
+    """Get the 20 most recent notifications for an employee. Unread first."""
+    if current_user.system_role != "manager" and current_user.id != employee_id:
+        raise HTTPException(status_code=403, detail="You can only view your own notifications.")
     notifications = (
         db.query(Notification)
         .filter(Notification.recipient_id == employee_id)
@@ -52,18 +56,28 @@ def get_notifications(employee_id: int, db: Session = Depends(get_db)):
 
 
 @router.post("/read/{notification_id}")
-def mark_read(notification_id: int, db: Session = Depends(get_db)):
-    """Mark a single notification as read."""
+def mark_read(
+    notification_id: int,
+    db: Session = Depends(get_db),
+    current_user: Employee = Depends(get_current_user),
+):
+    """Mark a single notification as read (must belong to the caller)."""
     notif = db.query(Notification).filter(Notification.id == notification_id).first()
-    if notif:
+    if notif and (current_user.system_role == "manager" or notif.recipient_id == current_user.id):
         notif.is_read = True
         db.commit()
     return {"status": "ok"}
 
 
 @router.post("/read-all/{employee_id}")
-def mark_all_read(employee_id: int, db: Session = Depends(get_db)):
+def mark_all_read(
+    employee_id: int,
+    db: Session = Depends(get_db),
+    current_user: Employee = Depends(get_current_user),
+):
     """Mark all notifications for an employee as read."""
+    if current_user.system_role != "manager" and current_user.id != employee_id:
+        raise HTTPException(status_code=403, detail="You can only modify your own notifications.")
     db.query(Notification).filter(
         Notification.recipient_id == employee_id,
         Notification.is_read == False

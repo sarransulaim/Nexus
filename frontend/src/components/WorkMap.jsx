@@ -3,27 +3,19 @@ import ForceGraph3D from 'react-force-graph-3d';
 import SpriteText from 'three-spritetext';
 import * as THREE from 'three';
 
-// ── Node config — aligned with the new design system ──────────
-// Primary: #6366f1 (indigo)
-// AI/Agent: #8b5cf6 (violet)
-// Voice/Cyan: #22d3ee (reserved — NOT used here)
-// Peer/Fuchsia: #d946ef
-// Success: #10b981 (emerald)
-// Warning: #f59e0b (amber)
-
 const NODE_CONFIG = {
-  database: { radius: 22, color: '#6366f1', label: 'Nexus Database'     }, // indigo — foundation
-  core:     { radius: 18, color: '#ffffff', label: 'Nexus Orchestrator'  }, // white — the brain
-  project:  { radius: 14, color: '#10b981', label: 'Projects'            }, // emerald — work units
-  team:     { radius: 12, color: '#8b5cf6', label: 'Teams'               }, // violet — groups
-  employee: { radius: 9,  color: '#a5b4fc', label: 'Employees'           }, // light indigo
-  pai:      { radius: 6,  color: '#d946ef', label: 'Personal AI Agents'  }, // fuchsia — AI
-  pdb:      { radius: 5,  color: '#475569', label: 'Private Databases'   }, // slate — stored data
-  task:     { radius: 5,  color: '#f59e0b', label: 'Tasks'               }, // amber — work items
-  subtask:  { radius: 3,  color: '#78716c', label: 'Subtasks'            }, // muted
+  database: { radius: 22, color: '#6366f1', label: 'Nexus Database'    },
+  core:     { radius: 18, color: '#ffffff', label: 'Nexus Orchestrator' },
+  project:  { radius: 14, color: '#10b981', label: 'Projects'           },
+  team:     { radius: 12, color: '#8b5cf6', label: 'Teams'              },
+  employee: { radius: 9,  color: '#a5b4fc', label: 'Employees'          },
+  pai:      { radius: 6,  color: '#d946ef', label: 'Personal AI Agents' },
+  pdb:      { radius: 5,  color: '#475569', label: 'Private Databases'  },
+  task:     { radius: 5,  color: '#f59e0b', label: 'Tasks'              },
+  subtask:  { radius: 3,  color: '#78716c', label: 'Subtasks'           },
 };
 
-const LINK_COLOR    = 'rgba(99,102,241,0.35)';   // indigo links
+const LINK_COLOR    = 'rgba(99,102,241,0.35)';
 const LINK_WIDTH    = 1;
 const CANVAS_HEIGHT = 620;
 
@@ -33,7 +25,6 @@ export default function WorkMap({ employees, tasks }) {
   const [dimensions, setDimensions] = useState({ width: 800, height: CANVAS_HEIGHT });
   const rotateRef    = useRef(null);
 
-  // Responsive width
   useEffect(() => {
     const measure = () => {
       if (containerRef.current) {
@@ -45,7 +36,6 @@ export default function WorkMap({ employees, tasks }) {
     return () => window.removeEventListener('resize', measure);
   }, []);
 
-  // Auto-rotate when graph settles
   const startAutoRotate = useCallback(() => {
     if (!graphRef.current) return;
     const SPEED = 0.0015;
@@ -70,7 +60,6 @@ export default function WorkMap({ employees, tasks }) {
     }
   }, []);
 
-  // Build graph data
   const graphData = useMemo(() => {
     const nodes = [];
     const links = [];
@@ -86,12 +75,10 @@ export default function WorkMap({ employees, tasks }) {
     const safeEmps  = Array.isArray(employees) ? employees : [];
     const safeTasks = Array.isArray(tasks)     ? tasks     : [];
 
-    // Core nodes
     addNode('db',   'database', 'Nexus DB');
     addNode('core', 'core',     'Nexus AI');
     links.push({ source: 'db', target: 'core' });
 
-    // Teams
     const teams = [...new Set(safeEmps.map(e => e.team || 'Unassigned'))];
     teams.forEach(t => {
       const tid = `team-${t}`;
@@ -99,7 +86,6 @@ export default function WorkMap({ employees, tasks }) {
       links.push({ source: 'core', target: tid });
     });
 
-    // Employees + their personal AI + personal DB
     safeEmps.forEach(emp => {
       const empId = `emp-${emp.id}`;
       const paiId = `pai-${emp.id}`;
@@ -115,9 +101,7 @@ export default function WorkMap({ employees, tasks }) {
       links.push({ source: paiId, target: pdbId });
     });
 
-    // Projects & tasks
     safeTasks.forEach(task => {
-      // Extract project name from task title
       let projName = 'General';
       if (task.title.includes(':')) projName = task.title.split(':')[0].trim();
 
@@ -133,14 +117,12 @@ export default function WorkMap({ employees, tasks }) {
       addNode(taskId, 'task', taskName);
       links.push({ source: projId, target: taskId });
 
-      // Link employee + their AI to the task
       const owner = safeEmps.find(e => e.id === task.owner_id);
       if (owner) {
         links.push({ source: `emp-${owner.id}`, target: taskId });
         links.push({ source: `pai-${owner.id}`, target: taskId });
       }
 
-      // Subtasks
       (task.subtasks || []).forEach(sub => {
         const subId = `sub-${sub.id}`;
         addNode(subId, 'subtask', sub.title.substring(0, 18));
@@ -151,34 +133,32 @@ export default function WorkMap({ employees, tasks }) {
     return { nodes, links };
   }, [employees, tasks]);
 
-  // Render each node as a glowing sphere + label
   const renderNode = useCallback((node) => {
     const cfg = NODE_CONFIG[node.group] || { radius: 5, color: '#64748b' };
 
     const geo = new THREE.SphereGeometry(cfg.radius, 32, 32);
     const mat = new THREE.MeshStandardMaterial({
-      color:            cfg.color,
-      emissive:         cfg.color,
+      color:             cfg.color,
+      emissive:          cfg.color,
       emissiveIntensity: node.group === 'core' ? 0.6 : 0.4,
-      roughness:        0.3,
-      metalness:        0.2,
-      transparent:      true,
-      opacity:          node.group === 'subtask' ? 0.6 : 0.85,
+      roughness:         0.3,
+      metalness:         0.2,
+      transparent:       true,
+      opacity:           node.group === 'subtask' ? 0.6 : 0.85,
     });
     const sphere = new THREE.Mesh(geo, mat);
 
-    // Label — only always-visible for core + database
     const label = new SpriteText(node.name);
-    label.color       = node.group === 'core' ? '#ffffff' : 'rgba(248,250,252,0.75)';
-    label.textHeight  = node.group === 'core' ? 10 : 7;
-    label.fontWeight  = node.group === 'core' ? 'bold' : 'normal';
-    label.fontFace    = 'Inter, ui-sans-serif, system-ui, sans-serif';
+    label.color           = node.group === 'core' ? '#ffffff' : 'rgba(248,250,252,0.75)';
+    label.textHeight      = node.group === 'core' ? 10 : 7;
+    label.fontWeight      = node.group === 'core' ? 'bold' : 'normal';
+    label.fontFace        = 'Inter, ui-sans-serif, system-ui, sans-serif';
     label.backgroundColor = 'rgba(9,9,15,0.6)';
-    label.padding     = 2;
-    label.borderRadius = 3;
+    label.padding         = 2;
+    label.borderRadius    = 3;
     label.position.set(0, -(cfg.radius + 10), 0);
-    label.visible     = node.group === 'core' || node.group === 'database';
-    label.userData    = { isLabel: true, group: node.group };
+    label.visible   = node.group === 'core' || node.group === 'database';
+    label.userData  = { isLabel: true, group: node.group };
 
     const group = new THREE.Group();
     group.add(sphere);
@@ -186,23 +166,22 @@ export default function WorkMap({ employees, tasks }) {
     return group;
   }, []);
 
-  // Proximity-based label reveal (show labels when zoomed in)
   useEffect(() => {
     let raf;
     const tmp = new THREE.Vector3();
-
     const tick = () => {
       if (graphRef.current) {
         const cam   = graphRef.current.camera();
         const scene = graphRef.current.scene();
         if (cam && scene) {
           scene.traverse(obj => {
-            if (obj.userData?.isLabel &&
-                obj.userData.group !== 'core' &&
-                obj.userData.group !== 'database') {
+            if (
+              obj.userData?.isLabel &&
+              obj.userData.group !== 'core' &&
+              obj.userData.group !== 'database'
+            ) {
               obj.getWorldPosition(tmp);
-              const d2 = tmp.distanceToSquared(cam.position);
-              obj.visible = d2 < 55000; // reveal when close enough
+              obj.visible = tmp.distanceToSquared(cam.position) < 55000;
             }
           });
         }
@@ -217,12 +196,14 @@ export default function WorkMap({ employees, tasks }) {
 
   return (
     <div style={{
+      // FIX: --border, --bg-card, --text-3 don't exist in the design system.
+      // Replaced with the correct CSS variables from index.css.
       borderRadius: '0.875rem',
-      border: '1px solid var(--border)',
-      background: 'var(--bg-card)',
-      overflow: 'hidden',
-      position: 'relative',
-      marginTop: '1.25rem',
+      border:       '1px solid var(--b1)',      // was: var(--border)
+      background:   'var(--bg-2)',              // was: var(--bg-card)
+      overflow:     'hidden',
+      position:     'relative',
+      marginTop:    '1.25rem',
     }}>
       {/* Header overlay */}
       <div style={{
@@ -230,12 +211,16 @@ export default function WorkMap({ employees, tasks }) {
         display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start',
         padding: '1.25rem', pointerEvents: 'none',
       }}>
-        {/* Title */}
         <div>
-          <p style={{ fontSize: '0.6875rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', color: 'var(--text-3)', marginBottom: '0.25rem' }}>
+          <p style={{
+            fontSize: '0.6875rem', fontWeight: 700, textTransform: 'uppercase',
+            letterSpacing: '0.08em',
+            color: 'var(--t3)',   // was: var(--text-3)
+            marginBottom: '0.25rem',
+          }}>
             Nexus 3D Brain
           </p>
-          <p style={{ fontSize: '0.5625rem', color: 'var(--text-3)', opacity: 0.6 }}>
+          <p style={{ fontSize: '0.5625rem', color: 'var(--t3)', opacity: 0.6 }}>
             Drag to rotate · Scroll to zoom · Zoom in to reveal labels
           </p>
         </div>
@@ -244,20 +229,26 @@ export default function WorkMap({ employees, tasks }) {
         <div style={{
           display: 'flex', flexDirection: 'column', gap: '0.375rem',
           background: 'rgba(9,9,15,0.75)', backdropFilter: 'blur(8px)',
-          border: '1px solid var(--border)', borderRadius: '0.625rem',
+          border: '1px solid var(--b1)', borderRadius: '0.625rem',
           padding: '0.75rem 1rem',
         }}>
           {Object.entries(NODE_CONFIG).map(([key, cfg]) => (
             <div key={key} style={{ display: 'flex', alignItems: 'center', gap: '0.5rem' }}>
               <div style={{
-                width: `${Math.max(cfg.radius * 0.55, 5)}px`,
-                height: `${Math.max(cfg.radius * 0.55, 5)}px`,
+                width:        `${Math.max(cfg.radius * 0.55, 5)}px`,
+                height:       `${Math.max(cfg.radius * 0.55, 5)}px`,
                 borderRadius: '999px',
-                background: cfg.color,
-                boxShadow: `0 0 6px ${cfg.color}66`,
-                flexShrink: 0,
+                background:   cfg.color,
+                boxShadow:    `0 0 6px ${cfg.color}66`,
+                flexShrink:   0,
               }} />
-              <span style={{ fontSize: '0.5625rem', color: 'rgba(248,250,252,0.5)', textTransform: 'uppercase', letterSpacing: '0.05em', whiteSpace: 'nowrap' }}>
+              <span style={{
+                fontSize:      '0.5625rem',
+                color:         'rgba(248,250,252,0.5)',
+                textTransform: 'uppercase',
+                letterSpacing: '0.05em',
+                whiteSpace:    'nowrap',
+              }}>
                 {cfg.label}
               </span>
             </div>

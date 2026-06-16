@@ -24,6 +24,11 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 JWT_SECRET      = os.getenv("JWT_SECRET", "nexus_change_this_in_production")
 JWT_ALGORITHM   = "HS256"
+
+if JWT_SECRET == "nexus_change_this_in_production":
+    print("⚠️  SECURITY: JWT_SECRET is the built-in default. Set a strong, random "
+          "JWT_SECRET in the environment before any non-local deployment — anyone "
+          "who knows the default can forge valid login tokens for any user.")
 ACCESS_TOKEN_EXPIRE_HOURS  = 8    # token lasts 8 hours
 REFRESH_TOKEN_EXPIRE_DAYS  = 30   # refresh token lasts 30 days
 

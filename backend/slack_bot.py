@@ -74,7 +74,21 @@ app = App(token=SLACK_BOT_TOKEN)
 # ═══════════════════════════════════════════════════════════════
 
 def get_employee_by_slack_id(slack_user_id: str) -> Employee | None:
-    """Finds the Nexus employee linked to this Slack user ID."""
+    """
+    Finds the Nexus employee linked to this Slack user ID.
+    DB-first (channel_connections), with JSON fallback for any
+    legacy links created before the DB flow existed.
+    """
+    # 1. Try the database (the proper, UI-managed path)
+    try:
+        from channels_router import slack_employee_lookup
+        emp = slack_employee_lookup(slack_user_id)
+        if emp:
+            return emp
+    except Exception as e:
+        log.warning(f"DB slack lookup failed, trying JSON: {e}")
+
+    # 2. Fallback: legacy JSON file
     links = load_links()
     employee_id = links.get(slack_user_id)
     if not employee_id:
@@ -108,7 +122,13 @@ def route_to_agent(employee: Employee, message: str) -> str:
     Sends the employee's message to their personal AI agent
     and returns the response.
     """
-    agent_id = f"Employee_{employee.id}"
+    # Match the web path's agent_id convention so Slack and web share
+    # the SAME agent identity (and therefore the same memory thread).
+    # Manager → "Manager_1", everyone else → "Employee_{id}".
+    if employee.system_role == "manager":
+        agent_id = "Manager_1"
+    else:
+        agent_id = f"Employee_{employee.id}"
     try:
         response = run_orchestrator(agent_id=agent_id, command=message)
         # Trigger WebSocket broadcast so dashboard updates instantly
@@ -182,6 +202,30 @@ def handle_dm(event, say, client):
         return
 
     log.info(f"DM from Slack user {slack_user_id}: {text[:60]}")
+
+    # ── Slack linking: is this message a 6-digit verification code? ──
+    # If so, try to complete a pending link instead of routing to AI.
+    stripped = text.replace(" ", "")
+    if stripped.isdigit() and len(stripped) == 6:
+        try:
+            from channels_router import complete_slack_link
+            result = complete_slack_link(slack_user_id, stripped)
+            if result.get("linked"):
+                name = result.get("employee_name", "")
+                say(text=f"✅ Linked! Your Slack is now connected to Nexus"
+                         f"{f' as {name}' if name else ''}. "
+                         f"Send me anything and your AI will respond.")
+                return
+            # If not linked and reason is expired/no_pending, fall through only
+            # if they're not already a known user (so existing users can still
+            # send numbers). We check below.
+            if result.get("reason") == "expired":
+                say(text="That code has expired. Generate a new one in Nexus → Connections.")
+                return
+        except Exception as e:
+            log.warning(f"slack link attempt failed: {e}")
+        # If no pending code matched, fall through — maybe it's a real message
+        # from an already-linked user (e.g. "123456" as actual content).
 
     # Look up the employee
     employee = get_employee_by_slack_id(slack_user_id)
@@ -307,10 +351,185 @@ def handle_slash_nexus(ack, respond, command):
 
 
 # ═══════════════════════════════════════════════════════════════
-# ENTRY POINT
+# ENTRY POINTS
 # ═══════════════════════════════════════════════════════════════
 
+# ===========================================================================
+# OUTBOUND: POST TO A CHANNEL (cross-tool action)
+# ===========================================================================
+
+def list_channels() -> str:
+    """Return public channels the bot can see, as a readable string."""
+    try:
+        resp = app.client.conversations_list(
+            types="public_channel", limit=200, exclude_archived=True
+        )
+        chans = resp.get("channels", [])
+        if not chans:
+            return "No channels found."
+        return "\n".join(f"#{c['name']} (id: {c['id']})" for c in chans)
+    except Exception as e:
+        return f"Could not list channels: {e}"
+
+
+def _resolve_channel_id(channel: str):
+    """Accept '#name', 'name', or a channel ID and return a channel ID."""
+    channel = (channel or "").strip().lstrip("#")
+    if not channel:
+        return None
+    if channel.startswith("C") and channel.isupper() and len(channel) >= 9:
+        return channel
+    try:
+        resp = app.client.conversations_list(
+            types="public_channel", limit=200, exclude_archived=True
+        )
+        for c in resp.get("channels", []):
+            if c.get("name", "").lower() == channel.lower():
+                return c.get("id")
+    except Exception:
+        pass
+    return None
+
+
+def post_to_channel(channel: str, message: str) -> str:
+    """
+    Post a message to a Slack channel as the Nexus bot.
+    `channel` may be '#name', 'name', or a channel ID.
+    The bot must be a member of the channel (invite it first).
+    """
+    if not message or not message.strip():
+        return "Nothing to post — message was empty."
+    channel_id = _resolve_channel_id(channel)
+    if not channel_id:
+        return (f"Could not find channel '{channel}'. "
+                f"Make sure it exists and the Nexus bot has been added to it.")
+
+    # Try to join the channel first (no-op if already a member; needs channels:join).
+    # This is what makes the post actually appear for public channels.
+    try:
+        app.client.conversations_join(channel=channel_id)
+    except Exception as join_err:
+        log.info(f"conversations_join skipped/failed for {channel_id}: {join_err}")
+
+    try:
+        resp = app.client.chat_postMessage(channel=channel_id, text=message)
+        clean = channel if channel.startswith("#") else "#" + channel.lstrip("#")
+        ok = resp.get("ok")
+        ts = resp.get("ts")
+        posted_channel = resp.get("channel")
+        log.info(f"chat_postMessage ok={ok} channel={posted_channel} ts={ts}")
+        if ok:
+            return f"Posted to {clean} (message id {ts})."
+        return f"Slack reported a problem posting to {clean}: {resp}"
+    except Exception as e:
+        err = str(e)
+        if "not_in_channel" in err or "channel_not_found" in err:
+            return ("Could not post — the Nexus bot is not a member of that channel. "
+                    "In Slack, invite the bot with /invite @Nexus, then try again.")
+        if "missing_scope" in err:
+            return ("Could not post — the bot is missing a required scope "
+                    "(need chat:write and channels:join). Add them in the Slack app "
+                    "settings and reinstall.")
+        return f"Failed to post: {err}"
+
+
+
+def read_channel_messages(channel: str, limit: int = 15) -> str:
+    """
+    Read recent messages from a Slack channel and return them as readable text.
+    `channel` may be '#name', 'name', or a channel ID.
+    Needs the channels:history scope and the bot must be in the channel.
+    """
+    channel_id = _resolve_channel_id(channel)
+    if not channel_id:
+        return (f"Could not find channel '{channel}'. Make sure it exists and the "
+                f"Nexus bot has been added to it.")
+    try:
+        resp = app.client.conversations_history(channel=channel_id, limit=limit)
+        msgs = resp.get("messages", [])
+        if not msgs:
+            return f"No recent messages in {channel}."
+
+        # Resolve user IDs to names where possible (cached per call)
+        name_cache = {}
+        def name_for(uid):
+            if not uid:
+                return "someone"
+            if uid in name_cache:
+                return name_cache[uid]
+            try:
+                info = app.client.users_info(user=uid)
+                nm = info["user"]["profile"].get("real_name") or info["user"].get("name") or uid
+            except Exception:
+                nm = uid
+            name_cache[uid] = nm
+            return nm
+
+        lines = []
+        # Slack returns newest-first; reverse to read oldest-to-newest
+        for m in reversed(msgs):
+            if m.get("subtype"):  # skip joins/leaves/system messages
+                continue
+            who = name_for(m.get("user") or m.get("bot_id"))
+            txt = (m.get("text") or "").strip()
+            if txt:
+                lines.append(f"{who}: {txt}")
+        if not lines:
+            return f"No readable messages in {channel} (only system events)."
+        clean = channel if channel.startswith("#") else "#" + channel.lstrip("#")
+        return f"Recent messages in {clean}:\n" + "\n".join(lines)
+    except Exception as e:
+        err = str(e)
+        if "not_in_channel" in err or "channel_not_found" in err:
+            return ("Could not read — the Nexus bot is not a member of that channel. "
+                    "Invite it with /invite @Nexus, then try again.")
+        if "missing_scope" in err:
+            return ("Could not read — the bot is missing the channels:history scope. "
+                    "Add it in the Slack app settings and reinstall.")
+        return f"Failed to read channel: {err}"
+
+_handler = None
+_started = False
+
+
+def start_in_background():
+    """
+    Start the Slack Socket Mode bot in a daemon thread so it runs
+    inside the FastAPI process (no separate `python slack_bot.py`).
+
+    Safe to call once at app startup. No-ops if tokens are missing
+    or if already started.
+    """
+    global _handler, _started
+    if _started:
+        return
+    if not SLACK_BOT_TOKEN or not SLACK_APP_TOKEN:
+        log.warning("⚠️  Slack tokens not set — Slack bot not started.")
+        return
+
+    def _run():
+        global _handler
+        try:
+            log.info("🚀 Starting Nexus Slack Bot (Socket Mode, background)...")
+            _handler = SocketModeHandler(app, SLACK_APP_TOKEN)
+            # Use connect() not start() in a thread — start() installs a
+            # signal handler that only works in the main thread. connect()
+            # opens the socket and listens without the signal setup.
+            _handler.connect()
+            # Keep this thread alive so the socket stays open.
+            import time as _time
+            while True:
+                _time.sleep(3600)
+        except Exception as e:
+            log.error(f"Slack bot crashed: {e}")
+
+    threading.Thread(target=_run, daemon=True, name="slack-bot").start()
+    _started = True
+    log.info("✅ Slack bot thread launched")
+
+
 if __name__ == "__main__":
-    log.info("🚀 Starting Nexus Slack Bot (Socket Mode)...")
+    # Standalone mode still works: python slack_bot.py
+    log.info("🚀 Starting Nexus Slack Bot (Socket Mode, standalone)...")
     handler = SocketModeHandler(app, SLACK_APP_TOKEN)
     handler.start()

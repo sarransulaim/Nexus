@@ -1,17 +1,20 @@
 """
 google_services.py — Gemini-powered Gmail + Calendar
 ======================================================
-This is where Gemini does its job.
-Claude (orchestrator) calls these functions when an employee
-needs Google Workspace actions. Gemini handles the heavy lifting
-because it's natively optimized for Google's APIs.
+Gemini handles all Google Workspace operations:
+  - Read & summarize emails
+  - Draft email replies
+  - Send emails
+  - Read calendar events
+  - Check availability
+  - Create calendar events
+  - Suggest focus time blocks
 
-Architecture:
-  Claude decides WHAT to do
-  → calls these functions
-  → Gemini reads/writes Google data
-  → returns structured result to Claude
-  → Claude formats the final response
+FIX FROM PREVIOUS VERSION:
+- Removed all EmailSummary table references (removed in v3 schema)
+- Summaries are returned directly to user, not cached in DB
+- This means each "check emails" call hits Gemini fresh, which is fine
+  because the AI router will eventually use Gemini Flash (cheaper)
 """
 
 import os
@@ -29,27 +32,23 @@ from sqlalchemy.orm import Session
 
 from api.google_auth import get_credentials, is_google_connected
 from database.core import SessionLocal
-from database.models import Employee, EmailSummary, OAuthToken
+from database.models import Employee, OAuthToken
 
-load_dotenv_flag = False
 try:
     from dotenv import load_dotenv
     load_dotenv()
-    load_dotenv_flag = True
 except ImportError:
     pass
 
-# ---------------------------------------------------------------------------
-# GEMINI SETUP — new google.genai SDK
-# ---------------------------------------------------------------------------
+# ── Gemini setup ──────────────────────────────────────────────
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-gemini_client  = genai.Client(api_key=GEMINI_API_KEY)
+gemini_client  = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 GEMINI_MODEL   = "gemini-2.5-pro"
 
 
-# ===========================================================================
+# ═══════════════════════════════════════════════════════════════
 # GMAIL FUNCTIONS
-# ===========================================================================
+# ═══════════════════════════════════════════════════════════════
 
 def get_gmail_service(employee_id: int, db: Session):
     """Returns an authenticated Gmail API service object."""
@@ -61,8 +60,7 @@ def get_gmail_service(employee_id: int, db: Session):
 
 def read_recent_emails(employee_id: int, max_results: int = 10, db: Session = None) -> str:
     """
-    Fetches and AI-summarizes the most recent emails for an employee.
-    Uses Gemini to extract key info and action items.
+    Fetches and summarizes the most recent unread emails for an employee.
     """
     close_db = False
     if db is None:
@@ -77,7 +75,7 @@ def read_recent_emails(employee_id: int, max_results: int = 10, db: Session = No
         if not service:
             return "Failed to connect to Gmail."
 
-        # Fetch recent message IDs
+        # Fetch recent unread message IDs
         results = service.users().messages().list(
             userId="me",
             maxResults=max_results,
@@ -90,7 +88,7 @@ def read_recent_emails(employee_id: int, max_results: int = 10, db: Session = No
             return "No unread emails found."
 
         email_data = []
-        for msg in messages[:5]:  # Process top 5 to avoid token overload
+        for msg in messages[:5]:  # Top 5 to avoid token overload
             full_msg = service.users().messages().get(
                 userId="me",
                 id=msg["id"],
@@ -103,7 +101,6 @@ def read_recent_emails(employee_id: int, max_results: int = 10, db: Session = No
             date      = headers.get("Date", "")
             thread_id = full_msg.get("threadId", "")
 
-            # Extract body text
             body = _extract_email_body(full_msg["payload"])
 
             email_data.append({
@@ -112,12 +109,15 @@ def read_recent_emails(employee_id: int, max_results: int = 10, db: Session = No
                 "subject":   subject,
                 "sender":    sender,
                 "date":      date,
-                "body":      body[:1000],  # cap at 1000 chars per email
+                "body":      body[:1000],
             })
 
-        # Use Gemini to summarize and extract action items
+        if not gemini_client:
+            return "Gemini API key not configured. Cannot summarize emails."
+
+        # Summarize with Gemini
         prompt = f"""You are an AI assistant summarizing emails for a busy professional.
-        
+
 Here are their recent unread emails:
 
 {json.dumps(email_data, indent=2)}
@@ -133,24 +133,6 @@ Be concise. Format as a clean readable list."""
         response = gemini_client.models.generate_content(model=GEMINI_MODEL, contents=prompt)
         summary  = response.text
 
-        # Cache summaries in DB to avoid re-processing
-        for email in email_data:
-            existing = db.query(EmailSummary).filter(
-                EmailSummary.employee_id     == employee_id,
-                EmailSummary.gmail_thread_id == email["thread_id"]
-            ).first()
-
-            if not existing:
-                db.add(EmailSummary(
-                    employee_id     = employee_id,
-                    gmail_thread_id = email["thread_id"],
-                    subject         = email["subject"],
-                    sender          = email["sender"],
-                    received_at     = email["date"],
-                    summary         = summary,
-                ))
-
-        db.commit()
         return f"📧 Email Summary ({len(email_data)} unread):\n\n{summary}"
 
     except Exception as e:
@@ -160,16 +142,8 @@ Be concise. Format as a clean readable list."""
             db.close()
 
 
-def draft_email_reply(
-    employee_id: int,
-    thread_id: str,
-    instruction: str,
-    db: Session = None
-) -> str:
-    """
-    Uses Gemini to draft an email reply in the employee's communication style.
-    Reads the thread context first, then drafts a contextually appropriate reply.
-    """
+def draft_email_reply(employee_id: int, thread_id: str, instruction: str, db: Session = None) -> str:
+    """Uses Gemini to draft an email reply in the employee's voice."""
     close_db = False
     if db is None:
         db = SessionLocal()
@@ -183,26 +157,25 @@ def draft_email_reply(
         if not service:
             return "Failed to connect to Gmail."
 
-        # Get employee info for style context
         emp = db.query(Employee).filter(Employee.id == employee_id).first()
         emp_name = emp.name if emp else "Employee"
 
-        # Fetch the thread
         thread = service.users().threads().get(
             userId="me",
             id=thread_id,
             format="full"
         ).execute()
 
-        # Extract thread messages
         thread_text = ""
-        for msg in thread.get("messages", [])[-3:]:  # last 3 messages for context
+        for msg in thread.get("messages", [])[-3:]:
             headers = {h["name"]: h["value"] for h in msg["payload"].get("headers", [])}
             sender  = headers.get("From", "Unknown")
             body    = _extract_email_body(msg["payload"])
             thread_text += f"\nFrom: {sender}\n{body[:500]}\n---"
 
-        # Gemini drafts the reply
+        if not gemini_client:
+            return "Gemini API key not configured."
+
         prompt = f"""You are drafting an email reply for {emp_name}.
 
 Email thread context:
@@ -226,13 +199,7 @@ Sign it as: {emp_name}"""
             db.close()
 
 
-def send_email(
-    employee_id: int,
-    to: str,
-    subject: str,
-    body: str,
-    db: Session = None
-) -> str:
+def send_email(employee_id: int, to: str, subject: str, body: str, db: Session = None) -> str:
     """Sends an email from the employee's Gmail account."""
     close_db = False
     if db is None:
@@ -240,6 +207,29 @@ def send_email(
         close_db = True
 
     try:
+        # ── Recipient validation (polish: catch malformed / likely-typo addresses) ──
+        to_clean = (to or "").strip()
+        if "@" not in to_clean or "." not in to_clean.split("@")[-1]:
+            return (f"That email address looks invalid: '{to}'. "
+                    f"Please give me a valid recipient address (like name@company.com) and I'll send it.")
+
+        local_part = to_clean.split("@")[0]
+        domain = to_clean.split("@")[-1].lower()
+
+        # Detect domains that are CLOSE to a known provider but not exact (catches
+        # gmil, gmal, gmaill, gmail.cm, yahooo, hotmial, etc. without a fixed list).
+        import difflib
+        KNOWN_PROVIDERS = [
+            "gmail.com", "yahoo.com", "hotmail.com", "outlook.com",
+            "icloud.com", "aol.com", "protonmail.com", "live.com",
+        ]
+        if domain not in KNOWN_PROVIDERS:
+            close = difflib.get_close_matches(domain, KNOWN_PROVIDERS, n=1, cutoff=0.8)
+            if close:
+                return (f"The address '{to}' looks like a typo — did you mean "
+                        f"'{local_part}@{close[0]}'? "
+                        f"I did NOT send it. Confirm the correct address and I'll send.")
+
         if not is_google_connected(employee_id, db):
             return "Google account not connected."
 
@@ -247,21 +237,18 @@ def send_email(
         if not service:
             return "Failed to connect to Gmail."
 
-        # Get employee's Gmail address from their profile
         profile  = service.users().getProfile(userId="me").execute()
         from_email = profile.get("emailAddress", "me")
 
         emp      = db.query(Employee).filter(Employee.id == employee_id).first()
         emp_name = emp.name if emp else "Nexus User"
 
-        # Build email with proper headers and charset
         message = MIMEMultipart("alternative")
         message["to"]      = to
         message["from"]    = f"{emp_name} <{from_email}>"
         message["subject"] = subject
         message.attach(MIMEText(body, "plain", "utf-8"))
 
-        # Encode correctly — Gmail API needs urlsafe base64 without padding issues
         raw_bytes = message.as_bytes()
         raw_b64   = base64.urlsafe_b64encode(raw_bytes).decode("ascii")
 
@@ -274,8 +261,7 @@ def send_email(
         return (f"✅ Email sent successfully!\n"
                 f"To: {to}\n"
                 f"Subject: {subject}\n"
-                f"Message ID: {msg_id}\n"
-                f"Check your Sent folder in Gmail to confirm.")
+                f"Message ID: {msg_id}")
 
     except Exception as e:
         return f"Send error: {str(e)}"
@@ -284,29 +270,11 @@ def send_email(
             db.close()
 
 
-def get_email_summary_from_cache(employee_id: int, db: Session) -> str:
-    """Returns cached email summaries from DB — avoids hitting Gmail API repeatedly."""
-    summaries = db.query(EmailSummary).filter(
-        EmailSummary.employee_id == employee_id,
-        EmailSummary.is_actioned == False
-    ).order_by(EmailSummary.created_at.desc()).limit(10).all()
-
-    if not summaries:
-        return "No cached email summaries. Try 'check my emails' to fetch fresh ones."
-
-    result = []
-    for s in summaries:
-        result.append(f"📧 {s.subject}\nFrom: {s.sender} | {s.received_at}\n{s.summary or 'No summary yet'}")
-
-    return "\n\n".join(result)
-
-
-# ===========================================================================
-# GOOGLE CALENDAR FUNCTIONS
-# ===========================================================================
+# ═══════════════════════════════════════════════════════════════
+# CALENDAR FUNCTIONS
+# ═══════════════════════════════════════════════════════════════
 
 def get_calendar_service(employee_id: int, db: Session):
-    """Returns an authenticated Calendar API service object."""
     creds = get_credentials(employee_id, db)
     if not creds:
         return None
@@ -314,10 +282,7 @@ def get_calendar_service(employee_id: int, db: Session):
 
 
 def get_upcoming_events(employee_id: int, days: int = 7, db: Session = None) -> str:
-    """
-    Fetches upcoming calendar events for the next N days.
-    Returns a formatted summary using Gemini.
-    """
+    """Fetches and formats upcoming calendar events."""
     close_db = False
     if db is None:
         db = SessionLocal()
@@ -363,7 +328,13 @@ def get_upcoming_events(employee_id: int, days: int = 7, db: Session = None) -> 
                 "attendees": attendees,
             })
 
-        # Gemini formats it nicely
+        if not gemini_client:
+            # Fallback to plain formatting if Gemini unavailable
+            lines = [f"📅 Your next {days} days:\n"]
+            for e in event_list:
+                lines.append(f"  • {e['title']} — {e['start']}")
+            return "\n".join(lines)
+
         prompt = f"""Format these calendar events into a clean, readable schedule summary:
 
 {json.dumps(event_list, indent=2)}
@@ -382,17 +353,8 @@ Note if there's a particularly busy day."""
             db.close()
 
 
-def check_availability(
-    employee_id: int,
-    date_str: str,
-    duration_minutes: int = 60,
-    db: Session = None
-) -> str:
-    """
-    Checks an employee's availability on a specific date.
-    Returns free slots of the requested duration.
-    Used by Claude's scheduling logic.
-    """
+def check_availability(employee_id: int, date_str: str, duration_minutes: int = 60, db: Session = None) -> str:
+    """Checks availability on a specific date and returns free slots."""
     close_db = False
     if db is None:
         db = SessionLocal()
@@ -400,20 +362,18 @@ def check_availability(
 
     try:
         if not is_google_connected(employee_id, db):
-            return f"Employee {employee_id} hasn't connected Google Calendar. Cannot check real availability."
+            return f"Employee {employee_id} hasn't connected Google Calendar."
 
         service = get_calendar_service(employee_id, db)
         if not service:
             return "Failed to connect to Calendar."
 
-        # Parse the date
         try:
             target_date = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
         except ValueError:
             target_date = datetime.now(timezone.utc) + timedelta(days=1)
 
-        # Fetch events for that day
-        day_start = target_date.replace(hour=0, minute=0, second=0)
+        day_start = target_date.replace(hour=0,  minute=0,  second=0)
         day_end   = target_date.replace(hour=23, minute=59, second=59)
 
         events_result = service.events().list(
@@ -431,9 +391,8 @@ def check_availability(
             if start and end:
                 busy_slots.append({"start": start, "end": end, "title": e.get("summary", "Busy")})
 
-        # Find free slots (9am-6pm working hours)
-        work_start = target_date.replace(hour=9,  minute=0,  second=0)
-        work_end   = target_date.replace(hour=18, minute=0,  second=0)
+        work_start = target_date.replace(hour=9,  minute=0, second=0)
+        work_end   = target_date.replace(hour=18, minute=0, second=0)
 
         free_slots = _find_free_slots(busy_slots, work_start, work_end, duration_minutes)
 
@@ -457,9 +416,9 @@ def create_calendar_event(
     end_time: str,
     attendee_emails: list = None,
     description: str = "",
-    db: Session = None
+    db: Session = None,
 ) -> str:
-    """Creates a real Google Calendar event for an employee."""
+    """Creates a Google Calendar event."""
     close_db = False
     if db is None:
         db = SessionLocal()
@@ -484,9 +443,9 @@ def create_calendar_event(
             event["attendees"] = [{"email": e} for e in attendee_emails]
 
         created = service.events().insert(
-            calendarId=  "primary",
-            body=        event,
-            sendUpdates= "all" if attendee_emails else "none",
+            calendarId  = "primary",
+            body        = event,
+            sendUpdates = "all" if attendee_emails else "none",
         ).execute()
 
         return f"✅ Calendar event '{title}' created for {start_time}. Event ID: {created.get('id')}"
@@ -499,10 +458,7 @@ def create_calendar_event(
 
 
 def get_focus_time_suggestions(employee_id: int, db: Session = None) -> str:
-    """
-    Analyzes calendar patterns to suggest focus time blocks.
-    This feeds the digital twin — learns when the employee does deep work.
-    """
+    """Analyzes calendar patterns to suggest focus time blocks."""
     close_db = False
     if db is None:
         db = SessionLocal()
@@ -510,6 +466,9 @@ def get_focus_time_suggestions(employee_id: int, db: Session = None) -> str:
 
     try:
         events_summary = get_upcoming_events(employee_id, days=14, db=db)
+
+        if not gemini_client:
+            return "Gemini not configured. Here are your upcoming events:\n\n" + events_summary
 
         prompt = f"""Based on this employee's calendar for the next 2 weeks:
 
@@ -519,7 +478,7 @@ Analyze their schedule and suggest:
 1. Their best focus time windows (when they have no meetings)
 2. Days that are overloaded with meetings
 3. Recommended time blocks for deep work
-4. Any concerning patterns (too many back-to-backs, no breaks, etc.)
+4. Any concerning patterns (too many back-to-backs, no breaks)
 
 Be specific with times and actionable in your recommendations."""
 
@@ -533,9 +492,9 @@ Be specific with times and actionable in your recommendations."""
             db.close()
 
 
-# ===========================================================================
+# ═══════════════════════════════════════════════════════════════
 # HELPERS
-# ===========================================================================
+# ═══════════════════════════════════════════════════════════════
 
 def _extract_email_body(payload: dict) -> str:
     """Recursively extracts plain text from email payload."""
@@ -551,22 +510,15 @@ def _extract_email_body(payload: dict) -> str:
                 body = _extract_email_body(part)
                 if body:
                     break
-    # Strip HTML tags if any slipped through
     body = re.sub(r"<[^>]+>", " ", body)
     return body.strip()
 
 
-def _find_free_slots(
-    busy_slots: list,
-    work_start: datetime,
-    work_end: datetime,
-    duration_min: int
-) -> list:
+def _find_free_slots(busy_slots: list, work_start: datetime, work_end: datetime, duration_min: int) -> list:
     """Finds free time slots given a list of busy periods."""
     free = []
     cursor = work_start
 
-    # Sort busy slots
     busy_sorted = sorted(busy_slots, key=lambda x: x["start"])
 
     for slot in busy_sorted:
@@ -584,7 +536,6 @@ def _find_free_slots(
             })
         cursor = max(cursor, slot_end)
 
-    # Check after last event
     remaining = (work_end - cursor).total_seconds() / 60
     if remaining >= duration_min:
         free.append({

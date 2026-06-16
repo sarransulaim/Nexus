@@ -1,13 +1,17 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 from database.core import get_db
-from database.models import Employee, PeerRequest 
+from database.models import Employee, PeerRequest
+from api.security import get_current_user
 
 router = APIRouter()
 
 @router.get("/")
-def get_all_employees(db: Session = Depends(get_db)):
-    employees = db.query(Employee).all()
+def get_all_employees(
+    db: Session = Depends(get_db),
+    current_user: Employee = Depends(get_current_user),
+):
+    employees = db.query(Employee).filter(Employee.company_id == current_user.company_id).all()
     
     emp_list = []
     for e in employees:

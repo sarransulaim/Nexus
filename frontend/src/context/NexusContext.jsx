@@ -1,21 +1,19 @@
-import React, { createContext, useContext, useState, useEffect, useRef } from 'react';
+import React, { createContext, useContext, useState, useEffect, useRef, useCallback } from 'react';
 import axios from 'axios';
 import { safeStr } from '../utils/helpers';
 
-// Create the Context
 const NexusContext = createContext();
 
-// Custom hook so any file can easily access the global state
 export function useNexus() {
   return useContext(NexusContext);
 }
 
-// The Provider Component
 export function NexusProvider({ children }) {
+
+  // Works correctly for local dev — hostname resolves to localhost
   const BACKEND_URL = `http://${window.location.hostname}:8000`;
 
-  // --- AUTH & NAVIGATION STATE ---
-  // On load, try to restore session from sessionStorage
+  // ── Auth & Navigation ───────────────────────────────────────
   const [currentUser, setCurrentUser] = useState(() => {
     try {
       const saved = sessionStorage.getItem('nexus_user');
@@ -23,30 +21,37 @@ export function NexusProvider({ children }) {
     } catch { return null; }
   });
 
-  // Token lives in memory only (more secure than localStorage)
-  // Refresh token lives in sessionStorage to survive page refresh
   const accessTokenRef = useRef(sessionStorage.getItem('nexus_access_token') || null);
+  // FIX (Bug 2): Refresh token now stored — previously was discarded after login
+  const refreshTokenRef = useRef(sessionStorage.getItem('nexus_refresh_token') || null);
+  // FIX (Bug 7): Polling fallback ref — fires every 60s as safety net when WS is down
+  const pollIntervalRef = useRef(null);
+  // FIX (Bug 9): Boot race guard — only connect WS after auth is confirmed
+  const authReadyRef    = useRef(!!sessionStorage.getItem('nexus_access_token'));
 
   const [activeTab, setActiveTab] = useState(() => {
     if (typeof window !== 'undefined') {
       const savedTab = sessionStorage.getItem('nexus_tab');
       if (savedTab) return savedTab;
-      if (currentUser) return currentUser.role === 'Manager' ? 'dashboard' : 'directives';
+      try {
+        const saved = sessionStorage.getItem('nexus_user');
+        const user  = saved ? JSON.parse(saved) : null;
+        if (user) return user.role === 'Manager' ? 'dashboard' : 'directives';
+      } catch {}
     }
     return 'dashboard';
   });
 
-  // --- GLOBAL DATA STATE ---
-  const [tasks, setTasks] = useState([]);
-  const [employees, setEmployees] = useState([]);
-  const [meetings, setMeetings] = useState([]);
+  // ── Global Data ─────────────────────────────────────────────
+  const [tasks,         setTasks]         = useState([]);
+  const [employees,     setEmployees]     = useState([]);
+  const [meetings,      setMeetings]      = useState([]);
   const [notifications, setNotifications] = useState([]);
-  const [unreadCount, setUnreadCount]     = useState(0);
-  const [isSyncing, setIsSyncing] = useState(false);
-
+  const [unreadCount,   setUnreadCount]   = useState(0);
+  const [isSyncing,     setIsSyncing]     = useState(false);
   const [manualCommand, setManualCommand] = useState('');
 
-  // --- UI SELECTION STATE ---
+  // ── UI Selection ─────────────────────────────────────────────
   const [selectedTask, setSelectedTask] = useState(null);
   const [selectedTeam, setSelectedTeam] = useState(() => {
     if (typeof window !== 'undefined') {
@@ -55,170 +60,362 @@ export function NexusProvider({ children }) {
     return null;
   });
 
-  // --- AI & VOICE STATE ---
-  const [transcript, setTranscript] = useState('');
-  const [aiResponse, setAiResponse] = useState('System standing by.');
+  // ── AI & Voice ───────────────────────────────────────────────
+  const [transcript,  setTranscript]  = useState('');
+  const [aiResponse,  setAiResponse]  = useState('');
   const [isListening, setIsListening] = useState(false);
-  const [isSpeaking, setIsSpeaking] = useState(false);
-  const recognitionRef = useRef(null);
+  const [isSpeaking,  setIsSpeaking]  = useState(false);
+  const [thoughts,    setThoughts]    = useState([]);
+  const [isThinking,  setIsThinking]  = useState(false);
+
+  const recognitionRef  = useRef(null);
   const currentAudioRef = useRef(null);
 
-  // --- NEW GLASS BRAIN STATES ---
-  const [thoughts, setThoughts] = useState([]); 
-  const [isThinking, setIsThinking] = useState(false);
+  // ── WebSocket refs ────────────────────────────────────────────
+  // FIX: Added wsRef and wsReconnectDelay for auto-reconnect.
+  // Previous version never reconnected after disconnect — real-time
+  // updates silently stopped on any network hiccup.
+  const wsRef            = useRef(null);
+  const wsReconnectDelay = useRef(1000); // starts 1s, doubles up to 30s
 
-  const fetchNotifications = async () => {
-    if (!currentUser?.dbId || currentUser?.role === 'Manager') return;
+  // Stable ref so WS onmessage always sees the current user
+  const currentUserRef = useRef(currentUser);
+  useEffect(() => { currentUserRef.current = currentUser; }, [currentUser]);
+
+
+  // ── FIX (Bug 2): Auto-refresh access token on 401 ──────────────
+  // Previously the refresh token returned by /login was discarded and
+  // there was no 401 handler. After 8 hours every request failed silently.
+  // This interceptor catches one 401, tries to refresh, retries the
+  // original request. If refresh fails, logs the user out cleanly.
+  useEffect(() => {
+    const requestInterceptor = axios.interceptors.request.use((config) => {
+      const token = accessTokenRef.current;
+      if (token && !config.headers.Authorization) {
+        config.headers.Authorization = `Bearer ${token}`;
+      }
+      return config;
+    });
+
+    const responseInterceptor = axios.interceptors.response.use(
+      (response) => response,
+      async (error) => {
+        const originalRequest = error.config;
+        // Only try refresh once per request, only on 401, and only if we have a refresh token
+        if (
+          error.response?.status === 401 &&
+          !originalRequest._retry &&
+          refreshTokenRef.current &&
+          !originalRequest.url?.includes('/auth/refresh')
+        ) {
+          originalRequest._retry = true;
+          try {
+            const res = await axios.post(`${BACKEND_URL}/api/v1/auth/refresh`, {
+              refresh_token: refreshTokenRef.current,
+            });
+            const newToken = res.data.access_token;
+            accessTokenRef.current = newToken;
+            sessionStorage.setItem('nexus_access_token', newToken);
+            originalRequest.headers.Authorization = `Bearer ${newToken}`;
+            return axios(originalRequest);
+          } catch (refreshErr) {
+            // Refresh failed — log out cleanly
+            handleDisconnectInternal();
+            return Promise.reject(refreshErr);
+          }
+        }
+        return Promise.reject(error);
+      }
+    );
+
+    return () => {
+      axios.interceptors.request.eject(requestInterceptor);
+      axios.interceptors.response.eject(responseInterceptor);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Internal disconnect (used by interceptor before handleDisconnect is defined)
+  const handleDisconnectInternal = () => {
+    accessTokenRef.current  = null;
+    refreshTokenRef.current = null;
+    authReadyRef.current    = false;
+    if (wsRef.current) {
+      wsRef.current.onclose = null;
+      wsRef.current.close();
+    }
+    if (pollIntervalRef.current) {
+      clearInterval(pollIntervalRef.current);
+      pollIntervalRef.current = null;
+    }
+    setCurrentUser(null);
+    sessionStorage.removeItem('nexus_user');
+    sessionStorage.removeItem('nexus_access_token');
+    sessionStorage.removeItem('nexus_refresh_token');
+    sessionStorage.removeItem('nexus_tab');
+    sessionStorage.removeItem('nexus_selected_team');
+  };
+
+
+  // ── Notifications ────────────────────────────────────────────
+  const fetchNotifications = useCallback(async () => {
+    const user = currentUserRef.current;
+    if (!user?.dbId) return;  // managers now receive proactive alerts too
     try {
       const headers = { Authorization: `Bearer ${accessTokenRef.current}` };
       const res = await axios.get(
-        `${BACKEND_URL}/api/v1/notifications/${currentUser.dbId}`,
+        `${BACKEND_URL}/api/v1/notifications/${user.dbId}`,
         { headers }
       );
       setNotifications(res.data?.notifications || []);
-      setUnreadCount(res.data?.unread_count || 0);
+      setUnreadCount(res.data?.unread_count    || 0);
     } catch (e) { console.error('Notification fetch error', e); }
-  };
+  }, [BACKEND_URL]);
 
   const markNotificationRead = async (notifId) => {
     try {
       const headers = { Authorization: `Bearer ${accessTokenRef.current}` };
-      await axios.post(
-        `${BACKEND_URL}/api/v1/notifications/read/${notifId}`,
-        {},
-        { headers }
-      );
-      setNotifications(prev =>
-        prev.map(n => n.id === notifId ? { ...n, is_read: true } : n)
-      );
+      await axios.post(`${BACKEND_URL}/api/v1/notifications/read/${notifId}`, {}, { headers });
+      setNotifications(prev => prev.map(n => n.id === notifId ? { ...n, is_read: true } : n));
       setUnreadCount(prev => Math.max(0, prev - 1));
     } catch (e) { console.error('Mark read error', e); }
   };
 
   const markAllNotificationsRead = async () => {
-    if (!currentUser?.dbId) return;
+    const user = currentUserRef.current;
+    if (!user?.dbId) return;
     try {
       const headers = { Authorization: `Bearer ${accessTokenRef.current}` };
-      await axios.post(
-        `${BACKEND_URL}/api/v1/notifications/read-all/${currentUser.dbId}`,
-        {},
-        { headers }
-      );
+      await axios.post(`${BACKEND_URL}/api/v1/notifications/read-all/${user.dbId}`, {}, { headers });
       setNotifications(prev => prev.map(n => ({ ...n, is_read: true })));
       setUnreadCount(0);
     } catch (e) { console.error('Mark all read error', e); }
   };
 
-  // --- DATA FETCHING ---
-  const fetchDashboardData = async () => {
+
+  // ── Data Fetching ────────────────────────────────────────────
+  const fetchDashboardData = useCallback(async () => {
     try {
       setIsSyncing(true);
       const headers = { Authorization: `Bearer ${accessTokenRef.current}` };
       const [taskRes, empRes, meetRes] = await Promise.all([
-        axios.get(`${BACKEND_URL}/api/v1/tasks/`,     { headers }).catch(() => ({ data: { tasks: [] } })),
+        axios.get(`${BACKEND_URL}/api/v1/tasks/`,     { headers }).catch(() => ({ data: { tasks:     [] } })),
         axios.get(`${BACKEND_URL}/api/v1/employees/`, { headers }).catch(() => ({ data: { employees: [] } })),
-        axios.get(`${BACKEND_URL}/api/v1/meetings/`,  { headers }).catch(() => ({ data: { meetings: [] } })),
+        axios.get(`${BACKEND_URL}/api/v1/meetings/`,  { headers }).catch(() => ({ data: { meetings:  [] } })),
       ]);
 
-      const newTasks = Array.isArray(taskRes.data?.tasks) ? taskRes.data.tasks : [];
-      const newEmps = Array.isArray(empRes.data?.employees) ? empRes.data.employees : [];
-      const newMeets = Array.isArray(meetRes.data?.meetings) ? meetRes.data.meetings : [];
+      const newTasks = Array.isArray(taskRes.data?.tasks)    ? taskRes.data.tasks     : [];
+      const newEmps  = Array.isArray(empRes.data?.employees) ? empRes.data.employees  : [];
+      const newMeets = Array.isArray(meetRes.data?.meetings) ? meetRes.data.meetings  : [];
 
-      setTasks(prev => JSON.stringify(prev) === JSON.stringify(newTasks) ? prev : newTasks);
-      setEmployees(prev => JSON.stringify(prev) === JSON.stringify(newEmps) ? prev : newEmps);
-      setMeetings(prev => JSON.stringify(prev) === JSON.stringify(newMeets) ? prev : newMeets);
-      // Refresh notifications every time data syncs
+      setTasks(prev     => JSON.stringify(prev) === JSON.stringify(newTasks) ? prev : newTasks);
+      setEmployees(prev => JSON.stringify(prev) === JSON.stringify(newEmps)  ? prev : newEmps);
+      setMeetings(prev  => JSON.stringify(prev) === JSON.stringify(newMeets) ? prev : newMeets);
       await fetchNotifications();
-    } catch (error) { console.error('Sync error', error); }
-    finally { setIsSyncing(false); }
-  };
+    } catch (error) {
+      console.error('Sync error', error);
+    } finally {
+      setIsSyncing(false);
+    }
+  }, [BACKEND_URL, fetchNotifications]);
 
-  // Ref to always have fresh currentUser inside the WebSocket callback
-  const currentUserRef = useRef(currentUser);
-  useEffect(() => { currentUserRef.current = currentUser; }, [currentUser]);
 
-  // --- LIFECYCLE EFFECTS (WEBSOCKET UPGRADE) ---
-  useEffect(() => {
-    // 1. Fetch initial data on load
-    fetchDashboardData();
+  // ── WebSocket with Auto-Reconnect ────────────────────────────
+  const connectWebSocket = useCallback(() => {
+    if (!currentUserRef.current) return;
 
-    // 2. Open the WebSocket Bridge
-    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${wsProtocol}//${window.location.hostname}:8000/api/v1/ws`;
-    const ws = new WebSocket(wsUrl);
-
-    ws.onmessage = (event) => {
-      // 1. Handle Automatic Syncing
-      if (event.data === "SYNC_REQUIRED") {
-        console.log("⚡ WebSocket Ping: Database updated! Refreshing UI...");
-        fetchDashboardData();
-        return;
+    // Clean up any existing dead connection
+    if (wsRef.current) {
+      const state = wsRef.current.readyState;
+      if (state === WebSocket.OPEN || state === WebSocket.CONNECTING) {
+        wsRef.current.onclose = null; // Prevent reconnect loop on manual close
+        wsRef.current.close();
       }
+    }
 
-      // 2. Handle AI "Thoughts" and System Audits
-      if (event.data.startsWith("THOUGHT:")) {
-        const rawPayload = event.data.replace("THOUGHT:", "").trim();
+    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    // Room-based WS — server needs employee_id to route messages correctly
+    const employeeId = currentUserRef.current.dbId;
+    // Auth: the WS now requires a valid token whose subject matches employeeId
+    const wsToken    = accessTokenRef.current || '';
+    const wsUrl      = `${wsProtocol}//${window.location.hostname}:8000/api/v1/ws/${employeeId}?token=${encodeURIComponent(wsToken)}`;
 
-        // Messages now use full agent_id as prefix: "Manager_1|..." or "Employee_3|..."
-        // This prevents Employee_2's thoughts from showing on Employee_3's screen
-        if (rawPayload.includes("|")) {
-          const [targetAgentId, ...messageParts] = rawPayload.split("|");
-          const thought = messageParts.join("|");
+    try {
+      const ws = new WebSocket(wsUrl);
+      wsRef.current = ws;
 
-          // Build the current user's agent_id to match against
+      ws.onopen = () => {
+        console.log('🌐 Nexus WS connected');
+        wsReconnectDelay.current = 1000; // Reset backoff on successful connect
+      };
+
+      ws.onmessage = (event) => {
+        const data = event.data;
+
+        if (data === 'SYNC_REQUIRED') {
+          fetchDashboardData();
+          return;
+        }
+
+        // ── NOTIF: real-time notification push ─────────────────────
+        // FIX (Wiring Gap): Server sends NOTIF: messages but frontend
+        // had no handler. Real-time notification badge now updates
+        // without waiting for a SYNC_REQUIRED.
+        if (data.startsWith('NOTIF:')) {
+          try {
+            const notif = JSON.parse(data.slice(6));
+            setNotifications(prev => [notif, ...prev]);
+            setUnreadCount(prev => prev + 1);
+          } catch (e) {
+            console.error('NOTIF parse error', e);
+          }
+          return;
+        }
+
+        // ── CHAT: new chat message in a channel ────────────────────
+        // FIX (Wiring Gap): Server sends CHAT:{channel_id}|{json} but
+        // frontend had no handler. Stub for now — chat UI is Phase 3.
+        // We dispatch a custom event so the chat page (when built) can listen.
+        if (data.startsWith('CHAT:')) {
+          try {
+            const pipeIdx = data.indexOf('|');
+            const channelId = parseInt(data.slice(5, pipeIdx), 10);
+            const message   = JSON.parse(data.slice(pipeIdx + 1));
+            window.dispatchEvent(new CustomEvent('nexus:chat', {
+              detail: { channelId, message },
+            }));
+          } catch (e) {
+            console.error('CHAT parse error', e);
+          }
+          return;
+        }
+
+        // ── MEETING: meeting event (participant joined, ended, etc) ──
+        // FIX (Wiring Gap): Stub for now — meeting UI is Phase 6.
+        if (data.startsWith('MEETING:')) {
+          try {
+            const pipeIdx   = data.indexOf('|');
+            const meetingId = parseInt(data.slice(8, pipeIdx), 10);
+            const eventData = JSON.parse(data.slice(pipeIdx + 1));
+            window.dispatchEvent(new CustomEvent('nexus:meeting', {
+              detail: { meetingId, event: eventData },
+            }));
+          } catch (e) {
+            console.error('MEETING parse error', e);
+          }
+          return;
+        }
+
+        // ── THOUGHT: Glass Brain / system messages ─────────────────
+        if (data.startsWith('THOUGHT:')) {
+          const rawPayload = data.replace('THOUGHT:', '').trim();
+
+          if (!rawPayload.includes('|')) {
+            setIsThinking(false);
+            setAiResponse(`[AI THOUGHT]: ${rawPayload}`);
+            return;
+          }
+
+          const pipeIdx       = rawPayload.indexOf('|');
+          const targetAgentId = rawPayload.slice(0, pipeIdx).trim();
+          const thought       = rawPayload.slice(pipeIdx + 1).trim();
+
           const user = currentUserRef.current;
           const myAgentId = user?.role === 'Manager'
             ? 'Manager_1'
             : `Employee_${user?.dbId}`;
 
-          const isMatch = targetAgentId.trim().toLowerCase() === myAgentId.toLowerCase();
+          if (targetAgentId.toLowerCase() !== myAgentId.toLowerCase()) return;
 
-          if (isMatch) {
-            if (thought.includes("[GLASS BRAIN]")) {
-              const cleanThought = thought.split("[GLASS BRAIN]")[1].trim();
-              setThoughts(prev => [...prev, cleanThought]);
-              setIsThinking(true);
-            } else {
-              setIsThinking(false);
-              setAiResponse(`[SYSTEM AUDIT]: ${thought}`);
-              if (typeof speakText === 'function') {
-                speakText(thought);
-              }
-            }
+          if (thought.includes('[GLASS BRAIN]')) {
+            const cleanThought = thought.split('[GLASS BRAIN]')[1].trim();
+            setThoughts(prev => [...prev, cleanThought]);
+            setIsThinking(true);
+          } else {
+            setIsThinking(false);
+            setAiResponse(`[SYSTEM AUDIT]: ${thought}`);
           }
-          // Silently ignore messages meant for other agents — no log spam
-        } else {
-          // Fallback if no pipe character exists
-          setIsThinking(false);
-          setAiResponse(`[AI THOUGHT]: ${rawPayload}`);
         }
-      }
-    };
-    
-    ws.onopen = () => console.log("🌐 Nexus Core WebSocket Link Established.");
-    ws.onclose = () => console.log("🌐 Nexus Core WebSocket Disconnected.");
-    // Initialize Speech Engine
+      };
+
+      ws.onerror = () => {
+        // Close triggers onclose which handles reconnect
+        ws.close();
+      };
+
+      ws.onclose = () => {
+        console.log(`🌐 Nexus WS disconnected. Reconnecting in ${wsReconnectDelay.current}ms...`);
+        if (!currentUserRef.current) return; // User logged out — don't reconnect
+
+        const delay = wsReconnectDelay.current;
+        wsReconnectDelay.current = Math.min(delay * 2, 30000); // Cap at 30s
+
+        setTimeout(connectWebSocket, delay);
+      };
+    } catch (e) {
+      console.error('WS connection error:', e);
+    }
+  }, [fetchDashboardData]);
+
+
+  // ── Boot: initial data fetch + WS ───────────────────────────
+  // FIX (Bug 9): Only connect WS if we have a valid auth token.
+  // Previously WS connected on mount even if session was expired.
+  // FIX (Bug 7): Polling fallback — refreshes data every 60s as a
+  // safety net in case WS drops and reconnect backoff is high.
+  useEffect(() => {
+    if (authReadyRef.current && currentUser) {
+      fetchDashboardData();
+      connectWebSocket();
+
+      // Polling fallback: fires every 60s — only triggers a refresh if WS isn't connected
+      pollIntervalRef.current = setInterval(() => {
+        const wsOpen = wsRef.current?.readyState === WebSocket.OPEN;
+        if (!wsOpen) {
+          fetchDashboardData();
+        }
+      }, 60000);
+    }
+
     try {
-      if (typeof window !== 'undefined' && 'speechSynthesis' in window) {
+      if ('speechSynthesis' in window) {
         window.speechSynthesis.onvoiceschanged = () => window.speechSynthesis.getVoices();
         window.speechSynthesis.getVoices();
       }
-    } catch (e) { console.error("Speech init error", e); }
+    } catch (e) { console.error('Speech init error', e); }
 
-    // 4. Cleanup function to close the bridge if component unmounts
     return () => {
-      ws.close();
+      // On unmount, close WS cleanly without triggering reconnect
+      if (wsRef.current) {
+        wsRef.current.onclose = null;
+        wsRef.current.close();
+      }
+      if (pollIntervalRef.current) {
+        clearInterval(pollIntervalRef.current);
+        pollIntervalRef.current = null;
+      }
     };
-  }, []); // Empty dependency array means this only runs once on boot!
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+
+  // ── selectedTask live sync ────────────────────────────────────
+  // FIX: Previous version had [tasks, selectedTask] as dependencies.
+  // When tasks synced → setSelectedTask called → selectedTask changed
+  // → effect ran again → infinite loop whenever the task modal was open.
+  //
+  // Fix: use functional setState (receives prev, no dependency on selectedTask)
+  // and deep-compare to avoid unnecessary re-renders.
   useEffect(() => {
-    if (selectedTask) {
-      const updated = tasks.find(t => t.id === selectedTask.id);
-      if (updated) setSelectedTask(updated);
-    }
-  }, [tasks, selectedTask]);
+    setSelectedTask(prev => {
+      if (!prev) return prev;
+      const updated = tasks.find(t => t.id === prev.id);
+      if (!updated) return prev;
+      return JSON.stringify(updated) !== JSON.stringify(prev) ? updated : prev;
+    });
+  }, [tasks]);
 
-  // --- TAB & TEAM STATE MANAGEMENT ---
+
+  // ── Tab & team persistence ───────────────────────────────────
   useEffect(() => {
     sessionStorage.setItem('nexus_tab', activeTab);
     if (activeTab !== 'team') {
@@ -228,70 +425,71 @@ export function NexusProvider({ children }) {
   }, [activeTab]);
 
   useEffect(() => {
-    if (selectedTeam) {
-      sessionStorage.setItem('nexus_selected_team', selectedTeam);
-    } else {
-      sessionStorage.removeItem('nexus_selected_team');
-    }
+    if (selectedTeam) sessionStorage.setItem('nexus_selected_team', selectedTeam);
+    else              sessionStorage.removeItem('nexus_selected_team');
   }, [selectedTeam]);
 
-  // --- AI ENGINE & VOICE FUNCTIONS ---
- // --- THE KILL SWITCH ---
- const stopSpeaking = () => {
-  // 1. Stop the MP3 if it's playing
-  if (currentAudioRef.current) {
-    currentAudioRef.current.pause();
-    currentAudioRef.current.currentTime = 0;
-    currentAudioRef.current = null;
-  }
-  // 2. Stop the browser fallback if it was used
-  if ('speechSynthesis' in window) {
-    window.speechSynthesis.cancel();
-  }
-  // 3. Turn off the orb animation
-  setIsSpeaking(false);
-};
 
-const speakText = async (text) => {
-  stopSpeaking(); 
-  
-  // FIX: Do NOT set isSpeaking(true) here! We must wait for the audio to load first!
-  
-  try {
-    const response = await axios.post(`${BACKEND_URL}/api/v1/manager/speak`, 
-      { text: text }, 
-      { responseType: 'blob' }
-    );
+  // ── Voice Engine ─────────────────────────────────────────────
+  const stopSpeaking = () => {
+    if (currentAudioRef.current) {
+      currentAudioRef.current.pause();
+      currentAudioRef.current.currentTime = 0;
+      currentAudioRef.current = null;
+    }
+    if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+    setIsSpeaking(false);
+  };
 
-    const audioUrl = window.URL.createObjectURL(new Blob([response.data]));
-    const audio = new Audio(audioUrl);
-    
-    currentAudioRef.current = audio; 
+  // Strip emojis, markdown, and decorative characters before speaking
+  const cleanForSpeech = (text) => {
+    if (!text) return '';
+    return text
+      // Remove emojis (full unicode emoji range)
+      .replace(/[\u{1F300}-\u{1F9FF}]|[\u{2600}-\u{27BF}]|[\u{1F000}-\u{1F02F}]|[\u{1F0A0}-\u{1F0FF}]|[\u{1F100}-\u{1F1FF}]|[\u{1F200}-\u{1F2FF}]|[\u{1FA00}-\u{1FA6F}]|[\u{1FA70}-\u{1FAFF}]|[\u{2300}-\u{23FF}]|[\u{2B00}-\u{2BFF}]|[\u{1F680}-\u{1F6FF}]/gu, '')
+      // Remove markdown: ** _ ` # > | etc
+      .replace(/\*\*/g, '')
+      .replace(/[*_`~]/g, '')
+      .replace(/^#+\s+/gm, '')
+      .replace(/^\s*[->•]\s+/gm, '')
+      // Strip checkbox-style markers from task lists
+      .replace(/\[\s*[X ]?\s*\]/g, '')
+      // Pipes and dashes used in tables/IDs
+      .replace(/\s*\|\s*/g, '. ')
+      // Multi-newline → single sentence break
+      .replace(/\n{2,}/g, '. ')
+      .replace(/\n/g, ' ')
+      // Cleanup multiple spaces and odd punctuation runs
+      .replace(/\s+/g, ' ')
+      .replace(/\.\s*\.+/g, '.')
+      .trim();
+  };
 
-    // FIX: The absolute millisecond the audio starts playing, turn on the Orb animation!
-    audio.onplay = () => {
-      setIsSpeaking(true);
-    };
+  const speakText = async (text) => {
+    stopSpeaking();
+    const cleaned = cleanForSpeech(text);
+    if (!cleaned) return;
 
-    audio.onended = () => {
-      setIsSpeaking(false);
-    };
-    
-    audio.onerror = () => {
-      setIsSpeaking(false);
-    };
-
-    await audio.play();
-
-  } catch (error) {
-    console.error("Neural Voice Engine failed to load.", error);
-    
-    const fallback = new SpeechSynthesisUtterance(text.replace(/[*#_`~\[\]]/g, ''));
-    fallback.onstart = () => setIsSpeaking(true);
-    fallback.onend = () => setIsSpeaking(false); 
-    window.speechSynthesis.speak(fallback);
-  }
-};
+    try {
+      const response = await axios.post(
+        `${BACKEND_URL}/api/v1/manager/speak`,
+        { text: cleaned },
+        { responseType: 'blob' }
+      );
+      const audioUrl = window.URL.createObjectURL(new Blob([response.data]));
+      const audio    = new Audio(audioUrl);
+      currentAudioRef.current = audio;
+      audio.onplay  = () => setIsSpeaking(true);
+      audio.onended = () => setIsSpeaking(false);
+      audio.onerror = () => setIsSpeaking(false);
+      await audio.play();
+    } catch {
+      const fallback = new SpeechSynthesisUtterance(cleaned);
+      fallback.onstart = () => setIsSpeaking(true);
+      fallback.onend   = () => setIsSpeaking(false);
+      window.speechSynthesis.speak(fallback);
+    }
+  };
 
   const toggleListening = () => {
     if (isListening) {
@@ -302,81 +500,89 @@ const speakText = async (text) => {
     }
     stopSpeaking();
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (!SpeechRecognition) return alert('Please use Chrome or Edge browser for voice features.');
+    if (!SpeechRecognition) return alert('Please use Chrome or Edge for voice features.');
     try {
       const recognition = new SpeechRecognition();
-      recognitionRef.current = recognition; recognition.continuous = true; recognition.interimResults = true;
-      recognition.onstart = () => { setIsListening(true); setTranscript(''); }
+      recognitionRef.current = recognition;
+      recognition.continuous      = true;
+      recognition.interimResults  = true;
+      recognition.onstart  = () => { setIsListening(true); setTranscript(''); };
       recognition.onresult = (event) => {
         let currentText = '';
-        for (let i = 0; i < event.results.length; i += 1) currentText += event.results[i][0].transcript;
+        for (let i = 0; i < event.results.length; i++) currentText += event.results[i][0].transcript;
         setTranscript(currentText);
-      }
-      recognition.onerror = () => { setAiResponse('Microphone error.'); setIsListening(false); }
-      recognition.onend = () => setIsListening(false);
+      };
+      recognition.onerror = () => { setAiResponse('Microphone error.'); setIsListening(false); };
+      recognition.onend   = () => setIsListening(false);
       recognition.start();
-    } catch (e) { console.error("Mic error", e); }
+    } catch (e) { console.error('Mic error', e); }
   };
+
+
+  // ── AI Command Sender ────────────────────────────────────────
   const sendCommandToNexus = async (text) => {
     const trimmed = safeStr(text).trim();
     if (!trimmed || !currentUser) return;
-    
-    // --- RESET AND START THE BRAIN ---
-    setThoughts([]); // Clear old telemetry logs
-    setIsThinking(true); // Start the Gemini spinner
-    setAiResponse('Processing directive...'); 
+
+    setThoughts([]);
+    setIsThinking(true);
+    setAiResponse('Processing directive...');
     setTranscript(`[SENT]: "${trimmed}"`);
-    
+
     try {
-      const dynamicManagerId = currentUser.role === 'Manager' ? 'Manager_1' : `Employee_${currentUser.dbId}`;
+      const dynamicManagerId = currentUser.role === 'Manager'
+        ? 'Manager_1'
+        : `Employee_${currentUser.dbId}`;
+
       const res = await axios.post(`${BACKEND_URL}/api/v1/manager/command`, {
-        manager_id: dynamicManagerId, command_text: trimmed, input_method: isListening ? 'voice' : 'manual',
+        manager_id:   dynamicManagerId,
+        command_text: trimmed,
+        input_method: isListening ? 'voice' : 'manual',
       });
-      
-      // --- STOP THE SPINNER ---
-      setIsThinking(false); // <--- THE FIX!
-      
+
+      setIsThinking(false);
       const finalResponse = safeStr(res.data?.ai_response || 'Directive complete.');
-      setAiResponse(finalResponse); 
-      
-      // Safety check for the voice engine
-      if (typeof speakText === 'function') {
-        speakText(finalResponse); 
-      }
+      setAiResponse(finalResponse);
+      speakText(finalResponse);
     } catch (error) {
-      // Stop the spinner even if it crashes!
-      setIsThinking(false); 
-      setAiResponse('Backend connection error.'); 
-      
-      if (typeof speakText === 'function') {
-        speakText("Error connecting to mainframe.");
-      }
+      setIsThinking(false);
+      setAiResponse('Backend connection error.');
+      speakText('Error connecting to mainframe.');
     }
   };
 
   const handleDbAction = (commandString) => {
-      setActiveTab('commands');
-      sendCommandToNexus(commandString);
+    setActiveTab('commands');
+    sendCommandToNexus(commandString);
   };
-  
-  const handleCompleteSubtask = async (subtaskId) => { await sendCommandToNexus(`Complete subtask ID ${subtaskId}`); }
-  const handleQuickComplete = async (taskId) => { await sendCommandToNexus(`Mark task ID ${taskId} as complete`); setSelectedTask(null); }
-  
+
+  const handleCompleteSubtask = async (subtaskId) => {
+    await sendCommandToNexus(`Complete subtask ID ${subtaskId}`);
+  };
+
+  const handleQuickComplete = async (taskId) => {
+    await sendCommandToNexus(`Mark task ID ${taskId} as complete`);
+    setSelectedTask(null);
+  };
+
   const handlePeerRequestAction = async (reqId, action) => {
     try {
-      await axios.post(`${BACKEND_URL}/api/v1/peer-requests/${reqId}/respond`, { action });
-      // Force the UI to refresh with the new data instantly
-      await fetchDashboardData(); 
-    } catch (error) { console.error("Failed to update peer request", error); }
-  }
+      await axios.post(
+        `${BACKEND_URL}/api/v1/peer-requests/${reqId}/respond`,
+        { action }
+      );
+      await fetchDashboardData();
+    } catch (error) { console.error('Peer request update failed', error); }
+  };
 
-  // --- AUTH FUNCTIONS ---
+
+  // ── Auth ─────────────────────────────────────────────────────
   const handleLogin = async (name, password) => {
     try {
       const res = await axios.post(`${BACKEND_URL}/api/v1/auth/login`, { name, password });
-      const { access_token, user } = res.data;
+      // FIX (Bug 2): refresh_token was previously discarded — now stored
+      const { access_token, refresh_token, user } = res.data;
 
-      // Build the user object matching existing structure
       const userObj = {
         role: user.role === 'manager' ? 'Manager' : 'Employee',
         dbId: user.id,
@@ -384,48 +590,48 @@ const speakText = async (text) => {
         team: user.team,
       };
 
-      // Store token in ref (memory) and sessionStorage
-      accessTokenRef.current = access_token;
-      sessionStorage.setItem('nexus_access_token', access_token);
+      accessTokenRef.current  = access_token;
+      refreshTokenRef.current = refresh_token;
+      authReadyRef.current    = true;
+      sessionStorage.setItem('nexus_access_token',  access_token);
+      sessionStorage.setItem('nexus_refresh_token', refresh_token);
       sessionStorage.setItem('nexus_user', JSON.stringify(userObj));
 
       setCurrentUser(userObj);
       setActiveTab(user.role === 'manager' ? 'dashboard' : 'directives');
 
-      return null; // no error
-    } catch (err) {
-      const msg = err.response?.data?.detail || 'Login failed. Check your credentials.';
-      return msg; // return error string to Login.jsx
-    }
-  };
+      // Open WebSocket now that user is logged in
+      wsReconnectDelay.current = 1000;
+      connectWebSocket();
 
-  // Axios helper that automatically adds the JWT token to every request
-  const authAxios = {
-    get: (url) => axios.get(url, {
-      headers: { Authorization: `Bearer ${accessTokenRef.current}` }
-    }),
-    post: (url, data) => axios.post(url, data, {
-      headers: { Authorization: `Bearer ${accessTokenRef.current}` }
-    }),
+      // Start polling fallback
+      if (!pollIntervalRef.current) {
+        pollIntervalRef.current = setInterval(() => {
+          const wsOpen = wsRef.current?.readyState === WebSocket.OPEN;
+          if (!wsOpen) fetchDashboardData();
+        }, 60000);
+      }
+
+      return null;
+    } catch (err) {
+      return err.response?.data?.detail || 'Login failed. Check your credentials.';
+    }
   };
 
   const handleDisconnect = () => {
-    // Tell backend to invalidate the token
     if (accessTokenRef.current) {
-      axios.post(`${BACKEND_URL}/api/v1/auth/logout`, {}, {
-        headers: { Authorization: `Bearer ${accessTokenRef.current}` }
-      }).catch(() => {}); // silent fail — still clear local state
+      axios.post(
+        `${BACKEND_URL}/api/v1/auth/logout`,
+        {},
+        { headers: { Authorization: `Bearer ${accessTokenRef.current}` } }
+      ).catch(() => {});
     }
-    accessTokenRef.current = null;
-    setCurrentUser(null);
-    sessionStorage.removeItem('nexus_user');
-    sessionStorage.removeItem('nexus_access_token');
-    sessionStorage.removeItem('nexus_tab');
-    sessionStorage.removeItem('nexus_selected_team');
+    handleDisconnectInternal();
     stopSpeaking();
   };
 
-  // Expose everything to the rest of the app
+
+  // ── Context Value ────────────────────────────────────────────
   const value = {
     currentUser, setCurrentUser,
     handleLogin, handleDisconnect,
@@ -446,7 +652,7 @@ const speakText = async (text) => {
     thoughts, setThoughts,
     isThinking, setIsThinking,
     stopSpeaking,
-    BACKEND_URL
+    BACKEND_URL,
   };
 
   return (

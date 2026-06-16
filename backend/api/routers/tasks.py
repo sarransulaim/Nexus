@@ -1,13 +1,17 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 from database.core import get_db
-from database.models import Task
+from database.models import Task, Employee
+from api.security import get_current_user
 
 router = APIRouter()
 
 @router.get("/")
-def get_all_tasks(db: Session = Depends(get_db)):
-    tasks = db.query(Task).all()
+def get_all_tasks(
+    db: Session = Depends(get_db),
+    current_user: Employee = Depends(get_current_user),
+):
+    tasks = db.query(Task).filter(Task.company_id == current_user.company_id).all()
     
     task_list = []
     for t in tasks:

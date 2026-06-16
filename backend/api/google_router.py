@@ -14,6 +14,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import RedirectResponse, JSONResponse
 from sqlalchemy.orm import Session
 from database.core import get_db
+from database.models import Employee
+from api.security import get_current_user
 from api.google_auth import (
     get_google_auth_url,
     handle_google_callback,
@@ -29,6 +31,13 @@ from api.google_services import (
 )
 
 router = APIRouter()
+
+
+def _require_self_or_manager(current_user: Employee, employee_id: int):
+    """Employees may only act on their OWN Google data; managers on anyone's.
+    Prevents reading/revoking another user's mailbox/calendar by iterating IDs."""
+    if current_user.system_role != "manager" and current_user.id != employee_id:
+        raise HTTPException(status_code=403, detail="You can only access your own Google data.")
 
 
 # ---------------------------------------------------------------------------
@@ -80,8 +89,13 @@ def google_callback(
 # Status check
 # ---------------------------------------------------------------------------
 @router.get("/status/{employee_id}")
-def google_status(employee_id: int, db: Session = Depends(get_db)):
+def google_status(
+    employee_id: int,
+    db: Session = Depends(get_db),
+    current_user: Employee = Depends(get_current_user),
+):
     """Returns whether an employee has connected their Google account."""
+    _require_self_or_manager(current_user, employee_id)
     connected = is_google_connected(employee_id, db)
     return {
         "employee_id": employee_id,
@@ -94,8 +108,13 @@ def google_status(employee_id: int, db: Session = Depends(get_db)):
 # Disconnect
 # ---------------------------------------------------------------------------
 @router.post("/disconnect/{employee_id}")
-def google_disconnect(employee_id: int, db: Session = Depends(get_db)):
+def google_disconnect(
+    employee_id: int,
+    db: Session = Depends(get_db),
+    current_user: Employee = Depends(get_current_user),
+):
     """Revokes Google access for an employee."""
+    _require_self_or_manager(current_user, employee_id)
     disconnect_google(employee_id, db)
     return {"message": f"Google Workspace disconnected for employee {employee_id}"}
 
@@ -107,9 +126,11 @@ def google_disconnect(employee_id: int, db: Session = Depends(get_db)):
 def get_emails(
     employee_id:  int,
     max_results:  int = Query(default=10, le=50),
-    db:           Session = Depends(get_db)
+    db:           Session = Depends(get_db),
+    current_user: Employee = Depends(get_current_user),
 ):
     """Fetches and summarizes recent emails for an employee."""
+    _require_self_or_manager(current_user, employee_id)
     if not is_google_connected(employee_id, db):
         raise HTTPException(status_code=400, detail="Google account not connected.")
     result = read_recent_emails(employee_id, max_results, db)
@@ -123,9 +144,11 @@ def get_emails(
 def get_calendar(
     employee_id: int,
     days:        int = Query(default=7, le=30),
-    db:          Session = Depends(get_db)
+    db:          Session = Depends(get_db),
+    current_user: Employee = Depends(get_current_user),
 ):
     """Fetches upcoming calendar events for an employee."""
+    _require_self_or_manager(current_user, employee_id)
     if not is_google_connected(employee_id, db):
         raise HTTPException(status_code=400, detail="Google account not connected.")
     result = get_upcoming_events(employee_id, days, db)
@@ -140,9 +163,11 @@ def get_availability(
     employee_id:      int,
     date:             str = Query(..., description="Date in YYYY-MM-DD format"),
     duration_minutes: int = Query(default=60),
-    db:               Session = Depends(get_db)
+    db:               Session = Depends(get_db),
+    current_user: Employee = Depends(get_current_user),
 ):
     """Checks free slots for an employee on a given date."""
+    _require_self_or_manager(current_user, employee_id)
     result = check_availability(employee_id, date, duration_minutes, db)
     return {"availability": result}
 
@@ -151,8 +176,13 @@ def get_availability(
 # Focus time analysis
 # ---------------------------------------------------------------------------
 @router.get("/focus-time/{employee_id}")
-def get_focus_time(employee_id: int, db: Session = Depends(get_db)):
+def get_focus_time(
+    employee_id: int,
+    db: Session = Depends(get_db),
+    current_user: Employee = Depends(get_current_user),
+):
     """AI analysis of calendar patterns to suggest focus time blocks."""
+    _require_self_or_manager(current_user, employee_id)
     if not is_google_connected(employee_id, db):
         raise HTTPException(status_code=400, detail="Google account not connected.")
     result = get_focus_time_suggestions(employee_id, db)

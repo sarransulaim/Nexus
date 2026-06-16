@@ -1,0 +1,68 @@
+# Nexus Command v3.0 — Backend Dependencies
+# Rule: unpinned except bcrypt==4.0.1
+
+# ── Web framework ─────────────────────────────────────────────
+fastapi
+uvicorn[standard]
+starlette
+python-multipart          # file uploads
+
+# ── Rate limiting ─────────────────────────────────────────────
+slowapi                   # FastAPI rate limiting
+
+# ── Database ──────────────────────────────────────────────────
+sqlalchemy
+alembic
+psycopg2-binary
+
+# ── AI ────────────────────────────────────────────────────────
+anthropic
+google-genai
+google-api-python-client
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+openai                    # Whisper for meeting transcription
+
+# ── Auth ──────────────────────────────────────────────────────
+passlib
+bcrypt==4.0.1
+pyjwt
+
+# ── File intelligence ─────────────────────────────────────────
+pymupdf                   # PDF text extraction (fast, accurate)
+python-docx               # Word document extraction
+pandas                    # Excel/CSV processing
+openpyxl                  # Excel support for pandas
+Pillow                    # Image processing
+
+# ── Async / HTTP ──────────────────────────────────────────────
+httpx
+aiohttp
+requests
+websockets
+aiofiles                  # Async file I/O for uploads
+
+# ── Omnichannel ───────────────────────────────────────────────
+slack-bolt
+slack-sdk
+twilio                    # WhatsApp + SMS
+
+# ── Meetings ──────────────────────────────────────────────────
+livekit                   # Livekit server SDK
+livekit-api               # Room management + token generation
+
+# ── Voice ─────────────────────────────────────────────────────
+edge-tts
+
+# ── Utilities ─────────────────────────────────────────────────
+python-dotenv
+pydantic
+tabulate
+python-magic              # Real MIME type detection (not just extension)
+
+# ── Security ──────────────────────────────────────────────────
+cryptography              # Fernet encryption for Google OAuth tokens at rest
+
+# ── Testing ───────────────────────────────────────────────────
+pytest                    # integration test suite (tests/) — run: python -m pytest tests/ -q

@@ -1,0 +1,233 @@
+"""
+twilio_client.py — Twilio Wrapper for WhatsApp
+================================================
+Thin wrapper around the Twilio Python SDK.
+
+Handles:
+  - Sending WhatsApp messages
+  - Verifying webhook signatures (security)
+  - Normalizing phone numbers (whatsapp:+12345 → +12345)
+
+Environment variables required:
+  TWILIO_ACCOUNT_SID   — starts with AC...
+  TWILIO_AUTH_TOKEN    — 32 char string
+  TWILIO_WHATSAPP_FROM — default: whatsapp:+14155238886 (sandbox)
+  TWILIO_WEBHOOK_BASE  — your ngrok URL (e.g. https://abc.ngrok-free.app)
+"""
+
+import os
+import logging
+from typing import Optional
+
+log = logging.getLogger("nexus.twilio")
+
+# ── Settings ──────────────────────────────────────────────────
+TWILIO_ACCOUNT_SID   = os.getenv("TWILIO_ACCOUNT_SID", "")
+TWILIO_AUTH_TOKEN    = os.getenv("TWILIO_AUTH_TOKEN", "")
+TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886")
+TWILIO_WEBHOOK_BASE  = os.getenv("TWILIO_WEBHOOK_BASE", "")   # ngrok URL
+
+
+# Lazy-init the client so the app doesn't crash if Twilio isn't configured yet
+_client = None
+_validator = None
+
+
+def _get_client():
+    global _client
+    if _client is None:
+        if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
+            raise RuntimeError(
+                "Twilio credentials not configured. Set TWILIO_ACCOUNT_SID and "
+                "TWILIO_AUTH_TOKEN in your .env file."
+            )
+        from twilio.rest import Client
+        _client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    return _client
+
+
+def _get_validator():
+    global _validator
+    if _validator is None:
+        from twilio.request_validator import RequestValidator
+        _validator = RequestValidator(TWILIO_AUTH_TOKEN)
+    return _validator
+
+
+# ═══════════════════════════════════════════════════════════════
+# PHONE NUMBER HELPERS
+# ═══════════════════════════════════════════════════════════════
+
+def normalize_phone(raw: str) -> str:
+    """
+    Convert any phone format to E.164 standard.
+
+    Examples:
+      'whatsapp:+12602469163' → '+12602469163'
+      '+12602469163'          → '+12602469163'
+      '+1 (260) 246-9163'     → '+12602469163'
+      '12602469163'           → '+12602469163'
+    """
+    if not raw:
+        return ""
+
+    # Strip whatsapp: prefix
+    if raw.startswith("whatsapp:"):
+        raw = raw[len("whatsapp:"):]
+
+    # Strip whitespace, dashes, parens
+    cleaned = "".join(c for c in raw if c.isdigit() or c == "+")
+
+    # Ensure leading +
+    if cleaned and not cleaned.startswith("+"):
+        cleaned = "+" + cleaned
+
+    return cleaned
+
+
+def to_whatsapp_format(phone: str) -> str:
+    """Add the 'whatsapp:' prefix Twilio requires for sending."""
+    normalized = normalize_phone(phone)
+    if not normalized:
+        return ""
+    return f"whatsapp:{normalized}"
+
+
+# ═══════════════════════════════════════════════════════════════
+# SEND MESSAGE
+# ═══════════════════════════════════════════════════════════════
+
+def send_whatsapp(to_phone: str, body: str) -> dict:
+    """
+    Send a WhatsApp message via Twilio.
+
+    Args:
+      to_phone: phone number (any format, will be normalized)
+      body: message text (max ~1600 chars; longer ones are truncated)
+
+    Returns:
+      {'success': True, 'sid': 'SM...'} on success
+      {'success': False, 'error': '...'} on failure
+    """
+    if not body:
+        return {"success": False, "error": "empty body"}
+
+    # WhatsApp max is around 4096 chars but keep it sane
+    if len(body) > 1500:
+        body = body[:1497] + "..."
+
+    to = to_whatsapp_format(to_phone)
+    if not to:
+        return {"success": False, "error": "invalid phone number"}
+
+    try:
+        client = _get_client()
+        message = client.messages.create(
+            from_=TWILIO_WHATSAPP_FROM,
+            to=to,
+            body=body,
+        )
+        log.info(f"WhatsApp sent to {to}: SID={message.sid}")
+        return {"success": True, "sid": message.sid, "status": message.status}
+    except Exception as e:
+        log.error(f"WhatsApp send failed to {to}: {e}")
+        return {"success": False, "error": str(e)}
+
+
+# ═══════════════════════════════════════════════════════════════
+# WEBHOOK SIGNATURE VERIFICATION
+# ═══════════════════════════════════════════════════════════════
+
+def verify_signature(url: str, params: dict, signature: str) -> bool:
+    """
+    Verify that an incoming webhook is really from Twilio.
+
+    Args:
+      url: the full URL Twilio POSTed to (use TWILIO_WEBHOOK_BASE + path)
+      params: the form data from the POST
+      signature: value of the X-Twilio-Signature header
+
+    Returns:
+      True if signature is valid, False otherwise.
+
+    In dev mode (no TWILIO_AUTH_TOKEN set), returns True to allow testing.
+    """
+    if not TWILIO_AUTH_TOKEN:
+        # Fail CLOSED: with no auth token we cannot verify the sender, so reject
+        # rather than trust a spoofable inbound webhook (which would drive the AI
+        # as a real employee). Set TWILIO_ALLOW_UNVERIFIED=1 ONLY for local tests.
+        if os.getenv("TWILIO_ALLOW_UNVERIFIED") == "1":
+            log.warning("⚠️  Twilio signature check bypassed (TWILIO_ALLOW_UNVERIFIED=1) — dev only")
+            return True
+        log.error("Twilio signature check failing closed: TWILIO_AUTH_TOKEN not set — rejecting webhook")
+        return False
+
+    if not signature:
+        log.warning("Missing X-Twilio-Signature header")
+        return False
+
+    try:
+        validator = _get_validator()
+        return validator.validate(url, params, signature)
+    except Exception as e:
+        log.error(f"Signature validation error: {e}")
+        return False
+
+
+def build_webhook_url(path: str) -> str:
+    """
+    Build the public URL Twilio will POST to.
+
+    In dev: TWILIO_WEBHOOK_BASE=https://abc.ngrok-free.app
+    Returns: https://abc.ngrok-free.app/api/v1/channels/whatsapp/inbound
+    """
+    if not TWILIO_WEBHOOK_BASE:
+        return path
+    base = TWILIO_WEBHOOK_BASE.rstrip("/")
+    if not path.startswith("/"):
+        path = "/" + path
+    return base + path
+
+
+# ═══════════════════════════════════════════════════════════════
+# VERIFICATION CODES
+# ═══════════════════════════════════════════════════════════════
+
+import secrets
+import string
+
+
+def generate_verification_code(length: int = 6) -> str:
+    """Generate a numeric verification code for phone linking."""
+    return "".join(secrets.choice(string.digits) for _ in range(length))
+
+
+def send_verification_code(to_phone: str, code: str, employee_name: str = "") -> dict:
+    """Send a verification code via WhatsApp."""
+    name_part = f", {employee_name}" if employee_name else ""
+    body = (
+        f"Welcome to Nexus{name_part}.\n\n"
+        f"Your verification code is: {code}\n\n"
+        f"Enter this in Nexus to link your phone.\n"
+        f"Code expires in 10 minutes."
+    )
+    return send_whatsapp(to_phone, body)
+
+
+# ═══════════════════════════════════════════════════════════════
+# HEALTH / CONFIG CHECK
+# ═══════════════════════════════════════════════════════════════
+
+def is_configured() -> bool:
+    """Quick check from other modules — is Twilio ready to use?"""
+    return bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN)
+
+
+def config_summary() -> dict:
+    """For admin/health endpoint."""
+    return {
+        "configured":    is_configured(),
+        "account_sid":   TWILIO_ACCOUNT_SID[:8] + "..." if TWILIO_ACCOUNT_SID else "",
+        "whatsapp_from": TWILIO_WHATSAPP_FROM,
+        "webhook_base":  TWILIO_WEBHOOK_BASE or "(not set — webhook signature verification will fail)",
+    }

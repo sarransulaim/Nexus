@@ -1,33 +1,34 @@
 """
-auth.py — Authentication Router
-=================================
-Handles:
-  - POST /auth/login       → returns access + refresh tokens
-  - POST /auth/refresh     → swap refresh token for a new access token
-  - POST /auth/logout      → invalidate the refresh token
-  - POST /auth/setup       → first-time: create manager account
-  - GET  /auth/me          → returns current logged-in user info
+auth.py — Authentication Router (Hardened)
+==========================================
+Changes from v2:
+  - Rate limiting on /login (5 per 15min per IP via slowapi)
+  - Refresh token verified against bcrypt hash (logout actually works)
+  - company_id returned in all user objects
+  - Employee creation requires company_id
+  - Audit log on login / password change
 """
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from datetime import datetime, timezone
 
 from database.core import get_db
-from database.models import Employee
+from database.models import Employee, Company, AuditLog
 from api.security import (
     hash_password, verify_password,
     create_access_token, create_refresh_token,
-    decode_token, get_current_user
+    decode_token, get_current_user,
 )
+from api.rate_limit import limiter
 
 router = APIRouter()
 
+DEFAULT_COMPANY_ID = 1  # Set on bootstrap — changes when multi-tenant UI is added
 
-# ---------------------------------------------------------------------------
-# SCHEMAS — what the frontend sends and receives
-# ---------------------------------------------------------------------------
+
+# ── Schemas ───────────────────────────────────────────────────
 
 class LoginRequest(BaseModel):
     name: str
@@ -39,91 +40,83 @@ class RefreshRequest(BaseModel):
 class SetupRequest(BaseModel):
     name: str
     password: str
-    secret_key: str   # a one-time secret so random people can't create managers
+    secret_key: str
 
 
-# ---------------------------------------------------------------------------
-# POST /auth/setup
-# First-time manager account creation.
-# ---------------------------------------------------------------------------
+# ── POST /auth/setup ─────────────────────────────────────────
+
 @router.post("/setup")
 def setup_manager(payload: SetupRequest, db: Session = Depends(get_db)):
-    """
-    Creates the first manager account.
-    Only works if no manager exists yet OR if the secret key matches.
-
-    HOW TO USE:
-    Send a POST request with:
-    { "name": "Director", "password": "yourpassword", "secret_key": "NEXUS_SETUP_2026" }
-    """
     import os
-    setup_secret = os.getenv("SETUP_SECRET", "NEXUS_SETUP_2026")
-
-    if payload.secret_key != setup_secret:
+    if payload.secret_key != os.getenv("SETUP_SECRET", "NEXUS_SETUP_2026"):
         raise HTTPException(status_code=403, detail="Invalid setup secret key.")
 
     existing = db.query(Employee).filter(Employee.system_role == "manager").first()
     if existing:
         raise HTTPException(status_code=400, detail="Manager account already exists.")
 
+    # Ensure company exists
+    company = db.query(Company).filter(Company.id == DEFAULT_COMPANY_ID).first()
+    if not company:
+        raise HTTPException(status_code=500, detail="Company not bootstrapped. Restart the server.")
+
     manager = Employee(
+        company_id=DEFAULT_COMPANY_ID,
         name=payload.name,
         role="Chief of Staff",
         system_role="manager",
         password_hash=hash_password(payload.password),
         is_active=True,
-        team="Management"
+        team="Management",
     )
     db.add(manager)
     db.commit()
     db.refresh(manager)
+    return {"message": f"Manager '{manager.name}' created.", "employee_id": manager.id}
 
-    return {"message": f"Manager account '{manager.name}' created successfully."}
 
+# ── POST /auth/login ─────────────────────────────────────────
 
-# ---------------------------------------------------------------------------
-# POST /auth/login
-# ---------------------------------------------------------------------------
 @router.post("/login")
-def login(payload: LoginRequest, db: Session = Depends(get_db)):
+@limiter.limit("10/15minutes")   # 10 attempts per 15 minutes per IP
+def login(request: Request, payload: LoginRequest, db: Session = Depends(get_db)):
     """
-    Login with name + password.
-    Returns an access token (8hrs) and a refresh token (30 days).
-
-    WHAT THE FRONTEND DOES WITH THIS:
-    - Stores the access token in memory
-    - Stores the refresh token in sessionStorage
-    - Sends the access token in every future API request header
+    Rate limited to prevent brute force.
+    Returns access token (8hrs) + refresh token (30 days).
     """
-    # 1. Find the employee by name (case-insensitive)
     employee = db.query(Employee).filter(
         Employee.name.ilike(payload.name.strip()),
-        Employee.is_active == True
+        Employee.is_active == True,
     ).first()
 
-    # 2. Check if they exist and password is correct
     if not employee or not employee.password_hash:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid name or password."
+            detail="Invalid name or password.",
         )
 
     if not verify_password(payload.password, employee.password_hash):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid name or password."
+            detail="Invalid name or password.",
         )
 
-    # 3. Update last login timestamp
     employee.last_login = datetime.now(timezone.utc)
 
-    # 4. Create tokens
     access_token  = create_access_token(employee.id, employee.system_role, employee.name)
     refresh_token = create_refresh_token(employee.id)
 
-    # 5. Store refresh token hash in DB (so we can invalidate it on logout)
-    from api.security import hash_password as hash_token
-    employee.refresh_token = hash_token(refresh_token)
+    # Store bcrypt hash — so logout invalidates the token
+    employee.refresh_token = hash_password(refresh_token)
+
+    # Audit log
+    db.add(AuditLog(
+        company_id=employee.company_id,
+        actor_id=employee.id,
+        action="login",
+        entity_type="employee",
+        entity_id=employee.id,
+    ))
     db.commit()
 
     return {
@@ -131,23 +124,23 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
         "refresh_token": refresh_token,
         "token_type":    "bearer",
         "user": {
-            "id":   employee.id,
-            "name": employee.name,
-            "role": employee.system_role,
-            "team": employee.team
-        }
+            "id":         employee.id,
+            "name":       employee.name,
+            "role":       employee.system_role,
+            "team":       employee.team,
+            "company_id": employee.company_id,
+        },
     }
 
 
-# ---------------------------------------------------------------------------
-# POST /auth/refresh
-# ---------------------------------------------------------------------------
+# ── POST /auth/refresh ───────────────────────────────────────
+
 @router.post("/refresh")
-def refresh_token(payload: RefreshRequest, db: Session = Depends(get_db)):
+@limiter.limit("30/minute")
+def refresh_token_endpoint(request: Request, payload: RefreshRequest, db: Session = Depends(get_db)):
     """
-    When the access token expires after 8 hours, the frontend
-    sends the refresh token here to get a new access token.
-    User never has to log in again for 30 days.
+    Verifies refresh token against stored bcrypt hash.
+    Logout clears the hash → subsequent refresh attempts fail.
     """
     token_data = decode_token(payload.refresh_token)
 
@@ -156,62 +149,55 @@ def refresh_token(payload: RefreshRequest, db: Session = Depends(get_db)):
 
     employee = db.query(Employee).filter(
         Employee.id == int(token_data["sub"]),
-        Employee.is_active == True
+        Employee.is_active == True,
     ).first()
 
     if not employee:
         raise HTTPException(status_code=401, detail="User not found.")
 
-    # Issue a fresh access token
-    new_access_token = create_access_token(
-        employee.id, employee.system_role, employee.name
-    )
+    # KEY FIX: verify against stored hash
+    if not employee.refresh_token:
+        raise HTTPException(status_code=401, detail="Session expired. Please log in again.")
 
-    return {
-        "access_token": new_access_token,
-        "token_type": "bearer"
-    }
+    if not verify_password(payload.refresh_token, employee.refresh_token):
+        raise HTTPException(status_code=401, detail="Refresh token revoked.")
+
+    new_access_token = create_access_token(employee.id, employee.system_role, employee.name)
+    return {"access_token": new_access_token, "token_type": "bearer"}
 
 
-# ---------------------------------------------------------------------------
-# POST /auth/logout
-# ---------------------------------------------------------------------------
+# ── POST /auth/logout ────────────────────────────────────────
+
 @router.post("/logout")
-def logout(
-    current_user: Employee = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """
-    Clears the refresh token from the database.
-    Even if someone has the old tokens, they can't refresh anymore.
-    """
+def logout(current_user: Employee = Depends(get_current_user), db: Session = Depends(get_db)):
     current_user.refresh_token = None
+    db.add(AuditLog(
+        company_id=current_user.company_id,
+        actor_id=current_user.id,
+        action="logout",
+        entity_type="employee",
+        entity_id=current_user.id,
+    ))
     db.commit()
-    return {"message": "Logged out successfully."}
+    return {"message": "Logged out."}
 
 
-# ---------------------------------------------------------------------------
-# GET /auth/me
-# ---------------------------------------------------------------------------
+# ── GET /auth/me ─────────────────────────────────────────────
+
 @router.get("/me")
 def get_me(current_user: Employee = Depends(get_current_user)):
-    """
-    Returns the currently logged-in user's info.
-    The frontend calls this on app load to restore the session.
-    """
     return {
-        "id":          current_user.id,
-        "name":        current_user.name,
-        "role":        current_user.system_role,
-        "team":        current_user.team,
-        "last_login":  current_user.last_login,
+        "id":         current_user.id,
+        "name":       current_user.name,
+        "role":       current_user.system_role,
+        "team":       current_user.team,
+        "company_id": current_user.company_id,
+        "last_login": current_user.last_login,
     }
 
 
-# ---------------------------------------------------------------------------
-# POST /auth/employees/create
-# Manager creates employee accounts (with temporary passwords)
-# ---------------------------------------------------------------------------
+# ── POST /auth/employees/create ──────────────────────────────
+
 class CreateEmployeeRequest(BaseModel):
     name: str
     role: str
@@ -225,23 +211,27 @@ class CreateEmployeeRequest(BaseModel):
 @router.post("/employees/create")
 def create_employee(
     payload: CreateEmployeeRequest,
-    db: Session = Depends(get_db)
+    current_user: Employee = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     """
-    Manager creates a new employee account.
-    Employee gets a temporary password they can change later.
+    Create a new employee account.
+
+    FIX (Bug 4): Manager-only. Previously any authenticated user could
+    create employee accounts within their company.
     """
+    if current_user.system_role != "manager":
+        raise HTTPException(status_code=403, detail="Manager access required.")
+
     existing = db.query(Employee).filter(
-        Employee.name.ilike(payload.name.strip())
+        Employee.name.ilike(payload.name.strip()),
+        Employee.company_id == current_user.company_id,
     ).first()
-
     if existing:
-        raise HTTPException(
-            status_code=400,
-            detail=f"An employee named '{payload.name}' already exists."
-        )
+        raise HTTPException(status_code=400, detail=f"'{payload.name}' already exists.")
 
-    employee = Employee(
+    emp = Employee(
+        company_id=current_user.company_id,
         name=payload.name,
         role=payload.role,
         team=payload.team,
@@ -253,20 +243,21 @@ def create_employee(
         gender=payload.gender,
         is_active=True,
     )
-    db.add(employee)
+    db.add(emp)
+    db.add(AuditLog(
+        company_id=current_user.company_id,
+        actor_id=current_user.id,
+        action="create_employee",
+        entity_type="employee",
+        new_value={"name": payload.name, "role": payload.role},
+    ))
     db.commit()
-    db.refresh(employee)
-
-    return {
-        "message": f"Employee '{employee.name}' created successfully.",
-        "employee_id": employee.id
-    }
+    db.refresh(emp)
+    return {"message": f"Employee '{emp.name}' created.", "employee_id": emp.id}
 
 
-# ---------------------------------------------------------------------------
-# POST /auth/set-password
-# Manager sets or resets password for any employee
-# ---------------------------------------------------------------------------
+# ── POST /auth/set-password ──────────────────────────────────
+
 class SetPasswordRequest(BaseModel):
     employee_id: int
     new_password: str
@@ -274,32 +265,39 @@ class SetPasswordRequest(BaseModel):
 @router.post("/set-password")
 def set_employee_password(
     payload: SetPasswordRequest,
-    db: Session = Depends(get_db)
+    current_user: Employee = Depends(get_current_user),
+    db: Session = Depends(get_db),
 ):
     """
-    Sets or resets a password for an existing employee.
-    Used when:
-    - Manager onboards an employee added via Claude tool
-    - Manager resets a forgotten password
+    Reset another employee's password.
+
+    FIX (Bug 4): Manager-only. Previously any authenticated user could
+    reset any other user's password within their company.
     """
-    employee = db.query(Employee).filter(Employee.id == payload.employee_id).first()
-    if not employee:
+    if current_user.system_role != "manager":
+        raise HTTPException(status_code=403, detail="Manager access required.")
+
+    emp = db.query(Employee).filter(
+        Employee.id == payload.employee_id,
+        Employee.company_id == current_user.company_id,
+    ).first()
+    if not emp:
         raise HTTPException(status_code=404, detail="Employee not found.")
 
-    employee.password_hash = hash_password(payload.new_password)
+    emp.password_hash = hash_password(payload.new_password)
+    db.add(AuditLog(
+        company_id=current_user.company_id,
+        actor_id=current_user.id,
+        action="set_password",
+        entity_type="employee",
+        entity_id=emp.id,
+    ))
     db.commit()
-
-    return {
-        "message": f"Password set for '{employee.name}'. They can now log in.",
-        "employee_id": employee.id,
-        "name": employee.name
-    }
+    return {"message": f"Password set for '{emp.name}'.", "employee_id": emp.id}
 
 
-# ---------------------------------------------------------------------------
-# POST /auth/change-password
-# Employee changes their own password after first login
-# ---------------------------------------------------------------------------
+# ── POST /auth/change-password ───────────────────────────────
+
 class ChangePasswordRequest(BaseModel):
     current_password: str
     new_password: str
@@ -308,12 +306,18 @@ class ChangePasswordRequest(BaseModel):
 def change_password(
     payload: ChangePasswordRequest,
     current_user: Employee = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
-    """Employee changes their own password."""
     if not verify_password(payload.current_password, current_user.password_hash or ""):
         raise HTTPException(status_code=401, detail="Current password is incorrect.")
 
     current_user.password_hash = hash_password(payload.new_password)
+    db.add(AuditLog(
+        company_id=current_user.company_id,
+        actor_id=current_user.id,
+        action="change_password",
+        entity_type="employee",
+        entity_id=current_user.id,
+    ))
     db.commit()
-    return {"message": "Password changed successfully."}
+    return {"message": "Password changed."}

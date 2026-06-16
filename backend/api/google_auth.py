@@ -62,6 +62,37 @@ CLIENT_CONFIG = {
 _pending_flows: dict = {}
 
 
+# ── Token encryption at rest ──────────────────────────────────
+# OAuth tokens (incl. the refresh token + client_secret) are encrypted before
+# they touch the DB, so a database dump alone no longer yields working Google
+# access. The key is derived from an env secret (NEXUS_TOKEN_KEY, falling back
+# to JWT_SECRET) and lives only in the environment — never in the DB.
+import base64
+import hashlib
+from cryptography.fernet import Fernet
+
+
+def _fernet() -> Fernet:
+    secret = os.getenv("NEXUS_TOKEN_KEY") or os.getenv("JWT_SECRET", "nexus_change_this_in_production")
+    return Fernet(base64.urlsafe_b64encode(hashlib.sha256(secret.encode()).digest()))
+
+
+def _encrypt(plaintext: str) -> str:
+    return _fernet().encrypt(plaintext.encode()).decode()
+
+
+def _load_token_json(stored: str) -> dict:
+    """Decrypt + parse stored token JSON. Falls back to legacy plaintext (which
+    is then re-encrypted on the next save), so pre-existing rows keep working."""
+    try:
+        return json.loads(_fernet().decrypt(stored.encode()).decode())
+    except Exception:
+        try:
+            return json.loads(stored)   # legacy plaintext row
+        except Exception:
+            return {}
+
+
 def _make_flow() -> Flow:
     """Creates a Flow with PKCE disabled — required for server-side web apps."""
     flow = Flow.from_client_config(
@@ -107,9 +138,9 @@ def handle_google_callback(code: str, state: str, db: Session) -> dict:
         # Fallback: create a fresh flow (loses PKCE state but works for simple cases)
         flow = _make_flow()
 
-    # Tell the flow to skip code verifier validation
-    import os
-    os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"  # allow http for local dev
+    # Allow http only for local/dev redirect URIs; production (https) stays strict.
+    if GOOGLE_REDIRECT_URI.startswith("http://"):
+        os.environ["OAUTHLIB_INSECURE_TRANSPORT"] = "1"
 
     flow.fetch_token(code=code)
     credentials = flow.credentials
@@ -141,7 +172,7 @@ def get_credentials(employee_id: int, db: Session) -> Credentials | None:
     if not record:
         return None
 
-    token_data = json.loads(record.access_token)
+    token_data = _load_token_json(record.access_token)
 
     creds = Credentials(
         token         = token_data.get("token"),
@@ -179,15 +210,16 @@ def _save_tokens(employee_id: int, credentials: Credentials, db: Session):
         OAuthToken.provider    == "google",
     ).first()
 
+    encrypted = _encrypt(token_data)
     if existing:
-        existing.access_token = token_data
+        existing.access_token = encrypted
         existing.token_expiry = credentials.expiry
         existing.updated_at   = datetime.now(timezone.utc)
     else:
         db.add(OAuthToken(
             employee_id   = employee_id,
             provider      = "google",
-            access_token  = token_data,   # storing full token JSON
+            access_token  = encrypted,    # encrypted token JSON (Fernet, key in env)
             token_expiry  = credentials.expiry,
             scope         = " ".join(SCOPES),
         ))
