@@ -26,7 +26,7 @@ from database.models import (
     MeetingActionItem, Delegation, Escalation,
     Goal, TimeEntry, Notification, ApprovalRequest,
     AuditLog, EmployeePreference, DailyBriefing,
-    WorkloadSnapshot, Contract,
+    WorkloadSnapshot, Contract, Team,
 )
 import queue
 import threading
@@ -762,6 +762,23 @@ MANAGER_TOOLS = [
             "type": "object",
             "properties": {"meeting_id": {"type": "integer"}},
             "required": ["meeting_id"]
+        }
+    },
+    {
+        "name": "set_team_lead",
+        "description": "Promote an employee to TEAM LEAD of their team, or demote them back. "
+                       "A team lead keeps their own tasks and personal AI but additionally "
+                       "gains manager-like tools scoped STRICTLY to their own team: view/assign/"
+                       "reassign team tasks, team status & workload, team meetings, and resolving "
+                       "their team's escalations. They cannot hire/fire, set passwords, see other "
+                       "teams, or approve outward emails.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "employee_id": {"type": "integer"},
+                "make_lead":   {"type": "boolean", "description": "true = promote to team lead, false = demote to regular employee"}
+            },
+            "required": ["employee_id", "make_lead"]
         }
     },
     {
@@ -1747,6 +1764,31 @@ def _parse_date(value):
 # which toolset list happened to be handed to the model.
 MANAGER_ONLY_TOOLS = {t["name"] for t in MANAGER_TOOLS} - {t["name"] for t in EMPLOYEE_TOOLS}
 
+# ── TEAM-LEAD TIER ──────────────────────────────────────────────────────────
+# A team lead (Employee.system_role == "team_lead") is a normal employee who
+# ALSO gets this curated subset of manager tools — hard-scoped to their OWN
+# team server-side (list results filtered, every explicit target validated).
+# Deliberately excluded: hiring/firing, passwords, company analytics, goals
+# admin, approvals of outward actions, contracts admin, MCP config.
+LEAD_TOOL_NAMES = {
+    # reads — list output filtered to the lead's team (lead_scope_ids)
+    "view_all_tasks", "get_overdue_tasks", "search_tasks",
+    "get_team_status", "get_workload_summary", "get_completion_rate",
+    "view_meetings", "view_escalations",
+    # target-validated reads/writes — the target must be inside the team
+    "get_employee_details", "assign_task", "reassign_task",
+    "update_task_status", "update_task_priority", "update_task_due_date",
+    "resolve_escalation",
+    # meetings — attendees restricted to the team; edits only to own meetings
+    "schedule_meeting", "reschedule_meeting", "delete_meeting",
+}
+# Schemas the lead's agent gets IN ADDITION to EMPLOYEE_TOOLS. Appended after
+# the employee cache breakpoint, so employee and lead agents share the cached
+# tool prefix.
+LEAD_EXTRA_TOOLS = [t for t in MANAGER_TOOLS
+                    if t["name"] in LEAD_TOOL_NAMES
+                    and t["name"] not in {e["name"] for e in EMPLOYEE_TOOLS}]
+
 
 def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
     """
@@ -1772,22 +1814,105 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
     # task's owner, etc.) are intentionally left alone.
     caller_is_employee = str(agent_id).startswith("Employee_")
     caller_id = None
+    caller_is_lead = False
+    lead_scope_ids = None   # for team leads: their team's employee ids (incl. self)
     if caller_is_employee:
         try:
             caller_id = int(str(agent_id).split("_", 1)[1])
         except (IndexError, ValueError):
             return "Authorization error: could not determine your identity."
+
         if tool_name in MANAGER_ONLY_TOOLS:
-            return "Not authorized — that action requires a manager."
-        for _f in ("employee_id", "sender_id", "author_id"):
-            if _f in tool_input:
-                tool_input[_f] = caller_id
-        # `from_agent_id` is a STRING agent id (String column), NOT an int FK — so
-        # force the caller's real id in the "Employee_<id>" form the handlers and
-        # the Team path use. Writing the bare int here broke create_escalation
-        # (int into a varchar column) and the "Employee_<id>" convention.
-        if "from_agent_id" in tool_input or tool_name == "create_escalation":
-            tool_input["from_agent_id"] = f"Employee_{caller_id}"
+            # TEAM LEADS get a curated subset of manager tools, hard-scoped to
+            # their own team. Role comes from the DB (never the model's args).
+            _ldb = SessionLocal()
+            try:
+                _me = _ldb.query(Employee).filter(Employee.id == caller_id).first()
+                if (_me is not None and _me.system_role == "team_lead"
+                        and _me.team_id and tool_name in LEAD_TOOL_NAMES):
+                    caller_is_lead = True
+                    lead_scope_ids = {e.id for e in _ldb.query(Employee).filter(
+                        Employee.team_id == _me.team_id,
+                        Employee.is_active == True).all()}
+                    lead_scope_ids.add(caller_id)
+            finally:
+                _ldb.close()
+            if not caller_is_lead:
+                return "Not authorized — that action requires a manager."
+
+        if not caller_is_lead:
+            for _f in ("employee_id", "sender_id", "author_id"):
+                if _f in tool_input:
+                    tool_input[_f] = caller_id
+            # `from_agent_id` is a STRING agent id (String column), NOT an int FK — so
+            # force the caller's real id in the "Employee_<id>" form the handlers and
+            # the Team path use. Writing the bare int here broke create_escalation
+            # (int into a varchar column) and the "Employee_<id>" convention.
+            if "from_agent_id" in tool_input or tool_name == "create_escalation":
+                tool_input["from_agent_id"] = f"Employee_{caller_id}"
+        else:
+            # ── LEAD TARGET VALIDATION ──────────────────────────────────────
+            # Identity fields are NOT forced here (a lead legitimately targets
+            # teammates) — instead every explicit person/task/meeting target is
+            # checked against the team. Out-of-team → refuse, never retarget.
+            def _as_int(v):
+                try:
+                    return int(v)
+                except (TypeError, ValueError):
+                    return None
+            _deny = "Not authorized — that's outside your team."
+            _emp_target_field = {"assign_task": "employee_id",
+                                 "get_employee_details": "employee_id",
+                                 "reassign_task": "new_employee_id"}
+            if tool_name in _emp_target_field:
+                _t = _as_int(tool_input.get(_emp_target_field[tool_name]))
+                if _t is None or _t not in lead_scope_ids:
+                    return _deny
+            if tool_name in ("reassign_task", "update_task_status",
+                             "update_task_priority", "update_task_due_date"):
+                _tdb = SessionLocal()
+                try:
+                    _task = _tdb.query(Task).filter(
+                        Task.id == _as_int(tool_input.get("task_id"))).first()
+                    if not _task:
+                        return "Task not found."
+                    if _task.owner_id not in lead_scope_ids:
+                        return _deny
+                finally:
+                    _tdb.close()
+            if tool_name == "search_tasks":
+                _o = _as_int(tool_input.get("owner_id"))
+                if tool_input.get("owner_id") is not None and _o not in lead_scope_ids:
+                    return _deny
+            if tool_name == "schedule_meeting":
+                _att = {_as_int(a) for a in (tool_input.get("attendee_ids") or [])}
+                if not _att or None in _att or not _att.issubset(lead_scope_ids):
+                    return "Not authorized — you can only schedule meetings with your own team."
+            if tool_name in ("reschedule_meeting", "delete_meeting"):
+                _mdb3 = SessionLocal()
+                try:
+                    _mtg = _mdb3.query(Meeting).filter(
+                        Meeting.id == _as_int(tool_input.get("meeting_id"))).first()
+                    if not _mtg:
+                        return "Meeting not found."
+                    if _mtg.created_by != caller_id:
+                        return "Not authorized — you can only change meetings you created yourself."
+                finally:
+                    _mdb3.close()
+            if tool_name == "resolve_escalation":
+                _edb = SessionLocal()
+                try:
+                    _esc = _edb.query(Escalation).filter(
+                        Escalation.id == _as_int(tool_input.get("escalation_id"))).first()
+                    if not _esc:
+                        return "Escalation not found."
+                    _from = str(_esc.from_agent_id or "")
+                    _fid = (_as_int(_from.split("_", 1)[1])
+                            if _from.startswith("Employee_") else None)
+                    if _fid not in lead_scope_ids:
+                        return _deny
+                finally:
+                    _edb.close()
 
     # ── TEAM (COORDINATOR) caller: a shared-channel assistant with NO personal
     # identity. Hard allow-list (defense in depth) — anything outside the
@@ -1844,9 +1969,12 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
     try:
         # ── TASKS ──────────────────────────────────────────────────────────
         if tool_name == "view_all_tasks":
-            tasks = db.query(Task).all()
+            _q = db.query(Task)
+            if lead_scope_ids is not None:   # team lead → own team only
+                _q = _q.filter(Task.owner_id.in_(lead_scope_ids))
+            tasks = _q.all()
             if not tasks:
-                return "No tasks in the system."
+                return "No tasks in the system." if lead_scope_ids is None else "Your team has no tasks."
             result = []
             for t in tasks:
                 subs = t.subtasks
@@ -1936,6 +2064,8 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
 
         elif tool_name == "search_tasks":
             q = db.query(Task)
+            if lead_scope_ids is not None:   # team lead → own team only
+                q = q.filter(Task.owner_id.in_(lead_scope_ids))
             if tool_input.get("keyword"):
                 kw = f"%{tool_input['keyword']}%"
                 q = q.filter((Task.title.ilike(kw)) | (Task.description.ilike(kw)))
@@ -1952,7 +2082,10 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
 
         elif tool_name == "get_overdue_tasks":
             today = datetime.now().strftime("%Y-%m-%d")
-            tasks = db.query(Task).filter(Task.is_completed == False).all()
+            _q = db.query(Task).filter(Task.is_completed == False)
+            if lead_scope_ids is not None:   # team lead → own team only
+                _q = _q.filter(Task.owner_id.in_(lead_scope_ids))
+            tasks = _q.all()
             overdue = [t for t in tasks if t.due_date and str(t.due_date) < today]
             if not overdue:
                 return "No overdue tasks. All directives are on schedule."
@@ -2180,7 +2313,11 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
                     "Watch the Glass Brain for real-time updates.")
 
         elif tool_name == "get_team_status":
-            employees = db.query(Employee).filter(Employee.system_role == "employee").all()
+            # != "manager" (not == "employee") so team LEADS appear in listings too
+            _q = db.query(Employee).filter(Employee.system_role != "manager")
+            if lead_scope_ids is not None:   # team lead → own team only
+                _q = _q.filter(Employee.id.in_(lead_scope_ids))
+            employees = _q.all()
             if not employees:
                 return "No employees in the system."
             result = []
@@ -2309,6 +2446,10 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
         # ── MEETINGS ───────────────────────────────────────────────────────
         elif tool_name == "view_meetings":
             meetings = db.query(Meeting).all()
+            if lead_scope_ids is not None:   # team lead → meetings involving the team
+                meetings = [m for m in meetings
+                            if m.created_by in lead_scope_ids
+                            or any(a.id in lead_scope_ids for a in m.attendees)]
             if not meetings:
                 return "No meetings scheduled."
             result = []
@@ -2480,6 +2621,33 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             db.commit()
             _broadcast_sync()
             return f"Meeting {tool_input['meeting_id']} cancelled.{google_note}"
+
+        elif tool_name == "set_team_lead":
+            emp = db.query(Employee).filter(Employee.id == tool_input["employee_id"]).first()
+            if not emp:
+                return "Employee not found."
+            if emp.system_role == "manager":
+                return "That's the manager — managers can't be team leads."
+            if tool_input.get("make_lead"):
+                if not emp.team_id:
+                    return f"{emp.name} isn't assigned to a team yet — assign them to a team first."
+                emp.system_role = "team_lead"
+                team = db.query(Team).filter(Team.id == emp.team_id).first()
+                if team:
+                    team.lead_id = emp.id
+                db.commit()
+                _broadcast_sync()
+                return (f"{emp.name} is now TEAM LEAD of {team.name if team else 'their team'}. "
+                        f"Their AI can manage the team's tasks, meetings, workload and escalations — "
+                        f"scoped to that team only.")
+            else:
+                emp.system_role = "employee"
+                team = db.query(Team).filter(Team.lead_id == emp.id).first()
+                if team:
+                    team.lead_id = None
+                db.commit()
+                _broadcast_sync()
+                return f"{emp.name} is a regular employee again."
 
         elif tool_name == "add_meeting_summary":
             meeting = db.query(Meeting).filter(Meeting.id == tool_input["meeting_id"]).first()
@@ -2851,6 +3019,9 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
 
         elif tool_name == "view_escalations":
             escs = db.query(Escalation).filter(Escalation.status == "pending").all()
+            if lead_scope_ids is not None:   # team lead → escalations from the team
+                _team_agents = {f"Employee_{i}" for i in lead_scope_ids}
+                escs = [e for e in escs if str(e.from_agent_id or "") in _team_agents]
             if not escs:
                 return "No pending escalations."
             return "\n".join(
@@ -2874,9 +3045,15 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
 
         # ── ANALYTICS ──────────────────────────────────────────────────────
         elif tool_name == "get_workload_summary":
-            employees  = db.query(Employee).filter(Employee.system_role == "employee").all()
-            total_tasks = db.query(Task).count()
-            completed   = db.query(Task).filter(Task.is_completed == True).count()
+            # != "manager" so team LEADS appear; scope filters to the lead's team
+            _eq = db.query(Employee).filter(Employee.system_role != "manager")
+            _tq = db.query(Task)
+            if lead_scope_ids is not None:
+                _eq = _eq.filter(Employee.id.in_(lead_scope_ids))
+                _tq = _tq.filter(Task.owner_id.in_(lead_scope_ids))
+            employees  = _eq.all()
+            total_tasks = _tq.count()
+            completed   = _tq.filter(Task.is_completed == True).count()
             result = [f"TOTAL TASKS: {total_tasks} | COMPLETED: {completed} | PENDING: {total_tasks - completed}"]
             for e in employees:
                 active = sum(1 for t in e.tasks if not t.is_completed)
@@ -2898,6 +3075,8 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
 
         elif tool_name == "get_completion_rate":
             q = db.query(Task)
+            if lead_scope_ids is not None:   # team lead → own team only
+                q = q.filter(Task.owner_id.in_(lead_scope_ids))
             if tool_input.get("employee_id"):
                 q = q.filter(Task.owner_id == tool_input["employee_id"])
             tasks = q.all()
@@ -3762,12 +3941,30 @@ def run_orchestrator(agent_id: str, command: str, extra_context: str = None) -> 
         emp_id = int(agent_id.split("_")[1])
         db = SessionLocal()
         try:
-            emp      = db.query(Employee).filter(Employee.id == emp_id).first()
-            emp_name = emp.name if emp else f"Employee {emp_id}"
+            emp       = db.query(Employee).filter(Employee.id == emp_id).first()
+            emp_name  = emp.name if emp else f"Employee {emp_id}"
+            is_lead   = bool(emp and emp.system_role == "team_lead" and emp.team_id)
+            team_name = (emp.team_obj.name if is_lead and emp.team_obj else emp.team) if emp else None
         finally:
             db.close()
         static_prompt, dynamic_prompt = get_employee_prompt_parts(emp_id, emp_name)
         tools = EMPLOYEE_TOOLS
+        if is_lead:
+            # Lead extras go AFTER the employee cache breakpoint, so employee
+            # and lead agents share the cached tool prefix. execute_tool
+            # enforces the team scoping server-side regardless of the prompt.
+            tools = list(EMPLOYEE_TOOLS) + LEAD_EXTRA_TOOLS
+            static_prompt += (
+                f"\n\n--- TEAM LEAD POWERS ---\n"
+                f"{emp_name} is the TEAM LEAD of {team_name or 'their team'}. Beyond your normal "
+                f"tools you can, FOR THIS TEAM ONLY: view all team tasks (view_all_tasks/search_tasks/"
+                f"get_overdue_tasks), see team status and workload (get_team_status/get_workload_summary/"
+                f"get_completion_rate), assign and reassign tasks among team members (assign_task/"
+                f"reassign_task), update team tasks (status/priority/due date), schedule team meetings "
+                f"(with Google Meet invites), and view/resolve the team's escalations. Everything is "
+                f"scoped to the team server-side — other teams' data, hiring, passwords, and company-wide "
+                f"actions are the manager's, and requests for them should be escalated."
+            )
     else:
         static_prompt, dynamic_prompt = get_manager_prompt_parts()
         tools = MANAGER_TOOLS
