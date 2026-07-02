@@ -27,8 +27,15 @@ from api.ollama_client import OllamaClient
 log = logging.getLogger("nexus.rag")
 
 # ── Config (swappable via env) ────────────────────────────────
-EMBED_MODEL        = os.getenv("EMBED_MODEL", "nomic-embed-text")
-EMBED_DIM          = int(os.getenv("EMBED_DIM", "768"))
+# EMBED_PROVIDER: "ollama" (local, free), "gemini" (hosted — for cloud deploys
+# with no Ollama sidecar), or "auto" (prefer Ollama if reachable, else Gemini
+# if GEMINI_API_KEY is set). Resolved ONCE per process: rows are tagged with
+# the model that made them and search filters on it, so mid-process flapping
+# between providers would split the index.
+EMBED_PROVIDER     = os.getenv("EMBED_PROVIDER", "auto").lower()
+EMBED_MODEL        = os.getenv("EMBED_MODEL", "nomic-embed-text")   # ollama model
+GEMINI_EMBED_MODEL = os.getenv("GEMINI_EMBED_MODEL", "gemini-embedding-001")
+EMBED_DIM          = int(os.getenv("EMBED_DIM", "768"))  # both providers emit 768 (gemini via output_dimensionality)
 CHUNK_CHARS        = 1200    # ~300 tokens per chunk
 CHUNK_OVERLAP      = 200     # carry context across chunk boundaries
 MAX_EMBED_CHARS    = 8000    # hard cap per embed call (safety)
@@ -46,22 +53,74 @@ _index_pool = ThreadPoolExecutor(max_workers=_INDEX_WORKERS, thread_name_prefix=
 
 # ── Embedding + chunking ──────────────────────────────────────
 
+# ── Provider resolution (once per process) ────────────────────
+_resolved_provider = None
+_gemini_client = None
+
+
+def _provider() -> str:
+    """ollama | gemini — resolved once. 'auto' prefers the free local Ollama and
+    falls back to Gemini (hosted) so RAG keeps working on cloud deploys."""
+    global _resolved_provider
+    if _resolved_provider:
+        return _resolved_provider
+    if EMBED_PROVIDER in ("ollama", "gemini"):
+        _resolved_provider = EMBED_PROVIDER
+    elif _ollama.is_available():
+        _resolved_provider = "ollama"
+    elif os.getenv("GEMINI_API_KEY"):
+        _resolved_provider = "gemini"
+    else:
+        _resolved_provider = "ollama"   # nothing reachable — keep trying local
+    log.info(f"RAG embedding provider: {_resolved_provider}")
+    return _resolved_provider
+
+
+def active_embed_model() -> str:
+    """The model rows are tagged with (and search filters on). Switching
+    providers changes this, so old rows simply stop matching — re-run
+    `python rag.py backfill` after a switch to re-index under the new model."""
+    return GEMINI_EMBED_MODEL if _provider() == "gemini" else EMBED_MODEL
+
+
+def _gemini_embed(text: str) -> list:
+    global _gemini_client
+    if _gemini_client is None:
+        import google.genai as genai
+        from google.genai import types as _gt
+        _gemini_client = genai.Client(api_key=os.environ["GEMINI_API_KEY"],
+                                      http_options=_gt.HttpOptions(timeout=30_000))
+    from google.genai import types as _gt
+    r = _gemini_client.models.embed_content(
+        model=GEMINI_EMBED_MODEL,
+        contents=text,
+        config=_gt.EmbedContentConfig(output_dimensionality=EMBED_DIM),
+    )
+    return list(r.embeddings[0].values)
+
+
 def embed_text(text: str, timeout: int = None) -> list:
     """Return the embedding vector for `text`, or [] if empty/failed.
 
     Pass `timeout` (seconds) for latency-sensitive callers (e.g. an interactive
-    search) so a slow/hung Ollama can't block for the full default 60s."""
+    search) so a slow/hung Ollama can't block for the full default 60s.
+    (The Gemini path has a fixed 30s HTTP timeout; `timeout` applies to Ollama.)"""
     text = (text or "").strip()
     if not text:
         return []
+    if _provider() == "gemini":
+        return _gemini_embed(text[:MAX_EMBED_CHARS])
     client = OllamaClient(timeout=timeout) if timeout is not None else _ollama
     return client.embed(model=EMBED_MODEL, text=text[:MAX_EMBED_CHARS])
 
 
 def backend_available() -> bool:
-    """Fast (~2s cap) probe of the embedding backend — lets interactive callers
-    fail fast with a clear message instead of waiting out a full embed timeout."""
+    """Fast probe of the embedding backend — lets interactive callers fail fast
+    with a clear message instead of waiting out a full embed timeout. The
+    hosted Gemini path is assumed up (no cheap probe; its own 30s cap applies)."""
     try:
+        if _provider() == "gemini":
+            return True
         return _ollama.is_available()
     except Exception:
         return False
@@ -129,7 +188,7 @@ def index_content(company_id: int, source_type: str, source_id, text: str, meta:
                 chunk_index=i,
                 content=ch,
                 embedding=vec,
-                embed_model=EMBED_MODEL,
+                embed_model=active_embed_model(),
                 meta=meta or {},
             ))
             stored += 1
@@ -197,7 +256,7 @@ def search(company_id: int, query: str, k: int = 5,
     try:
         q = db.query(KnowledgeEmbedding).filter(
             KnowledgeEmbedding.company_id  == company_id,
-            KnowledgeEmbedding.embed_model == EMBED_MODEL,
+            KnowledgeEmbedding.embed_model == active_embed_model(),
         )
         if source_types:
             q = q.filter(KnowledgeEmbedding.source_type.in_(source_types))

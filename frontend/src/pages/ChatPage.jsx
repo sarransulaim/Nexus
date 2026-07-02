@@ -3,7 +3,7 @@ import { useNexus } from '../context/NexusContext';
 import { Icon, ICON, Spinner } from '../components/ui/SharedUI';
 import { safeStr } from '../utils/helpers';
 
-const BACKEND_URL = `http://${window.location.hostname}:8000`;
+import { BACKEND_URL } from '../config';
 
 // Chat endpoints are now authenticated — attach the bearer token (these are
 // raw fetch() calls, so the axios interceptor doesn't apply to them).

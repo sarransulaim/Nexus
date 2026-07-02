@@ -4,7 +4,7 @@ import { Icon, ICON, TypingIndicator, Spinner } from '../components/ui/SharedUI'
 import { safeStr } from '../utils/helpers';
 import FileUploadCard from '../components/FileUploadCard';
 
-const BACKEND_URL = `http://${window.location.hostname}:8000`;
+import { BACKEND_URL } from '../config';
 
 /* ─── Waveform Visualizer ────────────────────────────────────── */
 function WaveformViz({ isListening, isSpeaking, isThinking, volume }) {

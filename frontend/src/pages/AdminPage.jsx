@@ -2,9 +2,7 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useNexus } from '../context/NexusContext';
 import axios from 'axios';
 
-const BACKEND_URL = `http://${window.location.hostname}:8000`;
-const WS_PROTOCOL = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-const WS_BASE     = `${WS_PROTOCOL}//${window.location.hostname}:8000`;
+import { BACKEND_URL, WS_BASE } from '../config';
 
 export default function AdminPage() {
   const { currentUser } = useNexus();

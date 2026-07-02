@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useState, useEffect, useRef, useCallback } from 'react';
 import axios from 'axios';
 import { safeStr } from '../utils/helpers';
+import { BACKEND_URL, WS_BASE } from '../config';
 
 const NexusContext = createContext();
 
@@ -9,9 +10,6 @@ export function useNexus() {
 }
 
 export function NexusProvider({ children }) {
-
-  // Works correctly for local dev — hostname resolves to localhost
-  const BACKEND_URL = `http://${window.location.hostname}:8000`;
 
   // ── Auth & Navigation ───────────────────────────────────────
   const [currentUser, setCurrentUser] = useState(() => {
@@ -289,12 +287,11 @@ export function NexusProvider({ children }) {
       }
     }
 
-    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     // Room-based WS — server needs employee_id to route messages correctly
     const employeeId = currentUserRef.current.dbId;
     // Auth: the WS now requires a valid token whose subject matches employeeId
     const wsToken    = accessTokenRef.current || '';
-    const wsUrl      = `${wsProtocol}//${window.location.hostname}:8000/api/v1/ws/${employeeId}?token=${encodeURIComponent(wsToken)}`;
+    const wsUrl      = `${WS_BASE}/api/v1/ws/${employeeId}?token=${encodeURIComponent(wsToken)}`;
 
     try {
       // Per-socket flag: a failed HANDSHAKE (expired token → server closes

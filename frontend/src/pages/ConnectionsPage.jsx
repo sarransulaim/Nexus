@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { useNexus } from '../context/NexusContext';
 import axios from 'axios';
 
-const BACKEND_URL = `http://${window.location.hostname}:8000`;
+import { BACKEND_URL } from '../config';
 
 /* One clean hub for every integration — Productivity, Messaging, and MCP data sources.
  * (Replaces the old separate Integrations page; all connect flows live here.) */

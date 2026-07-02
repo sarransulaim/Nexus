@@ -2,7 +2,7 @@ import { useState, useRef } from 'react';
 import { useNexus } from '../context/NexusContext';
 import axios from 'axios';
 
-const BACKEND_URL = `http://${window.location.hostname}:8000`;
+import { BACKEND_URL } from '../config';
 
 /**
  * FileUploadCard

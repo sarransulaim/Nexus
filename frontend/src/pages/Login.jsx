@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { useNexus } from '../context/NexusContext';
 import { Icon, ICON, Spinner } from '../components/ui/SharedUI';
 
-const BACKEND_URL = `http://${window.location.hostname}:8000`;
+import { BACKEND_URL } from '../config';
 
 const labelStyle = { display: 'block', fontSize: 11, fontWeight: 600, textTransform: 'uppercase', letterSpacing: '0.07em', color: 'var(--t3)', marginBottom: 6 };
 

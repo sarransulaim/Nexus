@@ -1,0 +1,56 @@
+# Nexus Command — self-host / local container stack.
+#
+#   1. Copy backend/.env.example → .env at the repo root (or export the vars)
+#   2. docker compose up --build
+#   3. API on http://localhost:8000 — run the frontend with `npm run dev`
+#      (it targets :8000 by default) or point VITE_BACKEND_URL at this host.
+#
+# Cloud platforms (Railway/Render) don't use this file — they build
+# backend/Dockerfile directly and provide managed Postgres.
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: nexus_core
+    volumes:
+      - nexus_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://postgres:${POSTGRES_PASSWORD:-postgres}@db:5432/nexus_core
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET (64+ random chars)}
+      SETUP_SECRET: ${SETUP_SECRET:?set SETUP_SECRET (16+ chars)}
+      NEXUS_TOKEN_KEY: ${NEXUS_TOKEN_KEY:?set NEXUS_TOKEN_KEY}
+      CLAUDE_API_KEY: ${CLAUDE_API_KEY:?set CLAUDE_API_KEY}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      # No Ollama in the container stack → hosted Gemini embeddings for RAG.
+      # Running Ollama on the host? Set EMBED_PROVIDER=ollama and
+      # OLLAMA_HOST=http://host.docker.internal:11434 instead.
+      EMBED_PROVIDER: ${EMBED_PROVIDER:-gemini}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:5173}
+      BACKEND_URL: ${BACKEND_URL:-http://localhost:8000}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-http://localhost:8000/api/v1/google/callback}
+      SLACK_ENABLED: ${SLACK_ENABLED:-false}
+      SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:-}
+      SLACK_APP_TOKEN: ${SLACK_APP_TOKEN:-}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
+      TWILIO_WEBHOOK_BASE: ${TWILIO_WEBHOOK_BASE:-}
+
+volumes:
+  nexus_pgdata:
