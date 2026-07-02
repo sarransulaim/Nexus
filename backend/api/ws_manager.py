@@ -11,12 +11,18 @@ Message routing:
   send_thought(agent_id)    → routes Glass Brain to correct employee
 
 Dead connections are cleaned up on every failed send.
-Thread-safe via asyncio.Lock.
+
+Concurrency: guarded by a plain **threading.Lock** (loop-agnostic). The lock
+protects ONLY the in-memory registries and is NEVER held across an ``await`` —
+so broadcasts fired from background threads (each on its own ``asyncio.run``
+loop) can't deadlock or raise on a cross-event-loop ``asyncio.Lock`` (which
+would silently drop SYNC_REQUIRED / chat / notification pushes). Targets are
+snapshotted under the lock, then the sends happen outside it.
 """
 
 import json
-import asyncio
 import logging
+import threading
 from typing import Dict, Set, List
 from fastapi import WebSocket
 
@@ -29,96 +35,112 @@ class ConnectionManager:
         self._connections: Dict[int, WebSocket] = {}    # employee_id → ws
         self._channel_rooms: Dict[int, Set[int]] = {}   # channel_id → {employee_ids}
         self._meeting_rooms: Dict[int, Set[int]] = {}   # meeting_id → {employee_ids}
-        self._lock = asyncio.Lock()
+        self._managers: Set[int] = set()                # connected employee_ids who are managers
+        self._lock = threading.Lock()   # guards registries only; never held across an await
 
-    async def connect(self, websocket: WebSocket, employee_id: int):
+    async def connect(self, websocket: WebSocket, employee_id: int, is_manager: bool = False):
         await websocket.accept()
-        async with self._lock:
+        with self._lock:
             old = self._connections.get(employee_id)
-            if old:
-                try:
-                    await old.close()
-                except Exception:
-                    pass
             self._connections[employee_id] = websocket
+            if is_manager:
+                self._managers.add(employee_id)
+        if old is not None and old is not websocket:
+            try:
+                await old.close()   # outside the lock — never await while holding it
+            except Exception:
+                pass
         log.info(f"WS connected: Employee {employee_id} | total={len(self._connections)}")
 
-    async def disconnect(self, employee_id: int):
-        async with self._lock:
-            self._connections.pop(employee_id, None)
-            for members in self._channel_rooms.values():
-                members.discard(employee_id)
-            for members in self._meeting_rooms.values():
-                members.discard(employee_id)
+    async def disconnect(self, employee_id: int, websocket: WebSocket = None):
+        # Identity-aware: only forget the employee if the socket being torn down is
+        # the one CURRENTLY registered. A stale socket's teardown (after the client
+        # reconnected) must not evict the fresh socket — otherwise the server
+        # silently stops delivering notifications/chat to a "connected" client.
+        with self._lock:
+            if websocket is None or self._connections.get(employee_id) is websocket:
+                self._connections.pop(employee_id, None)
+                self._managers.discard(employee_id)
+                for members in self._channel_rooms.values():
+                    members.discard(employee_id)
+                for members in self._meeting_rooms.values():
+                    members.discard(employee_id)
 
     # ── Room management ────────────────────────────
 
     async def join_channel(self, employee_id: int, channel_id: int):
-        async with self._lock:
+        with self._lock:
             self._channel_rooms.setdefault(channel_id, set()).add(employee_id)
 
     async def leave_channel(self, employee_id: int, channel_id: int):
-        async with self._lock:
+        with self._lock:
             if channel_id in self._channel_rooms:
                 self._channel_rooms[channel_id].discard(employee_id)
 
     async def join_meeting(self, employee_id: int, meeting_id: int):
-        async with self._lock:
+        with self._lock:
             self._meeting_rooms.setdefault(meeting_id, set()).add(employee_id)
 
     async def leave_meeting(self, employee_id: int, meeting_id: int):
-        async with self._lock:
+        with self._lock:
             if meeting_id in self._meeting_rooms:
                 self._meeting_rooms[meeting_id].discard(employee_id)
 
-    # ── Internal send ──────────────────────────────
+    # ── Internal send: snapshot targets under the lock, await sends OUTSIDE it ──
 
-    async def _send_one(self, employee_id: int, message: str) -> bool:
-        ws = self._connections.get(employee_id)
-        if not ws:
-            return True
-        try:
-            await ws.send_text(message)
-            return True
-        except Exception:
-            self._connections.pop(employee_id, None)
-            return False
+    async def _send_targets(self, targets: List, message: str):
+        """targets = list of (employee_id, websocket). Sends happen with NO lock
+        held; dead sockets are pruned afterward (only if still the registered one)."""
+        dead = []
+        for eid, ws in targets:
+            try:
+                await ws.send_text(message)
+            except Exception:
+                dead.append((eid, ws))
+        if dead:
+            with self._lock:
+                for eid, ws in dead:
+                    if self._connections.get(eid) is ws:   # don't evict a reconnected socket
+                        self._connections.pop(eid, None)
 
     # ── Public methods ─────────────────────────────
 
     async def broadcast(self, message: str):
         """Send to ALL employees. Used for SYNC_REQUIRED."""
-        async with self._lock:
-            ids = list(self._connections.keys())
-        dead = []
-        for emp_id in ids:
-            async with self._lock:
-                ok = await self._send_one(emp_id, message)
-            if not ok:
-                dead.append(emp_id)
+        with self._lock:
+            targets = list(self._connections.items())
+        await self._send_targets(targets, message)
 
     async def send_to_employee(self, employee_id: int, message: str):
         """Send to one specific employee."""
-        async with self._lock:
-            await self._send_one(employee_id, message)
+        with self._lock:
+            ws = self._connections.get(employee_id)
+            targets = [(employee_id, ws)] if ws is not None else []
+        await self._send_targets(targets, message)
 
     async def broadcast_to_channel(self, channel_id: int, message: str, exclude_id: int = None):
         """Send to all members of a chat channel."""
-        async with self._lock:
-            members = self._channel_rooms.get(channel_id, set()).copy()
-        for emp_id in members:
-            if emp_id == exclude_id:
-                continue
-            async with self._lock:
-                await self._send_one(emp_id, message)
+        with self._lock:
+            targets = [(m, self._connections[m])
+                       for m in self._channel_rooms.get(channel_id, set())
+                       if m != exclude_id and m in self._connections]
+        await self._send_targets(targets, message)
 
     async def broadcast_to_meeting(self, meeting_id: int, message: str):
         """Send to all participants of a meeting."""
-        async with self._lock:
-            members = self._meeting_rooms.get(meeting_id, set()).copy()
-        for emp_id in members:
-            async with self._lock:
-                await self._send_one(emp_id, message)
+        with self._lock:
+            targets = [(m, self._connections[m])
+                       for m in self._meeting_rooms.get(meeting_id, set())
+                       if m in self._connections]
+        await self._send_targets(targets, message)
+
+    async def broadcast_to_managers(self, message: str):
+        """Send only to connected MANAGER employees (manager-scoped telemetry —
+        never leak manager glass-brain / negotiation reports to employees)."""
+        with self._lock:
+            targets = [(eid, ws) for eid, ws in self._connections.items()
+                       if eid in self._managers]
+        await self._send_targets(targets, message)
 
     async def send_thought(self, agent_id: str, thought: str):
         """Route Glass Brain thought to the correct employee."""
@@ -130,8 +152,8 @@ class ConnectionManager:
             except (ValueError, IndexError):
                 pass
         else:
-            # Manager or unknown — broadcast (only manager is connected anyway)
-            await self.broadcast(message)
+            # Manager or unknown — managers only (never leak manager telemetry to all).
+            await self.broadcast_to_managers(message)
 
     async def send_notification(self, employee_id: int, notif: dict):
         """Real-time notification push to one employee."""

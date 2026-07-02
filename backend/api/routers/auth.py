@@ -46,9 +46,16 @@ class SetupRequest(BaseModel):
 # ── POST /auth/setup ─────────────────────────────────────────
 
 @router.post("/setup")
-def setup_manager(payload: SetupRequest, db: Session = Depends(get_db)):
-    import os
-    if payload.secret_key != os.getenv("SETUP_SECRET", "NEXUS_SETUP_2026"):
+@limiter.limit("5/hour")
+def setup_manager(request: Request, payload: SetupRequest, db: Session = Depends(get_db)):
+    import os, hmac
+    expected_secret = os.getenv("SETUP_SECRET", "")
+    if not expected_secret or expected_secret == "NEXUS_SETUP_2026" or len(expected_secret) < 16:
+        raise HTTPException(
+            status_code=503,
+            detail="Setup is not configured. Set a strong SETUP_SECRET in the environment before bootstrapping.",
+        )
+    if not hmac.compare_digest(payload.secret_key, expected_secret):
         raise HTTPException(status_code=403, detail="Invalid setup secret key.")
 
     existing = db.query(Employee).filter(Employee.system_role == "manager").first()
@@ -73,6 +80,16 @@ def setup_manager(payload: SetupRequest, db: Session = Depends(get_db)):
     db.commit()
     db.refresh(manager)
     return {"message": f"Manager '{manager.name}' created.", "employee_id": manager.id}
+
+
+# ── GET /auth/status ─────────────────────────────────────────
+@router.get("/status")
+def auth_status(db: Session = Depends(get_db)):
+    """Public: whether the instance is bootstrapped (a manager exists). Lets the
+    frontend decide between the first-run Setup screen and the Login screen.
+    Returns no user data."""
+    has_manager = db.query(Employee).filter(Employee.system_role == "manager").first() is not None
+    return {"initialized": has_manager}
 
 
 # ── POST /auth/login ─────────────────────────────────────────
@@ -189,6 +206,7 @@ def get_me(current_user: Employee = Depends(get_current_user)):
     return {
         "id":         current_user.id,
         "name":       current_user.name,
+        "email":      current_user.email,
         "role":       current_user.system_role,
         "team":       current_user.team,
         "company_id": current_user.company_id,

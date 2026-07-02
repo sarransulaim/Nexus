@@ -1,0 +1,9 @@
+{
+  "name": "nexus-landing",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Standalone marketing landing page for Nexus — static site + Vercel serverless lead capture.",
+  "dependencies": {
+    "resend": "^4.0.1"
+  }
+}

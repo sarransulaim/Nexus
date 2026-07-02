@@ -137,19 +137,38 @@ def extract_text(file_path: str, mime_type: str) -> str:
         ):
             try:
                 import pandas as pd
+                PREVIEW_ROWS = 20
+                # Only read the preview rows — never load an entire multi-GB
+                # spreadsheet into memory just to show a 20-row sample (#19).
                 if mime_type == "text/csv":
-                    df = pd.read_csv(file_path)
+                    df = pd.read_csv(file_path, nrows=PREVIEW_ROWS)
+                    # True row count without loading all columns into pandas: a
+                    # cheap streaming line count (approximate for quoted newlines,
+                    # fine as a display hint).
+                    total_rows = None
+                    try:
+                        with open(file_path, "r", encoding="utf-8", errors="ignore") as fh:
+                            total_rows = max(0, sum(1 for _ in fh) - 1)  # minus header
+                        total_rows = max(total_rows, len(df))
+                    except Exception:
+                        total_rows = None
                 else:
-                    df = pd.read_excel(file_path)
+                    df = pd.read_excel(file_path, nrows=PREVIEW_ROWS)
+                    total_rows = None  # exact count unknown without a full parse
 
                 # Summarize the data, don't dump every row
+                n_preview = len(df)
                 summary = []
-                summary.append(f"Spreadsheet with {len(df)} rows and {len(df.columns)} columns")
+                if total_rows is not None:
+                    summary.append(f"Spreadsheet with {total_rows} rows and {len(df.columns)} columns")
+                else:
+                    summary.append(f"Spreadsheet with {len(df.columns)} columns "
+                                   f"(showing first {n_preview} rows)")
                 summary.append(f"Columns: {', '.join(str(c) for c in df.columns)}")
-                summary.append("\nFirst 20 rows:")
-                summary.append(df.head(20).to_string())
-                if len(df) > 20:
-                    summary.append(f"\n... and {len(df) - 20} more rows")
+                summary.append(f"\nFirst {n_preview} rows:")
+                summary.append(df.head(PREVIEW_ROWS).to_string())
+                if total_rows is not None and total_rows > n_preview:
+                    summary.append(f"\n... and {total_rows - n_preview} more rows")
                 return "\n".join(summary)
             except Exception as e:
                 log.error(f"Spreadsheet extraction error: {e}")

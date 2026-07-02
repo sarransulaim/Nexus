@@ -16,7 +16,7 @@ Pull it once with:  ollama pull nomic-embed-text
 
 import os
 import logging
-import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -36,15 +36,35 @@ DEFAULT_COMPANY_ID = 1       # single-tenant per instance for the pilot
 
 _ollama = OllamaClient()
 
+# Bounded worker pool for background indexing. Embeds are serialized through a
+# single local Ollama anyway, so a couple of workers is plenty — and it stops an
+# upload / chat burst from spawning an unbounded number of daemon threads (#9),
+# which would explode thread + Ollama load and memory. Excess work queues.
+_INDEX_WORKERS = int(os.getenv("RAG_INDEX_WORKERS", "2"))
+_index_pool = ThreadPoolExecutor(max_workers=_INDEX_WORKERS, thread_name_prefix="rag-index")
+
 
 # ── Embedding + chunking ──────────────────────────────────────
 
-def embed_text(text: str) -> list:
-    """Return the embedding vector for `text`, or [] if empty/failed."""
+def embed_text(text: str, timeout: int = None) -> list:
+    """Return the embedding vector for `text`, or [] if empty/failed.
+
+    Pass `timeout` (seconds) for latency-sensitive callers (e.g. an interactive
+    search) so a slow/hung Ollama can't block for the full default 60s."""
     text = (text or "").strip()
     if not text:
         return []
-    return _ollama.embed(model=EMBED_MODEL, text=text[:MAX_EMBED_CHARS])
+    client = OllamaClient(timeout=timeout) if timeout is not None else _ollama
+    return client.embed(model=EMBED_MODEL, text=text[:MAX_EMBED_CHARS])
+
+
+def backend_available() -> bool:
+    """Fast (~2s cap) probe of the embedding backend — lets interactive callers
+    fail fast with a clear message instead of waiting out a full embed timeout."""
+    try:
+        return _ollama.is_available()
+    except Exception:
+        return False
 
 
 def chunk_text(text: str, size: int = CHUNK_CHARS, overlap: int = CHUNK_OVERLAP) -> list:
@@ -130,7 +150,12 @@ def index_async(company_id: int, source_type: str, source_id, text: str, meta: d
             index_content(company_id, source_type, source_id, text, meta=meta)
         except Exception as e:
             log.warning(f"async index failed for {source_type}:{source_id}: {e}")
-    threading.Thread(target=_run, daemon=True).start()
+    try:
+        _index_pool.submit(_run)
+    except RuntimeError as e:
+        # Pool shut down (interpreter exiting) — indexing is best-effort, so
+        # just skip rather than block the caller with an inline embed.
+        log.warning(f"index pool unavailable ({e}); skipped async index for {source_type}:{source_id}")
 
 
 # ── Retrieval ─────────────────────────────────────────────────
@@ -151,14 +176,17 @@ def _top_k(query_vec, rows, k: int):
 
 
 def search(company_id: int, query: str, k: int = 5,
-           source_types: list = None, min_score: float = 0.30) -> list:
+           source_types: list = None, min_score: float = 0.30,
+           query_timeout: int = None) -> list:
     """
     Semantic search over a company's knowledge. ALWAYS scoped to company_id
     (tenant isolation) and to the active embed model (dimension safety).
     Returns a list of {score, content, source_type, source_id, meta}.
+
+    `query_timeout` bounds the query-embed for interactive callers.
     """
     try:
-        qvec = embed_text(query)
+        qvec = embed_text(query, timeout=query_timeout)
     except Exception as e:
         log.warning(f"query embed failed: {e}")
         return []

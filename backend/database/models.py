@@ -263,6 +263,10 @@ class Meeting(Base):
     livekit_room_name  = Column(String(200), nullable=True, unique=True)
     livekit_started_at = Column(DateTime(timezone=True), nullable=True)
     livekit_ended_at   = Column(DateTime(timezone=True), nullable=True)
+    # Google Calendar event backing this meeting (the Meet link lives in
+    # `location`). Set when the organizer had Google connected at creation;
+    # lets reschedule/cancel in Nexus also move/cancel the Google event.
+    google_event_id    = Column(String(300), nullable=True)
     recording_path     = Column(String(500), nullable=True)
     transcript         = Column(Text, nullable=True)
     summary            = Column(Text, nullable=True)
@@ -855,3 +859,23 @@ class Contract(Base):
     __table_args__ = (
         Index("ix_contracts_company_status", "company_id", "status"),
     )
+
+
+class MCPConnection(Base):
+    """A connected enterprise app / data source exposed over MCP (Model Context
+    Protocol). Company-scoped; the auth token is Fernet-encrypted at rest. These
+    are fed into the orchestrator's Claude calls so the AI can read real artifacts
+    (code, schema, issues) instead of only task text."""
+    __tablename__ = "mcp_connections"
+
+    id             = Column(Integer, primary_key=True, index=True)
+    company_id     = Column(Integer, ForeignKey("companies.id", ondelete="CASCADE"), nullable=False, index=True)
+    app            = Column(String(80), nullable=False)    # catalog key: "github", "notion", "custom", ...
+    label          = Column(String(120), nullable=False)   # display name
+    url            = Column(String(500), nullable=False)   # the MCP server URL (must be publicly reachable)
+    auth_token_enc = Column(Text, nullable=True)           # Fernet-encrypted token (never returned to clients)
+    enabled        = Column(Boolean, default=True)
+    created_at     = Column(DateTime(timezone=True), default=_now)
+    updated_at     = Column(DateTime(timezone=True), default=_now, onupdate=_now)
+
+    __table_args__ = (UniqueConstraint("company_id", "app", name="uq_mcp_company_app"),)

@@ -18,8 +18,17 @@ from database.models import Task, Employee
 from api.ws_manager import notifier
 from api.security import get_current_user, require_manager
 from api.claude_orchestrator import run_orchestrator, glass_brain_queue, load_agent_memory
+from api.rate_limit import limiter
+from fastapi.concurrency import run_in_threadpool
+import asyncio
 
 router = APIRouter()
+
+# Cap concurrent orchestrator runs so a burst (or the 30-min schedulers firing)
+# can't exhaust the threadpool and starve fast endpoints like /health. Each run
+# is offloaded off the event loop via run_in_threadpool; the semaphore bounds
+# how many run at once.
+_orchestrator_sem = asyncio.Semaphore(8)
 
 
 # ---------------------------------------------------------------------------
@@ -52,27 +61,31 @@ async def broadcast_db_update():
 # POST /manager/command — MAIN AI ENDPOINT
 # ---------------------------------------------------------------------------
 @router.post("/command")
-def process_command(
-    request: CommandRequest,
+@limiter.limit("30/minute")
+async def process_command(
+    request: Request,
+    payload: CommandRequest,
     background_tasks: BackgroundTasks,
     current_user: Employee = Depends(get_current_user),
 ):
     """
     Routes a command through the Claude Orchestrator.
 
-    SECURITY: the agent identity is DERIVED from the authenticated token, not
-    the request body — otherwise any caller could impersonate any agent
-    (the manager or any employee) and drive the full toolset.
+    SECURITY: the agent identity is DERIVED from the authenticated token, not the
+    request body — otherwise any caller could impersonate any agent.
+    AVAILABILITY: the orchestrator is a blocking, multi-call loop, so we run it in
+    a threadpool behind a concurrency semaphore and rate-limit the endpoint — one
+    client (or a burst) can't hang the whole API, including /health.
     """
     agent_id = "Manager_1" if current_user.system_role == "manager" else f"Employee_{current_user.id}"
     print(f"\n--- [INCOMING COMMAND] ---")
-    print(f"Agent: {agent_id} | Input: {request.command_text[:80]}")
+    print(f"Agent: {agent_id} | Input: {payload.command_text[:80]}")
 
     try:
-        final_response = run_orchestrator(
-            agent_id=agent_id,
-            command=request.command_text.strip()
-        )
+        async with _orchestrator_sem:
+            final_response = await run_in_threadpool(
+                run_orchestrator, agent_id, payload.command_text.strip()
+            )
         # After any command, ping the frontend to refresh dashboard data
         background_tasks.add_task(broadcast_db_update)
         return {"status": "success", "ai_response": final_response}

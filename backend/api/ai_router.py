@@ -100,8 +100,12 @@ class AIRouter:
         if self._gemini_client is None:
             try:
                 import google.genai as genai
+                from google.genai import types as _gtypes
                 self._gemini_client = genai.Client(
-                    api_key=os.getenv("GEMINI_API_KEY")
+                    api_key=os.getenv("GEMINI_API_KEY"),
+                    # 60s cap: a Gemini stall now RAISES, so AIRouter.call()'s except
+                    # fires and falls back to Haiku instead of hanging the worker forever.
+                    http_options=_gtypes.HttpOptions(timeout=60_000),
                 )
             except Exception as e:
                 log.warning(f"Gemini client init failed: {e}")
@@ -123,12 +127,18 @@ class AIRouter:
         prompt: str,
         system: Optional[str] = None,
         max_tokens: int = 2048,
+        allow_fallback: bool = True,
     ) -> str:
         """
         Route a single-turn AI call. Returns text response.
 
         For multi-turn conversations with tool calls (the orchestrator),
         use claude_client directly — this method is for one-shot text gen.
+
+        allow_fallback=False keeps a task pinned to its primary provider: used by
+        the $0 background jobs (e.g. preference extraction) so that an Ollama
+        outage silently SKIPS the work instead of quietly escalating a supposedly
+        free task to paid Haiku on every run.
         """
         provider, model = ROUTING_TABLE.get(
             task_type,
@@ -139,7 +149,7 @@ class AIRouter:
             return self._dispatch(provider, model, prompt, system, max_tokens)
         except Exception as e:
             log.warning(f"{provider} failed for {task_type.value}: {e}")
-            fallback = FALLBACKS.get(provider)
+            fallback = FALLBACKS.get(provider) if allow_fallback else None
             if fallback:
                 fb_provider, fb_model = fallback
                 log.info(f"Falling back to {fb_provider}:{fb_model}")
@@ -200,6 +210,7 @@ ai_router = AIRouter()
 
 
 # ── Convenience function ──────────────────────────────────────
-def ai_call(task_type: TaskType, prompt: str, system: Optional[str] = None, max_tokens: int = 2048) -> str:
+def ai_call(task_type: TaskType, prompt: str, system: Optional[str] = None,
+            max_tokens: int = 2048, allow_fallback: bool = True) -> str:
     """Shortcut: from api.ai_router import ai_call, TaskType"""
-    return ai_router.call(task_type, prompt, system, max_tokens)
+    return ai_router.call(task_type, prompt, system, max_tokens, allow_fallback=allow_fallback)

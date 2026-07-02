@@ -26,6 +26,9 @@ TWILIO_ACCOUNT_SID   = os.getenv("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN    = os.getenv("TWILIO_AUTH_TOKEN", "")
 TWILIO_WHATSAPP_FROM = os.getenv("TWILIO_WHATSAPP_FROM", "whatsapp:+14155238886")
 TWILIO_WEBHOOK_BASE  = os.getenv("TWILIO_WEBHOOK_BASE", "")   # ngrok URL
+# Hard cap on every outbound Twilio HTTP call so a stalled request can't hang the
+# calling thread (background sender / webhook reply path) forever (#17).
+_HTTP_TIMEOUT        = int(os.getenv("TWILIO_HTTP_TIMEOUT", "10"))
 
 
 # Lazy-init the client so the app doesn't crash if Twilio isn't configured yet
@@ -42,7 +45,16 @@ def _get_client():
                 "TWILIO_AUTH_TOKEN in your .env file."
             )
         from twilio.rest import Client
-        _client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        try:
+            from twilio.http.http_client import TwilioHttpClient
+            # Default timeout for all Twilio requests. No auto-retry: message
+            # sends are non-idempotent, and a blind retry could double-send.
+            http_client = TwilioHttpClient(timeout=_HTTP_TIMEOUT)
+            _client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, http_client=http_client)
+        except Exception as e:
+            # Older SDK without TwilioHttpClient — fall back to the plain client.
+            log.warning(f"Twilio timeout client unavailable ({e}); using default client.")
+            _client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
     return _client
 
 
@@ -172,6 +184,50 @@ def verify_signature(url: str, params: dict, signature: str) -> bool:
     except Exception as e:
         log.error(f"Signature validation error: {e}")
         return False
+
+
+def verify_signature_multi(urls: list, params: dict, signature: str) -> bool:
+    """
+    Like verify_signature but tries several candidate public URLs, accepting if
+    ANY validates.
+
+    Twilio signs the EXACT public URL it POSTed to. Behind ngrok / a reverse
+    proxy that URL can differ from both what the app sees (request.url is the
+    internal address) and a possibly-stale TWILIO_WEBHOOK_BASE — so a single
+    reconstructed URL silently rejects every legitimate webhook (#16). Checking
+    multiple candidates is safe: each still needs a signature that matches the
+    HMAC of (url, params) under the secret auth token, which an attacker cannot
+    forge, so accepting extra candidate URLs never weakens verification.
+    """
+    if not TWILIO_AUTH_TOKEN:
+        if os.getenv("TWILIO_ALLOW_UNVERIFIED") == "1":
+            log.warning("⚠️  Twilio signature check bypassed (TWILIO_ALLOW_UNVERIFIED=1) — dev only")
+            return True
+        log.error("Twilio signature check failing closed: TWILIO_AUTH_TOKEN not set — rejecting webhook")
+        return False
+
+    if not signature:
+        log.warning("Missing X-Twilio-Signature header")
+        return False
+
+    try:
+        validator = _get_validator()
+    except Exception as e:
+        log.error(f"Signature validator init error: {e}")
+        return False
+
+    tried = []
+    for u in urls:
+        if not u or u in tried:
+            continue
+        tried.append(u)
+        try:
+            if validator.validate(u, params, signature):
+                return True
+        except Exception as e:
+            log.error(f"Signature validation error for {u}: {e}")
+    log.warning(f"Twilio signature did not match any candidate URL: {tried}")
+    return False
 
 
 def build_webhook_url(path: str) -> str:

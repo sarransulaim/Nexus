@@ -2,4 +2,3 @@
 __pycache__/
 *.pyc
 nexus_core.db
-alembic/versions/

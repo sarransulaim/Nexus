@@ -23,6 +23,7 @@ Run alongside the FastAPI server:
 """
 
 import os
+import re
 import json
 import asyncio
 import threading
@@ -203,74 +204,59 @@ def handle_dm(event, say, client):
 
     log.info(f"DM from Slack user {slack_user_id}: {text[:60]}")
 
-    # ── Slack linking: is this message a 6-digit verification code? ──
-    # If so, try to complete a pending link instead of routing to AI.
-    stripped = text.replace(" ", "")
-    if stripped.isdigit() and len(stripped) == 6:
+    # ── Slack linking: does this message contain a 6-digit verification code? ──
+    # Slack often decorates the text — a pasted "*732305*" arrives bold — so strip
+    # whitespace + Slack markup (*bold*, _italic_, `code`, ~strike~) before checking,
+    # and fall back to a standalone 6-digit run anywhere in the message.
+    code_candidate = re.sub(r"[\s*_`~]", "", text)
+    if not (code_candidate.isdigit() and len(code_candidate) == 6):
+        m = re.search(r"(?<!\d)(\d{6})(?!\d)", text)
+        code_candidate = m.group(1) if m else ""
+
+    if code_candidate.isdigit() and len(code_candidate) == 6:
         try:
             from channels_router import complete_slack_link
-            result = complete_slack_link(slack_user_id, stripped)
+            result = complete_slack_link(slack_user_id, code_candidate)
             if result.get("linked"):
                 name = result.get("employee_name", "")
-                say(text=f"✅ Linked! Your Slack is now connected to Nexus"
-                         f"{f' as {name}' if name else ''}. "
+                say(text=f"✅ *Linked!* Your Slack is now connected to Nexus"
+                         f"{f' as *{name}*' if name else ''}. "
                          f"Send me anything and your AI will respond.")
                 return
-            # If not linked and reason is expired/no_pending, fall through only
-            # if they're not already a known user (so existing users can still
-            # send numbers). We check below.
             if result.get("reason") == "expired":
-                say(text="That code has expired. Generate a new one in Nexus → Connections.")
+                say(text="⏰ That code has expired. Generate a fresh one in "
+                         "Nexus → Connections → Slack and DM it to me within 10 minutes.")
                 return
+            # reason == no_pending_code: if they're not linked yet, the code was
+            # wrong or stale — tell them, instead of silently asking for a name.
+            if not get_employee_by_slack_id(slack_user_id):
+                say(text="🔑 I couldn't find that code. Open Nexus → Connections → "
+                         "Slack, click *Connect* for a new code, and DM me just the "
+                         "6 digits.")
+                return
+            # else: an already-linked user happened to send 6 digits — fall through.
         except Exception as e:
             log.warning(f"slack link attempt failed: {e}")
-        # If no pending code matched, fall through — maybe it's a real message
-        # from an already-linked user (e.g. "123456" as actual content).
+        # fall through — maybe it's a real message from an already-linked user.
 
     # Look up the employee
     employee = get_employee_by_slack_id(slack_user_id)
 
     if not employee:
-        # Not linked yet — ask them to identify themselves
+        # Not linked yet. We NEVER link by self-reported name — that would let
+        # ANYONE in the workspace impersonate a colleague by typing their name and
+        # hijack their private agent (tasks, email, calendar). Linking requires the
+        # verified 6-digit code from Nexus → Connections → Slack → Connect, which
+        # the DM handler above matches via complete_slack_link. Works for all roles.
         say(
             text=(
                 "👋 *Welcome to Nexus!*\n\n"
-                "I don't recognize your Slack account yet. "
-                "Please tell me your name so I can link you to your Nexus account:\n\n"
-                "_Type: `I am [Your Name]`_"
+                "I don't recognize your Slack account yet. To link it *securely*:\n"
+                "1. Open *Nexus → Connections → Slack* and click *Connect*.\n"
+                "2. DM me the *6-digit code* it shows you.\n\n"
+                "_(I can't link by name — that would let anyone impersonate a teammate.)_"
             )
         )
-
-        # Handle name identification in the next message
-        if text.lower().startswith("i am "):
-            name = text[5:].strip()
-            db = SessionLocal()
-            try:
-                match = db.query(Employee).filter(
-                    Employee.name.ilike(f"%{name}%"),
-                    Employee.system_role == "employee"
-                ).first()
-
-                if match:
-                    # Get Slack profile for username
-                    try:
-                        profile = client.users_info(user=slack_user_id)
-                        slack_username = profile["user"]["name"]
-                    except Exception:
-                        slack_username = slack_user_id
-
-                    link_employee_to_slack(match.id, slack_user_id, slack_username)
-                    say(
-                        text=(
-                            f"✅ *Linked!* You're now connected as *{match.name}* ({match.role}).\n\n"
-                            f"You can now talk to your personal AI agent directly from Slack. "
-                            f"Try: _\"What are my tasks?\"_ or _\"Check my emails\"_"
-                        )
-                    )
-                else:
-                    say(f"❌ Couldn't find an employee named *{name}* in Nexus. Please check the spelling and try again.")
-            finally:
-                db.close()
         return
 
     # Employee is linked — send typing indicator
@@ -290,34 +276,166 @@ def handle_dm(event, say, client):
     log_message(employee.id, "outbound", response)
 
 
-@app.event("app_mention")
-def handle_mention(event, say):
-    """
-    Handles @Nexus mentions in channels.
-    Extracts the message and routes to the mentioning employee's agent.
-    """
-    slack_user_id = event.get("user")
-    text          = event.get("text", "")
+def _slack_display_name(client, user_id: str) -> str:
+    """Best-effort human name for a Slack user — prefer the linked Nexus
+    employee, fall back to their Slack profile."""
+    if not user_id:
+        return "Someone"
+    try:
+        emp = get_employee_by_slack_id(user_id)
+        if emp:
+            return emp.name
+    except Exception:
+        pass
+    try:
+        u = client.users_info(user=user_id)["user"]
+        return (u.get("profile", {}).get("display_name")
+                or u.get("real_name") or u.get("name") or "Someone")
+    except Exception:
+        return "Someone"
 
-    # Strip the bot mention from the text
-    import re
-    clean_text = re.sub(r'<@[A-Z0-9]+>', '', text).strip()
+
+def _slack_channel_name(client, channel_id: str) -> str:
+    try:
+        return client.conversations_info(channel=channel_id)["channel"].get("name") or ""
+    except Exception:
+        return ""
+
+
+def _slack_recent_transcript(client, channel_id: str, limit: int = 14,
+                             exclude_ts: str = None) -> str:
+    """Readable transcript of the channel's recent messages. Every line here
+    is ALREADY visible to all channel members, so using it as context cannot
+    leak anything private. Degrades to '' if the bot lacks history scope."""
+    try:
+        resp = client.conversations_history(channel=channel_id, limit=limit)
+    except Exception as e:
+        log.warning(f"channel history unavailable ({e}); replying without context")
+        return ""
+    msgs = list(reversed(resp.get("messages", []) or []))  # oldest first
+    name_cache, lines = {}, []
+    for m in msgs:
+        if exclude_ts and m.get("ts") == exclude_ts:
+            continue  # skip the mention we're currently answering
+        body = re.sub(r"<@[A-Z0-9]+>", "", (m.get("text") or "")).strip()
+        if not body:
+            continue
+        if m.get("bot_id") or m.get("subtype") == "bot_message":
+            who = "Nexus"
+        else:
+            uid = m.get("user")
+            if uid not in name_cache:
+                name_cache[uid] = _slack_display_name(client, uid)
+            who = name_cache[uid]
+        if len(body) > 400:
+            body = body[:400] + "…"
+        lines.append(f"{who}: {body}")
+    return "\n".join(lines[-limit:])
+
+
+def _employee_workload_line(emp) -> str:
+    """One-line 'who's working on what' for a channel member — their open task
+    titles. Read-only; these are team work items, not private data."""
+    from database.models import Task
+    db = SessionLocal()
+    try:
+        tasks = db.query(Task).filter(
+            Task.owner_id == emp.id, Task.is_completed == False  # noqa: E712
+        ).all()
+        if not tasks:
+            return f"{emp.name} ({emp.role}) — no open tasks"
+        titles = ", ".join(t.title for t in tasks[:4])
+        more   = f" +{len(tasks) - 4} more" if len(tasks) > 4 else ""
+        return f"{emp.name} ({emp.role}) — {len(tasks)} open: {titles}{more}"
+    finally:
+        db.close()
+
+
+def _slack_channel_project_context(client, channel_id: str) -> str:
+    """Auto-detect the channel's project focus: map channel members → linked
+    Nexus employees → their open work. Read-only, best-effort. Returns '' if the
+    member list isn't available (e.g. missing scope)."""
+    try:
+        member_ids = client.conversations_members(
+            channel=channel_id, limit=50).get("members", []) or []
+    except Exception as e:
+        log.warning(f"channel members unavailable ({e})")
+        return ""
+    seen, lines = set(), []
+    for uid in member_ids:
+        if uid in seen:
+            continue
+        seen.add(uid)
+        emp = get_employee_by_slack_id(uid)
+        if emp:
+            lines.append(_employee_workload_line(emp))
+    return "\n".join(lines)
+
+
+@app.event("app_mention")
+def handle_mention(event, say, client):
+    """
+    @Nexus in a CHANNEL → the TEAM / COORDINATOR assistant: run_orchestrator with
+    a `Team_{channel}` identity. It reads project/task/dependency/team state and
+    can escalate blockers, but has NO personal data and NO manager powers — safe
+    for a shared room (enforced server-side in execute_tool). Personal help stays
+    in DMs (handle_dm). On any failure it falls back to a light conversational
+    reply so the channel never gets a hard error.
+    """
+    channel_id    = event.get("channel")
+    slack_user_id = event.get("user")
+    thread_ts     = event.get("thread_ts")  # stay in-thread if mentioned in one
+    clean_text    = re.sub(r"<@[A-Z0-9]+>", "", event.get("text", "")).strip()
 
     if not clean_text:
-        say("Hey! DM me directly to talk to your personal Nexus agent. 🤖")
+        say(text=f"<@{slack_user_id}> 👋 I'm Nexus — ask me about the team's "
+                 f"projects, tasks or dependencies here, or *DM me* for your "
+                 f"private tasks, emails and calendar.",
+            thread_ts=thread_ts)
         return
 
-    employee = get_employee_by_slack_id(slack_user_id)
-
-    if not employee:
-        say(f"<@{slack_user_id}> You need to link your Slack account first. DM me to get started!")
+    # SECURITY: only a recognized company employee may drive the team agent —
+    # otherwise an unlinked guest merely present in the channel could read
+    # internal team status/tasks/dependencies. Linked employees pass instantly.
+    if not get_employee_by_slack_id(slack_user_id):
+        say(text=f"<@{slack_user_id}> 👋 I help this team coordinate, but I don't "
+                 f"recognize your account yet. *DM me* to link it, then mention me "
+                 f"here.",
+            thread_ts=thread_ts)
         return
 
-    say(f"<@{slack_user_id}> _Processing..._")
+    speaker      = _slack_display_name(client, slack_user_id)
+    channel_name = _slack_channel_name(client, channel_id)
+    transcript   = _slack_recent_transcript(client, channel_id, exclude_ts=event.get("ts"))
+    roster       = _slack_channel_project_context(client, channel_id)
 
-    response = route_to_agent(employee, clean_text)
-    formatted = format_for_slack(response)
-    say(f"<@{slack_user_id}> {formatted}")
+    # Context the team agent should see — all of it already visible to every
+    # member of this channel (roster of who's here + what they're working on,
+    # plus the recent messages).
+    ctx = [f"=== SHARED CHANNEL #{channel_name or 'team'} ==="]
+    if roster:
+        ctx.append("WHO'S IN THIS CHANNEL AND WHAT THEY'RE WORKING ON:\n" + roster)
+    if transcript:
+        ctx.append("RECENT MESSAGES (oldest first):\n" + transcript)
+    ctx.append("=== END CHANNEL CONTEXT ===")
+
+    try:
+        reply = run_orchestrator(
+            agent_id=f"Team_{channel_id}",
+            command=f"{speaker} (in the channel) says: {clean_text}",
+            extra_context="\n\n".join(ctx),
+        )
+        _trigger_sync()
+        say(text=format_for_slack(reply), thread_ts=thread_ts)
+    except Exception as e:
+        log.error(f"team agent failed, falling back to light reply: {e}")
+        try:
+            from channel_assistant import build_channel_reply
+            reply = build_channel_reply(channel_name, transcript, speaker, clean_text)
+            say(text=format_for_slack(reply), thread_ts=thread_ts)
+        except Exception:
+            say(text=f"<@{slack_user_id}> Sorry, I ran into an issue. Please try again.",
+                thread_ts=thread_ts)
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -509,19 +627,57 @@ def start_in_background():
 
     def _run():
         global _handler
-        try:
-            log.info("🚀 Starting Nexus Slack Bot (Socket Mode, background)...")
-            _handler = SocketModeHandler(app, SLACK_APP_TOKEN)
-            # Use connect() not start() in a thread — start() installs a
-            # signal handler that only works in the main thread. connect()
-            # opens the socket and listens without the signal setup.
-            _handler.connect()
-            # Keep this thread alive so the socket stays open.
-            import time as _time
-            while True:
-                _time.sleep(3600)
-        except Exception as e:
-            log.error(f"Slack bot crashed: {e}")
+        import time as _time
+        failures = 0
+        MAX_FAILURES = 8
+        # Resilient supervisor. slack_sdk's OWN auto-reconnect storms when a
+        # firewall / antivirus / flaky network keeps killing the WebSocket — that
+        # storm has segfaulted the whole process. So we DISABLE its auto-reconnect
+        # and pace reconnects ourselves with backoff, then give up. The FastAPI
+        # backend stays healthy regardless.
+        while failures < MAX_FAILURES:
+            try:
+                log.info("🚀 Slack bot connecting (Socket Mode)...")
+                _handler = SocketModeHandler(app, SLACK_APP_TOKEN)
+                try:
+                    _handler.client.auto_reconnect_enabled = False  # we pace reconnects, not slack_sdk
+                except Exception:
+                    pass
+                _handler.connect()
+                log.info("✅ Slack connected")
+                # Stay alive while connected; break out to reconnect when it drops.
+                probe_errs = 0
+                while True:
+                    _time.sleep(5)
+                    try:
+                        if not _handler.client.is_connected():
+                            log.warning("Slack WebSocket dropped.")
+                            break
+                        probe_errs = 0
+                    except Exception as pe:
+                        # Don't spin forever if is_connected() itself keeps raising —
+                        # after a few consecutive errors drop out to reconnect (the
+                        # outer loop backs off + eventually gives up) instead of
+                        # wedging as falsely "connected".
+                        probe_errs += 1
+                        if probe_errs >= 3:
+                            log.warning(f"Slack connection probe failing ({pe}) — reconnecting.")
+                            break
+            except Exception as e:
+                log.warning(f"Slack connect error: {e}")
+            finally:
+                try:
+                    if _handler:
+                        _handler.close()
+                except Exception:
+                    pass
+            failures += 1
+            delay = min(120, 10 * failures)
+            log.warning(f"Slack reconnect {failures}/{MAX_FAILURES} — backing off {delay}s")
+            _time.sleep(delay)
+        log.error("🛑 Slack bot gave up after repeated connection failures — the backend stays "
+                  "healthy. A firewall/AV/network is dropping the WebSocket; fix that, then "
+                  "restart with SLACK_ENABLED=true.")
 
     threading.Thread(target=_run, daemon=True, name="slack-bot").start()
     _started = True

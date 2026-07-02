@@ -36,7 +36,7 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # CLIENT & GLOBALS
 # ---------------------------------------------------------------------------
-claude_client     = anthropic.Anthropic(api_key=os.getenv("CLAUDE_API_KEY"))
+claude_client     = anthropic.Anthropic(api_key=os.getenv("CLAUDE_API_KEY"), timeout=60.0, max_retries=2)
 glass_brain_queue = queue.Queue()
 
 # Recursion guard for AI-to-AI negotiation: while we call a candidate's
@@ -52,6 +52,44 @@ BACKEND_BASE = os.getenv("BACKEND_URL", "http://localhost:8000")
 # All DB inserts use this. When multi-tenant UI is added,
 # this will be looked up from the authenticated user's company.
 DEFAULT_COMPANY_ID = 1
+
+
+# ---------------------------------------------------------------------------
+# AI AUDIT TRAIL
+# One durable AuditLog row per MODEL-INVOKED tool execution, so "which AI
+# action sent that email last Tuesday?" is answerable after any restart.
+# Deliberately NOT hooked into assemble_context_snapshot's internal reads —
+# those are fixed system-initiated queries that would only flood the log.
+# ---------------------------------------------------------------------------
+def _audit_tool_execution(agent_id: str, tool_name: str, tool_input: dict, result: str):
+    """Best-effort durable audit write on its own short session. Never raises —
+    auditing must never break the tool loop."""
+    try:
+        def _trunc(v):
+            return (v[:300] + "…") if isinstance(v, str) and len(v) > 300 else v
+        actor_id = None
+        if str(agent_id).startswith("Employee_"):
+            try:
+                actor_id = int(str(agent_id).split("_", 1)[1])
+            except ValueError:
+                pass
+        _adb = SessionLocal()
+        try:
+            _adb.add(AuditLog(
+                company_id=DEFAULT_COMPANY_ID,
+                actor_id=actor_id,
+                actor_agent_id=str(agent_id)[:100],
+                action=f"ai_tool:{tool_name}"[:200],
+                new_value={
+                    "input":  {k: _trunc(v) for k, v in (tool_input or {}).items()},
+                    "result": (result or "")[:500],
+                },
+            ))
+            _adb.commit()
+        finally:
+            _adb.close()
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +216,13 @@ def serialize_message_content(content):
             return {"type": "text", "text": content.text}
         elif content.type == "tool_use":
             return {"type": "tool_use", "id": content.id, "name": content.name, "input": content.input}
+        # Any other block (mcp_tool_use, mcp_tool_result, server_tool_use, …): preserve it
+        # generically so it round-trips through memory and replays correctly to the API.
+        if hasattr(content, "model_dump"):
+            try:
+                return content.model_dump(mode="json")
+            except Exception:
+                pass
     return content
 
 
@@ -296,9 +341,11 @@ MANAGER_TOOLS = [
     },
     {
         "name": "send_email",
-        "description": "Send an email from the connected Gmail. IRREVERSIBLE AND PUBLIC. "
-                       "Show the user the recipient, subject, and body and get explicit "
-                       "confirmation before calling. Never send without confirmation.",
+        "description": "Queue an email from the connected Gmail. Calling this does NOT send "
+                       "immediately: the email goes to the Approvals page and is sent only "
+                       "after a human approves it there. Draft the recipient/subject/body with "
+                       "the user, call the tool, then tell them it's awaiting approval — never "
+                       "claim it was sent.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -324,8 +371,10 @@ MANAGER_TOOLS = [
     },
     {
         "name": "create_calendar_event",
-        "description": "Create a calendar event. IRREVERSIBLE — confirm details with the user first. "
-                       "Times in ISO format.",
+        "description": "Create a calendar event. Times in ISO format. Events WITH attendee_emails "
+                       "send real invite emails, so they queue on the Approvals page for human "
+                       "approval before going out; attendee-less events (own calendar) apply "
+                       "immediately.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -673,27 +722,35 @@ MANAGER_TOOLS = [
     },
     {
         "name": "schedule_meeting",
-        "description": "Schedule a new meeting with attendees.",
+        "description": "Schedule a new meeting with attendees. If the organizer has Google "
+                       "connected, this ALSO creates a Google Calendar event with a Google "
+                       "Meet link and emails invites to every attendee — so always pass "
+                       "start_iso (exact ISO 8601 local datetime, e.g. 2026-07-02T14:00:00) "
+                       "computed from CURRENT TIME whenever the user gives a date/time.",
         "input_schema": {
             "type": "object",
             "properties": {
                 "topic":            {"type": "string"},
-                "time":             {"type": "string"},
+                "time":             {"type": "string", "description": "human-readable time, e.g. 'tomorrow 2 PM'"},
+                "start_iso":        {"type": "string", "description": "exact start as ISO 8601 local datetime (no timezone suffix), e.g. 2026-07-02T14:00:00 — required for the Google Meet invite"},
                 "attendee_ids":     {"type": "array", "items": {"type": "integer"}},
                 "duration_minutes": {"type": "integer"},
-                "location":         {"type": "string"}
+                "location":         {"type": "string", "description": "physical location, if any — the Google Meet link is added automatically"}
             },
             "required": ["topic", "time", "attendee_ids"]
         }
     },
     {
         "name": "reschedule_meeting",
-        "description": "Change the time of an existing meeting.",
+        "description": "Change the time of an existing meeting. If the meeting has a linked "
+                       "Google Calendar event, passing new_start_iso also moves that event "
+                       "and emails attendees the update.",
         "input_schema": {
             "type": "object",
             "properties": {
-                "meeting_id": {"type": "integer"},
-                "new_time":   {"type": "string"}
+                "meeting_id":    {"type": "integer"},
+                "new_time":      {"type": "string"},
+                "new_start_iso": {"type": "string", "description": "exact new start as ISO 8601 local datetime, e.g. 2026-07-03T15:00:00"}
             },
             "required": ["meeting_id", "new_time"]
         }
@@ -1071,6 +1128,17 @@ MANAGER_TOOLS = [
             "required": [],
         },
     },
+    {
+        "name": "confirm_dependency_map",
+        "description": "Activate the AI-proposed dependency map for a project — flips its provisional "
+                       "(proposed) interface contracts to active, so Nexus starts watching them for drift. "
+                       "Use when the manager confirms the dependency map the AI proposed for a project.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"project_id": {"type": "integer"}},
+            "required": ["project_id"],
+        },
+    },
 
     # ── KNOWLEDGE BASE (RAG) ──────────────────────────────────────────────
     {
@@ -1415,7 +1483,9 @@ EMPLOYEE_TOOLS = [
     },
     {
         "name": "send_email",
-        "description": "Send an email from the employee's Gmail. Only call after employee confirms.",
+        "description": "Queue an email from the employee's Gmail. It is NOT sent immediately — "
+                       "it goes to the Approvals page for human approval first. Tell the employee "
+                       "it's awaiting approval; never claim it was sent.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -1454,7 +1524,9 @@ EMPLOYEE_TOOLS = [
     },
     {
         "name": "create_calendar_event",
-        "description": "Create a real Google Calendar event for the employee.",
+        "description": "Create a real Google Calendar event for the employee. Events WITH "
+                       "attendee_emails queue for human approval on the Approvals page before "
+                       "invites go out; attendee-less events apply immediately.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -1556,6 +1628,52 @@ MANAGER_TOOLS[-1]["cache_control"]  = {"type": "ephemeral"}
 EMPLOYEE_TOOLS[-1]["cache_control"] = {"type": "ephemeral"}
 
 
+# ===========================================================================
+# TEAM (COORDINATOR) TIER — a third role, between employee and manager.
+# ===========================================================================
+# The team assistant runs in SHARED channels (Slack channels, Nexus group chat).
+# A channel is visible to everyone in it, so this tier is a strict, read-mostly
+# allow-list: it reads project / task / dependency / contract state and team
+# status, searches project knowledge, and can escalate a blocker to the manager
+# — but it has NO manager powers (approvals, HR, company commands, task writes)
+# and NO access to anyone's private data (emails, calendar, personal tasks, DM
+# memory). The allow-list is enforced server-side in execute_tool (defense in
+# depth), not merely by which tools the model is handed.
+TEAM_TOOL_NAMES = [
+    # read — projects & tasks (team work artifacts, NOT personal data)
+    "view_projects", "get_tasks_by_project", "view_all_tasks", "search_tasks",
+    "get_overdue_tasks", "get_overdue_summary",
+    # read — team & coordination (dependencies/contracts are the differentiator)
+    "get_team_status", "get_workload_summary", "get_completion_rate",
+    "view_task_dependencies", "view_contracts",
+    "find_employee_by_name",
+    # read — project knowledge
+    "search_knowledge",
+    # act — escalate a blocker to the manager (the ONLY non-read action)
+    "create_escalation",
+]
+# DELIBERATELY EXCLUDED from the channel tier: view_goals (personal OKRs),
+# view_task_comments (free-text discussion), view_meetings (private meeting
+# topics) and search_employees (full-directory enumeration). The team gate
+# strips `employee_id`, so these tools would silently return WHOLE-COMPANY data
+# into a public channel — a personal-data leak that contradicts the tier's
+# guarantee. Coordination still works via tasks/projects/deps/status above.
+TEAM_ALLOWED_TOOLS = set(TEAM_TOOL_NAMES)
+
+# Build the team toolset from the existing, tested schemas. Manager defs win
+# over employee defs for duplicate names (they're written for cross-team reads);
+# create_escalation comes from the employee set. cache_control is stripped from
+# the reused copies and re-applied to only the last team tool. Originals are
+# never mutated (dict comprehensions make fresh copies).
+_ALL_TOOL_DEFS = {t["name"]: t for t in (EMPLOYEE_TOOLS + MANAGER_TOOLS)}
+TEAM_TOOLS = [
+    {k: v for k, v in _ALL_TOOL_DEFS[n].items() if k != "cache_control"}
+    for n in TEAM_TOOL_NAMES if n in _ALL_TOOL_DEFS
+]
+if TEAM_TOOLS:
+    TEAM_TOOLS[-1] = {**TEAM_TOOLS[-1], "cache_control": {"type": "ephemeral"}}
+
+
 def _refresh_cache_breakpoint(messages: list):
     """
     Incremental conversation caching for the tool-use loop: keep exactly one
@@ -1624,6 +1742,12 @@ def _parse_date(value):
 # ===========================================================================
 # TOOL EXECUTION
 # ===========================================================================
+# Manager-only tools = every tool a manager can call that an employee cannot.
+# Used as a defense-in-depth role gate inside execute_tool (B1), independent of
+# which toolset list happened to be handed to the model.
+MANAGER_ONLY_TOOLS = {t["name"] for t in MANAGER_TOOLS} - {t["name"] for t in EMPLOYEE_TOOLS}
+
+
 def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
     """
     Executes the named tool and returns a string result to Claude.
@@ -1638,6 +1762,82 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
         emit_tool_called(agent_id, tool_name, tool_input)
     except Exception:
         pass
+
+    # ── AUTHORIZATION (B1): a caller's identity comes from the AUTHENTICATED
+    # agent_id (derived from their token), NEVER from the model's tool arguments.
+    # Without this, an employee could tell the AI "act as employee 3 / read their
+    # emails" and the model would pass that id straight through. For employee
+    # callers we (a) hard-block manager-only tools and (b) overwrite every
+    # self-identity field with the real caller id. Target ids (recipient_id, a
+    # task's owner, etc.) are intentionally left alone.
+    caller_is_employee = str(agent_id).startswith("Employee_")
+    caller_id = None
+    if caller_is_employee:
+        try:
+            caller_id = int(str(agent_id).split("_", 1)[1])
+        except (IndexError, ValueError):
+            return "Authorization error: could not determine your identity."
+        if tool_name in MANAGER_ONLY_TOOLS:
+            return "Not authorized — that action requires a manager."
+        for _f in ("employee_id", "sender_id", "author_id"):
+            if _f in tool_input:
+                tool_input[_f] = caller_id
+        # `from_agent_id` is a STRING agent id (String column), NOT an int FK — so
+        # force the caller's real id in the "Employee_<id>" form the handlers and
+        # the Team path use. Writing the bare int here broke create_escalation
+        # (int into a varchar column) and the "Employee_<id>" convention.
+        if "from_agent_id" in tool_input or tool_name == "create_escalation":
+            tool_input["from_agent_id"] = f"Employee_{caller_id}"
+
+    # ── TEAM (COORDINATOR) caller: a shared-channel assistant with NO personal
+    # identity. Hard allow-list (defense in depth) — anything outside the
+    # Coordinator tier is refused here even if the model somehow requests it.
+    # Strip any self-identity the model set (the channel isn't a person) and
+    # attribute escalations to the channel/team rather than to an individual.
+    caller_is_team = str(agent_id).startswith("Team_")
+    if caller_is_team:
+        if tool_name not in TEAM_ALLOWED_TOOLS:
+            return ("The team assistant can't do that here. I can read project, "
+                    "task, dependency and team status, search project knowledge, "
+                    "and flag a blocker to the manager — but I don't have "
+                    "permission for that action. For personal things, DM me; for "
+                    "manager actions, ask a manager.")
+        for _f in ("employee_id", "sender_id", "author_id"):
+            tool_input.pop(_f, None)
+        if tool_name == "create_escalation":
+            tool_input["from_agent_id"] = agent_id
+
+    # ── GOOGLE PERSONAL TOOLS act on the CALLER'S OWN account ──────────────
+    # You can only touch a Google account you personally OAuth-connected, so the
+    # employee_id for these tools must be the caller's own. Employees got it
+    # forced above; the manager's real employee id isn't encoded in "Manager_1",
+    # so resolve it here — otherwise "check my emails" looks up the wrong id and
+    # wrongly reports "not connected" even when Gmail is connected.
+    GOOGLE_PERSONAL_TOOLS = {
+        "check_my_emails", "draft_email_reply", "send_email", "check_my_calendar",
+        "check_availability", "create_calendar_event", "get_focus_time_suggestions",
+        "check_google_connection",
+    }
+    if tool_name in GOOGLE_PERSONAL_TOOLS:
+        _own_id = caller_id
+        if _own_id is None:  # manager — resolve the real Employee row (single-tenant)
+            _mdb = SessionLocal()
+            try:
+                _mgr = _mdb.query(Employee).filter(Employee.system_role == "manager").first()
+                _own_id = _mgr.id if _mgr else None
+            finally:
+                _mdb.close()
+        if _own_id is not None:
+            tool_input["employee_id"] = _own_id
+
+    def _own_employee_id(_db):
+        """The caller's own Employee id: employees directly from the token-derived
+        caller_id; the manager via row lookup (their real id isn't in 'Manager_1').
+        Used to pick whose Google account organizes Meet events."""
+        if caller_id is not None:
+            return caller_id
+        _mgr = _db.query(Employee).filter(Employee.system_role == "manager").first()
+        return _mgr.id if _mgr else None
 
     db = SessionLocal()
 
@@ -1692,6 +1892,19 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
                 lines.append(f"ID:{c.id} | {c.name} | {p} → {co} | status:{c.status} | {(c.description or '')[:80]}")
             return "\n".join(lines)
 
+        elif tool_name == "confirm_dependency_map":
+            n = db.query(Contract).filter(
+                Contract.company_id == DEFAULT_COMPANY_ID,
+                Contract.project_id == tool_input["project_id"],
+                Contract.status == "proposed",
+            ).update({"status": "active"}, synchronize_session=False)
+            db.commit()
+            _broadcast_sync()
+            if not n:
+                return "No proposed dependency map found for that project (maybe already confirmed)."
+            return (f"Confirmed — {n} dependency contract(s) for project {tool_input['project_id']} are now active. "
+                    f"I'll watch each producer for changes and warn the consumer's owner if it drifts.")
+
         elif tool_name == "search_knowledge":
             # Semantic retrieval over the company's knowledge base. Tenant-scoped
             # via DEFAULT_COMPANY_ID — rag.search filters on company_id so this
@@ -1704,7 +1917,14 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
                 limit = int(tool_input.get("limit") or 5)
             except (TypeError, ValueError):
                 limit = 5
-            hits = rag.search(DEFAULT_COMPANY_ID, query, k=max(1, min(limit, 10)))
+            # Interactive path — the user is waiting on this command. Don't let a
+            # slow/hung local embed backend pin the turn for the full 60s embed
+            # timeout: fail fast on a 2s availability probe, and cap the query
+            # embed itself at 8s if the backend is reachable but sluggish. (#18)
+            if not rag.backend_available():
+                return ("The knowledge base search backend is temporarily unavailable. "
+                        "Please try again in a moment.")
+            hits = rag.search(DEFAULT_COMPANY_ID, query, k=max(1, min(limit, 10)), query_timeout=8)
             if not hits:
                 return ("Nothing relevant in the knowledge base for that. "
                         "It may not have been uploaded or indexed yet.")
@@ -1877,6 +2097,8 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             task = db.query(Task).filter(Task.id == tool_input["task_id"]).first()
             if not task:
                 return "Task not found."
+            if caller_is_employee and task.owner_id != caller_id:
+                return "Not authorized — that task isn't assigned to you."
             db.add(Subtask(task_id=tool_input["task_id"], title=tool_input["title"]))
             db.commit()
             _broadcast_sync()
@@ -1998,6 +2220,12 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             return "\n".join(f"ID:{e.id} | {e.name} | Role:{e.role} | Team:{e.team} | Skills:{e.skills}" for e in employees)
 
         elif tool_name == "add_employee":
+            # B6: every employee MUST get a credential or they can never log in
+            # (login rejects accounts with no password_hash). Generate a temp
+            # password and surface it so the manager can hand it over privately.
+            import secrets as _secrets
+            from api.security import hash_password as _hash_password
+            temp_password = _secrets.token_urlsafe(9)
             emp = Employee(
                 company_id=DEFAULT_COMPANY_ID,
                 name=tool_input["name"], role=tool_input["role"],
@@ -2005,11 +2233,14 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
                 age=tool_input.get("age", 25), experience=tool_input.get("experience", 0),
                 skills=tool_input.get("skills", ""), gender=tool_input.get("gender", "Unspecified"),
                 system_role="employee", is_active=True,
+                password_hash=_hash_password(temp_password),
             )
             db.add(emp)
             db.commit()
             _broadcast_sync()
-            return f"Employee '{tool_input['name']}' added. ID: {emp.id}."
+            return (f"Employee '{tool_input['name']}' added (ID {emp.id}). "
+                    f"Temporary password: {temp_password}  — share it with them privately; "
+                    f"they should change it after first login.")
 
         elif tool_name == "update_employee":
             emp = db.query(Employee).filter(Employee.id == tool_input["employee_id"]).first()
@@ -2087,6 +2318,9 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             return "\n".join(result)
 
         elif tool_name == "schedule_meeting":
+            organizer_id = _own_employee_id(db)
+            start_iso    = (tool_input.get("start_iso") or "").strip()
+
             meeting = Meeting(
                 company_id=DEFAULT_COMPANY_ID,
                 topic=tool_input["topic"],
@@ -2095,39 +2329,157 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
                 scheduled_date=_parse_date(tool_input["time"]),
                 duration_minutes=tool_input.get("duration_minutes"),
                 location=tool_input.get("location"),
+                created_by=organizer_id,
             )
+            if meeting.scheduled_date is None and start_iso:
+                try:
+                    from api.google_services import _parse_start_iso
+                    meeting.scheduled_date = _parse_start_iso(start_iso).date()
+                except Exception:
+                    pass
             attendees = db.query(Employee).filter(Employee.id.in_(tool_input["attendee_ids"])).all()
             meeting.attendees = attendees
+            # Capture everything the Google step needs BEFORE the commit expires
+            # these instances — so no fresh transaction (= pinned pool connection)
+            # is opened while the slow Google HTTP calls run.
+            emails   = [a.email for a in attendees if a.email]
+            no_email = [a.name for a in attendees if not a.email]
+            organizer_name = None
+            if organizer_id is not None:
+                _org = db.query(Employee).filter(Employee.id == organizer_id).first()
+                organizer_name = _org.name if _org else None
             db.add(meeting)
             db.commit()
+            meeting_id = meeting.id
+
+            # ── Google Meet + emailed calendar invites ────────────────────────
+            # Best-effort: the Nexus meeting above is already committed, so a
+            # Google failure NEVER loses the meeting — it's reported honestly.
+            meet_link = None
+            meet_note = ""
+            if not start_iso:
+                meet_note = ("\n(No Google Meet created — I couldn't pin an exact date/time. "
+                             "Give me one and I'll add the Meet + invites.)")
+            elif organizer_id is None:
+                meet_note = "\n(No Google Meet created — couldn't resolve the organizer's account.)"
+            else:
+                from api.google_services import create_meet_event
+                res = create_meet_event(
+                    organizer_employee_id=organizer_id,
+                    title=tool_input["topic"],
+                    start_iso=start_iso,
+                    duration_minutes=tool_input.get("duration_minutes"),
+                    attendee_emails=emails,
+                    description=f"Scheduled via Nexus Command by {organizer_name or 'the team'}.",
+                    db=db,
+                )
+                if res.get("ok"):
+                    meeting.google_event_id = res.get("event_id")
+                    meet_link = res.get("meet_link")
+                    if meet_link and not tool_input.get("location"):
+                        meeting.location = meet_link
+                    if not meeting.duration_minutes:
+                        meeting.duration_minutes = 60   # matches the calendar event's default
+                    try:
+                        db.commit()
+                    except Exception:
+                        # The Google event EXISTS and invites are out — never orphan
+                        # it: retry linking on a fresh session (fresh connection).
+                        db.rollback()
+                        try:
+                            _s = SessionLocal()
+                            try:
+                                _s.query(Meeting).filter(Meeting.id == meeting_id).update(
+                                    {"google_event_id": res.get("event_id")})
+                                _s.commit()
+                            finally:
+                                _s.close()
+                        except Exception:
+                            print(f"[meetings] WARNING: Google event {res.get('event_id')} "
+                                  f"created but could not be linked to meeting {meeting_id}")
+                    meet_note = (f"\n📹 Google Meet: {meet_link}" if meet_link
+                                 else "\n📅 Google Calendar event created.")
+                    if emails:
+                        meet_note += f"\n✉️ Calendar invites emailed to: {', '.join(emails)}."
+                    if no_email:
+                        meet_note += (f"\n⚠️ No email on file, so not on the Google invite: "
+                                      f"{', '.join(no_email)}.")
+                else:
+                    meet_note = (f"\n(Nexus meeting created, but the Google Meet step was "
+                                 f"skipped: {res.get('error')})")
+
             for emp in attendees:
                 db.add(Notification(
                     company_id=DEFAULT_COMPANY_ID,
                     recipient_id=emp.id, type="meeting",
                     title="Meeting Scheduled",
-                    message=f"Meeting: {tool_input['topic']} at {tool_input['time']}",
+                    message=f"Meeting: {tool_input['topic']} at {tool_input['time']}"
+                            + (f" — Meet: {meet_link}" if meet_link else ""),
                 ))
             db.commit()
             _broadcast_sync()
-            return f"Meeting '{tool_input['topic']}' scheduled for {tool_input['time']}."
+            return f"Meeting '{tool_input['topic']}' scheduled for {tool_input['time']}.{meet_note}"
 
         elif tool_name == "reschedule_meeting":
             meeting = db.query(Meeting).filter(Meeting.id == tool_input["meeting_id"]).first()
             if not meeting:
                 return "Meeting not found."
             meeting.scheduled_time = tool_input["new_time"]
+            new_start_iso = (tool_input.get("new_start_iso") or "").strip()
+            if new_start_iso:
+                try:
+                    from api.google_services import _parse_start_iso
+                    meeting.scheduled_date = _parse_start_iso(new_start_iso).date()
+                except Exception:
+                    pass
+            # Commit the Nexus reschedule BEFORE any Google call: the Google path
+            # may commit/rollback this session (token refresh) — uncommitted
+            # changes here could be silently discarded or committed prematurely.
+            db.commit()
+            # Keep the linked Google Calendar event in sync (attendees get the update)
+            google_note = ""
+            if meeting.google_event_id:
+                if new_start_iso:
+                    organizer_id = _own_employee_id(db)
+                    if organizer_id is not None:
+                        from api.google_services import update_meet_event_time
+                        res = update_meet_event_time(
+                            organizer_id, meeting.google_event_id,
+                            new_start_iso, meeting.duration_minutes, db=db,
+                        )
+                        google_note = ("\n📅 Google Calendar event moved — attendees emailed the update."
+                                       if res.get("ok")
+                                       else f"\n⚠️ Google Calendar event NOT moved: {res.get('error')}")
+                    else:
+                        google_note = "\n⚠️ Google Calendar event NOT moved: couldn't resolve the organizer."
+                else:
+                    google_note = ("\n⚠️ This meeting has a Google Calendar invite, but I couldn't pin "
+                                   "the exact new time — give me one and I'll move the invite too.")
             db.commit()
             _broadcast_sync()
-            return f"Meeting {tool_input['meeting_id']} rescheduled to {tool_input['new_time']}."
+            return f"Meeting {tool_input['meeting_id']} rescheduled to {tool_input['new_time']}.{google_note}"
 
         elif tool_name == "delete_meeting":
             meeting = db.query(Meeting).filter(Meeting.id == tool_input["meeting_id"]).first()
             if not meeting:
                 return "Meeting not found."
+            # Cancel the linked Google Calendar event first (attendees get a
+            # cancellation email); failure is reported but never blocks the delete.
+            google_note = ""
+            if meeting.google_event_id:
+                organizer_id = _own_employee_id(db)
+                if organizer_id is not None:
+                    from api.google_services import delete_meet_event
+                    res = delete_meet_event(organizer_id, meeting.google_event_id, db=db)
+                    google_note = ("\n📅 Google Calendar event cancelled — attendees emailed."
+                                   if res.get("ok")
+                                   else f"\n⚠️ Google Calendar event NOT cancelled: {res.get('error')}")
+                else:
+                    google_note = "\n⚠️ Google Calendar event NOT cancelled: couldn't resolve the organizer."
             db.delete(meeting)
             db.commit()
             _broadcast_sync()
-            return f"Meeting {tool_input['meeting_id']} cancelled."
+            return f"Meeting {tool_input['meeting_id']} cancelled.{google_note}"
 
         elif tool_name == "add_meeting_summary":
             meeting = db.query(Meeting).filter(Meeting.id == tool_input["meeting_id"]).first()
@@ -2561,7 +2913,7 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             if not approvals:
                 return "No pending approvals."
             return "\n".join(
-                f"ID:{a.id} | Action:{a.action_type} | By:{a.requested_by} | Reason:{a.reason}"
+                f"ID:{a.id} | Action:{a.action_type} | By:{a.requested_by} | Status:{a.status}"
                 for a in approvals
             )
 
@@ -2569,6 +2921,14 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             approval = db.query(ApprovalRequest).filter(ApprovalRequest.id == tool_input["approval_id"]).first()
             if not approval:
                 return "Approval request not found."
+            # Outward actions (real emails/invites leave the org) may ONLY be
+            # approved by a human on the Approvals page — never through the AI.
+            # Otherwise a prompt-injected "approve my pending requests" defeats
+            # the whole gate. Rejecting via AI stays allowed (rejecting is safe).
+            if approval.action_type in ("send_email", "create_calendar_event"):
+                return (f"Approval #{approval.id} is an outward action ({approval.action_type}) and "
+                        f"must be approved by a human on the Approvals page — I can't approve it. "
+                        f"I can reject it if you want.")
             approval.status       = "approved"
             approval.reviewer_note = tool_input.get("note", "")
             approval.reviewed_at   = datetime.now(timezone.utc)
@@ -2647,6 +3007,8 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             goal = db.query(Goal).filter(Goal.id == tool_input["goal_id"]).first()
             if not goal:
                 return "Goal not found."
+            if caller_is_employee and goal.employee_id != caller_id:
+                return "Not authorized — that goal isn't yours."
             goal.progress_pct = tool_input["progress_pct"]
             if tool_input["progress_pct"] >= 100:
                 goal.status = "achieved"
@@ -2734,6 +3096,8 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             task = db.query(Task).filter(Task.id == tool_input["task_id"]).first()
             if not task:
                 return "Task not found."
+            if caller_is_employee and task.owner_id != caller_id:
+                return "Not authorized — that task isn't assigned to you."
             task.is_completed = True
             task.completed_at  = datetime.now(timezone.utc)
             db.commit()
@@ -2744,6 +3108,8 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             task = db.query(Task).filter(Task.id == tool_input["task_id"]).first()
             if not task:
                 return "Task not found."
+            if caller_is_employee and task.owner_id != caller_id:
+                return "Not authorized — that task isn't assigned to you."
             db.query(Subtask).filter(Subtask.task_id == task.id).delete()
             for title in tool_input["subtasks"]:
                 db.add(Subtask(task_id=task.id, title=title))
@@ -2755,6 +3121,10 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             st = db.query(Subtask).filter(Subtask.id == tool_input["subtask_id"]).first()
             if not st:
                 return f"Subtask ID {tool_input['subtask_id']} not found."
+            if caller_is_employee:
+                _parent = db.query(Task).filter(Task.id == st.task_id).first()
+                if _parent and _parent.owner_id != caller_id:
+                    return "Not authorized — that subtask isn't on one of your tasks."
             st.is_completed = True
             st.completed_at  = datetime.now(timezone.utc)
             # Auto-complete parent task if all subtasks are done
@@ -2854,6 +3224,31 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             emp_id = tool_input["employee_id"]
             if not is_google_connected(emp_id, db):
                 return f"Google account not connected. Visit: {BACKEND_BASE}/api/v1/google/connect/{emp_id}"
+            # ── HARD APPROVAL GATE (outward action) ────────────────────────
+            # The model NEVER sends email directly: the send is queued as an
+            # ApprovalRequest and executed only when a human approves it on the
+            # Approvals page. This is the non-LLM barrier between untrusted
+            # content (a prompt-injected inbound email) and a real-world send.
+            # NEXUS_REQUIRE_APPROVAL=0 disables the gate (demos only).
+            if os.getenv("NEXUS_REQUIRE_APPROVAL", "1") != "0":
+                approval = ApprovalRequest(
+                    company_id=DEFAULT_COMPANY_ID,
+                    requested_by=agent_id,
+                    action_type="send_email",
+                    payload={
+                        "employee_id": emp_id,
+                        "to":          tool_input["to"],
+                        "subject":     tool_input["subject"],
+                        "body":        tool_input["body"],
+                    },
+                )
+                db.add(approval)
+                db.commit()
+                _broadcast_sync()
+                return (f"Email to {tool_input['to']} (subject: {tool_input['subject']!r}) is QUEUED "
+                        f"as approval request #{approval.id} — it will be sent only after a human "
+                        f"approves it on the Approvals page. Tell the user it's awaiting approval; "
+                        f"do NOT claim it was sent.")
             return send_fn(emp_id, tool_input["to"], tool_input["subject"], tool_input["body"], db)
 
         elif tool_name == "check_my_calendar":
@@ -2875,13 +3270,40 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             emp_id = tool_input["employee_id"]
             if not is_google_connected(emp_id, db):
                 return f"Google Calendar not connected. Visit: {BACKEND_BASE}/api/v1/google/connect/{emp_id}"
+            _attendees = [e for e in (tool_input.get("attendee_emails") or []) if e]
+            # ── HARD APPROVAL GATE when the event EMAILS people ─────────────
+            # An event with attendee_emails sends real invite emails (to ANY
+            # address, with attacker-controllable title/description) — same
+            # exfiltration class as send_email, so it queues for human approval.
+            # Attendee-less events only touch the caller's own calendar → direct.
+            if _attendees and os.getenv("NEXUS_REQUIRE_APPROVAL", "1") != "0":
+                approval = ApprovalRequest(
+                    company_id=DEFAULT_COMPANY_ID,
+                    requested_by=agent_id,
+                    action_type="create_calendar_event",
+                    payload={
+                        "employee_id":     emp_id,
+                        "title":           tool_input["title"],
+                        "start_time":      tool_input["start_time"],
+                        "end_time":        tool_input["end_time"],
+                        "description":     tool_input.get("description", ""),
+                        "attendee_emails": _attendees,
+                    },
+                )
+                db.add(approval)
+                db.commit()
+                _broadcast_sync()
+                return (f"Calendar event {tool_input['title']!r} (invites to: {', '.join(_attendees)}) "
+                        f"is QUEUED as approval request #{approval.id} — invites go out only after a "
+                        f"human approves it on the Approvals page. Tell the user it's awaiting "
+                        f"approval; do NOT claim invites were sent.")
             return create_calendar_event(
                 employee_id=emp_id,
                 title=tool_input["title"],
                 start_time=tool_input["start_time"],
                 end_time=tool_input["end_time"],
                 description=tool_input.get("description", ""),
-                attendee_emails=tool_input.get("attendee_emails", []),
+                attendee_emails=_attendees,
                 db=db,
             )
 
@@ -3042,8 +3464,8 @@ call the tool first. Accuracy is non-negotiable — a wrong count destroys trust
 3. Flag concerning patterns when you see them. Don't wait to be asked.
 
 THE PROPOSE-AND-WAIT RHYTHM — how a chief of staff operates:
-For any action that changes something the manager would want to approve — sending an email,
-posting publicly, scheduling a meeting, reassigning work, anything outward-facing or hard to undo —
+For any action that changes something the manager would want to approve — posting publicly,
+scheduling a meeting, reassigning work, anything outward-facing or hard to undo —
 follow this cadence every time:
   (a) State briefly what you found or what prompted this.
   (b) State the specific action you propose to take — concrete details (who, what, when).
@@ -3053,6 +3475,10 @@ Never claim something is done unless the tool actually ran. Never fabricate a su
 For pure reads (status, counts, lookups) and small reversible internal changes (set a priority,
 add a checklist item), just do it — no confirmation needed. Reserve the rhythm for things that
 leave the system or can't be easily undone.
+EXCEPTION — emails and external invites are HARD-GATED: send_email and attendee-bearing
+create_calendar_event calls only QUEUE the action on the Approvals page; nothing leaves until a
+human approves it there. So for those, draft the content with the manager, call the tool once it
+looks right, and report that it's awaiting approval — never report it as sent.
 
 After you complete or report on something, proactively name the natural next step if there is an
 obvious one ("This task has no deadline — want me to set one?"). Surface it; don't wait to be asked.
@@ -3063,6 +3489,34 @@ obvious one ("This task has no deadline — want me to set one?"). Surface it; d
 7. When you finish an action, state what was done in one or two sentences. Move on.
 
 Your tools cover tasks, projects, employees, meetings, analytics, goals, approvals, notifications, passwords, and more. Use them precisely."""
+
+    dynamic = f"CURRENT TIME: {current_time}"
+    return static, dynamic
+
+
+def get_team_prompt_parts(agent_id: str, channel_label: str = None) -> tuple:
+    """(static, dynamic) for the TEAM / COORDINATOR assistant that runs in shared
+    channels. It helps a team work together and keeps their dependencies from
+    breaking — without ever exposing private data or taking manager actions."""
+    current_time = datetime.now().strftime("%A, %B %d, %Y at %I:%M %p")
+    where = f" in #{channel_label}" if channel_label else ""
+
+    static = f"""You are Nexus, the team coordination assistant{where}. You are talking with a TEAM in a shared space that everyone in it can read — not with one person in private.
+
+Your job: help the team work together and keep their work from breaking. You know the team's projects, tasks, who is working on what, and — most importantly — the DEPENDENCIES and CONTRACTS between people's work. When one person's work puts another's at risk, surface it early and name the cheapest correct fix and who owns it, so nothing breaks when people build on each other.
+
+CRITICAL — THIS IS A PUBLIC, SHARED CHANNEL:
+- You have NO access to anyone's private data: no personal emails, no personal calendars, no private/personal task lists, no one's direct-message history, and no tools to reach them. If asked for an individual's private information, say you can't share personal details in a channel and suggest they DM you for their own info.
+- You are NOT a manager. You cannot approve requests, create/assign/change tasks, touch HR or pay, or run company-wide commands. You read and you coordinate. Your ONE action is flagging a genuine blocker to the manager (create_escalation) — use it only when the team is truly stuck on something only a manager can unblock.
+
+How you work:
+1. Always pull real data with your tools before stating any fact about tasks, projects, dependencies, status, or who's doing what. Never guess — a wrong status breaks trust.
+2. Lead with what it means for the team and what to do next; don't dump raw data. You're a coordinator, not a database.
+3. Watch dependencies actively. If a contract is at-risk or a task is blocking others, say so plainly and propose the cheapest fix and the owner.
+4. Be concise and friendly for a chat channel — usually a few sentences. Address people by name. Use bullets only when they genuinely help (e.g. a short status digest).
+5. If something needs a manager's decision or is personal, route it (escalate, or tell them to DM) — don't pretend you can do it.
+
+You exist so a team building on each other's work stays in sync and nothing silently breaks."""
 
     dynamic = f"CURRENT TIME: {current_time}"
     return static, dynamic
@@ -3115,15 +3569,17 @@ STOP and call the tool first. A wrong answer destroys trust.
 4. If something is beyond your authority, create an escalation for the manager (from_agent_id="Employee_{employee_id}").
 
 THE PROPOSE-AND-WAIT RHYTHM:
-For any action that goes outward or is hard to undo — sending an email, posting publicly,
-contacting a peer, creating an escalation — first state what you propose (who, what, the exact
-content), ask for confirmation, then STOP and wait. Only call the action tool once {employee_name}
+For any action that goes outward or is hard to undo — posting publicly, contacting a peer,
+creating an escalation — first state what you propose (who, what, the exact content), ask for
+confirmation, then STOP and wait. Only call the action tool once {employee_name}
 confirms, in that same turn. Never claim something is done unless the tool actually ran.
 For reads and small reversible changes, just do it. After completing something, name the obvious
 next step if there is one.
 5. For email tasks, check_google_connection first. If connected, use Gmail tools. If not, give the connect URL.
 6. For calendar tasks, always check the real calendar before scheduling.
-7. NEVER send an email without explicit confirmation from {employee_name}.
+7. Emails are HARD-GATED: send_email only QUEUES the email for human approval on the Approvals
+   page — draft it with {employee_name}, call the tool, then say it's awaiting approval. Never
+   claim an email was sent.
 8. When you complete an action, state it plainly in one or two sentences.
 
 You have tools for tasks, meetings, goals, time tracking, notifications, peer collaboration, and Google Workspace. Use them precisely."""
@@ -3202,7 +3658,18 @@ def assemble_context_snapshot(agent_id: str, is_employee: bool, emp_id: int = No
             pass
         return None
 
-    if is_employee and emp_id is not None:
+    if str(agent_id).startswith("Team_"):
+        # Team coordinator: team status + overdue + dependency/contract health.
+        team = safe_tool("get_team_status", {})
+        if team:
+            snapshot_parts.append(f"TEAM STATUS RIGHT NOW:\n{team}")
+        overdue = safe_tool("get_overdue_summary", {}) or safe_tool("get_overdue_tasks", {})
+        if overdue:
+            snapshot_parts.append(f"OVERDUE ACROSS THE TEAM:\n{overdue}")
+        contracts = safe_tool("view_contracts", {})
+        if contracts:
+            snapshot_parts.append(f"DEPENDENCIES & CONTRACTS (flag anything at-risk):\n{contracts}")
+    elif is_employee and emp_id is not None:
         # Employee: their own tasks + calendar
         tasks = safe_tool("get_my_tasks", {})
         if tasks:
@@ -3231,7 +3698,42 @@ def assemble_context_snapshot(agent_id: str, is_employee: bool, emp_id: int = No
     )
 
 
-def run_orchestrator(agent_id: str, command: str) -> str:
+def _load_mcp_servers() -> list:
+    """Enabled MCP connections for the company → remote-connector server defs for
+    Anthropic's MCP connector. Returns [] when none, so the orchestrator stays on
+    the standard (non-beta) path and behaves exactly as before."""
+    try:
+        from database.models import MCPConnection
+        from api.token_crypto import decrypt_secret
+        db = SessionLocal()
+        try:
+            rows = db.query(MCPConnection).filter(
+                MCPConnection.company_id == DEFAULT_COMPANY_ID,
+                MCPConnection.enabled == True,  # noqa: E712
+            ).all()
+        finally:
+            db.close()
+        servers = []
+        for c in rows:
+            s = {"type": "url", "name": c.app, "url": c.url}
+            if c.auth_token_enc:
+                try:
+                    s["authorization_token"] = decrypt_secret(c.auth_token_enc)
+                except Exception:
+                    # Token can't be decrypted (e.g. key changed). SKIP this
+                    # connection rather than attach an UNauthenticated server —
+                    # attaching it tokenless would 401 and break EVERY AI call
+                    # for the company, not just this one connector.
+                    print(f"⚠️  MCP '{c.app}': stored token won't decrypt — skipping it.")
+                    continue
+            servers.append(s)
+        return servers
+    except Exception as e:
+        print(f"⚠️  MCP load failed (continuing without MCP): {e}")
+        return []
+
+
+def run_orchestrator(agent_id: str, command: str, extra_context: str = None) -> str:
     start = time.time()
 
     # PHASE 3: emit agent activation
@@ -3250,7 +3752,13 @@ def run_orchestrator(agent_id: str, command: str) -> str:
         return "Yes? What do you need."
 
     is_employee = agent_id.startswith("Employee_")
-    if is_employee:
+    is_team     = agent_id.startswith("Team_")
+    emp_id = None
+    if is_team:
+        # Shared-channel coordinator — restricted toolset, no personal identity.
+        static_prompt, dynamic_prompt = get_team_prompt_parts(agent_id)
+        tools = TEAM_TOOLS
+    elif is_employee:
         emp_id = int(agent_id.split("_")[1])
         db = SessionLocal()
         try:
@@ -3263,6 +3771,18 @@ def run_orchestrator(agent_id: str, command: str) -> str:
     else:
         static_prompt, dynamic_prompt = get_manager_prompt_parts()
         tools = MANAGER_TOOLS
+
+    # MCP — feed connected enterprise data sources into the Claude calls via
+    # Anthropic's remote connector. CONDITIONAL: when nothing is connected,
+    # mcp_servers is [] and the orchestrator runs exactly as it did before.
+    # ROLE-GATE: never attach company MCP servers to the TEAM (public-channel)
+    # tier — MCP tools run server-side, OUTSIDE the execute_tool allow-list, so an
+    # @mention in a public channel could otherwise reach the company's GitHub/DB
+    # connectors. Manager + employees (authenticated, private DM/web) still get MCP.
+    mcp_servers = [] if is_team else _load_mcp_servers()
+    if mcp_servers:
+        tools = list(tools) + [{"type": "mcp_toolset", "mcp_server_name": s["name"]} for s in mcp_servers]
+        print(f"🔌 MCP: {len(mcp_servers)} source(s) attached → {[s['name'] for s in mcp_servers]}")
 
     # PHASE 1.5: Inject learned personality context — makes the AI feel
     # more like the user over time. Empty string for new users.
@@ -3287,6 +3807,12 @@ def run_orchestrator(agent_id: str, command: str) -> str:
     except Exception:
         pass   # best-effort — never block the orchestrator
 
+    # Caller-supplied volatile context (e.g. the Slack channel's roster + recent
+    # messages for the team assistant). Goes in the dynamic block — it changes
+    # every command, so it must render after the cache breakpoint.
+    if extra_context:
+        dynamic_prompt += "\n\n" + extra_context
+
     # Prompt caching: static persona under a breakpoint (caches together with
     # the tools block that renders before it); volatile context after it.
     system_blocks = [{
@@ -3301,11 +3827,31 @@ def run_orchestrator(agent_id: str, command: str) -> str:
 
     complexity = classify_command(command)
     model      = MODEL_MAP[complexity]
+    # MCP tool use needs a capable model — Haiku acknowledges ("let me pull your repos")
+    # but under-uses the connector's tools, so upgrade whenever sources are attached.
+    if (mcp_servers or is_team) and complexity != "sonnet":
+        # MCP tool use and team coordination both need the stronger model.
+        complexity = "sonnet"
+        model = MODEL_MAP["sonnet"]
     print(f"🧠 Router: '{complexity.upper()}' → {model}")
     glass_brain_queue.put(
         f"{agent_id}|[GLASS BRAIN] "
         f"🧠 Routing to {'full reasoning engine' if complexity == 'sonnet' else 'fast engine'}..."
     )
+
+    def _call(msgs):
+        """One Claude call — beta MCP-connector path when sources are attached,
+        otherwise the standard path (byte-identical to the original request)."""
+        if mcp_servers:
+            return claude_client.beta.messages.create(
+                model=model, max_tokens=2048, system=system_blocks,
+                tools=tools, messages=msgs,
+                betas=["mcp-client-2025-11-20"], mcp_servers=mcp_servers,
+            )
+        return claude_client.messages.create(
+            model=model, max_tokens=2048, system=system_blocks,
+            tools=tools, messages=msgs,
+        )
 
     max_iterations = 10
     iteration      = 0
@@ -3318,13 +3864,7 @@ def run_orchestrator(agent_id: str, command: str) -> str:
             # breakpoint can never be filtered out of the request.
             request_messages = validate_messages(messages)
             _refresh_cache_breakpoint(request_messages)
-            response = claude_client.messages.create(
-                model=model,
-                max_tokens=2048,
-                system=system_blocks,
-                tools=tools,
-                messages=request_messages,
-            )
+            response = _call(request_messages)
         except Exception as api_err:
             err_str = str(api_err)
             if "tool_use_id" in err_str or "tool_result" in err_str:
@@ -3333,13 +3873,7 @@ def run_orchestrator(agent_id: str, command: str) -> str:
                 messages = [{"role": "user", "content": command}]
                 try:
                     _refresh_cache_breakpoint(messages)
-                    response = claude_client.messages.create(
-                        model=model,
-                        max_tokens=2048,
-                        system=system_blocks,
-                        tools=tools,
-                        messages=messages,
-                    )
+                    response = _call(messages)
                 except Exception as retry_err:
                     return f"System error after memory reset: {str(retry_err)}"
             else:
@@ -3389,6 +3923,7 @@ def run_orchestrator(agent_id: str, command: str) -> str:
                     glass_brain_queue.put(f"{agent_id}|[GLASS BRAIN] ⚙️ {block.name}...")
                     # execute_tool has its own try/except — always returns a string
                     result = execute_tool(block.name, block.input, agent_id)
+                    _audit_tool_execution(agent_id, block.name, block.input, str(result))
                     print(f"📊 Result: {str(result)[:120]}")
                     tool_results.append({
                         "type":        "tool_result",
@@ -3396,6 +3931,8 @@ def run_orchestrator(agent_id: str, command: str) -> str:
                         "content":     str(result),  # enforce string — never let None through
                     })
             messages.append({"role": "user", "content": tool_results})
+        elif response.stop_reason == "pause_turn":
+            continue  # server-side MCP tool loop paused — re-send the same messages to resume
         else:
             break
 

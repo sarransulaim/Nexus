@@ -18,7 +18,7 @@ from datetime import date, timedelta
 from database.core import SessionLocal
 from database.models import (
     Project, Task, TaskDependency, PeerRequest, Channel, ChannelMember,
-    Employee, Notification, Contract, project_members,
+    Employee, Notification, Contract, ApprovalRequest, project_members,
 )
 
 log = logging.getLogger("nexus.digest")
@@ -196,6 +196,66 @@ def _push_notif_async(employee_id: int, n: Notification):
     threading.Thread(target=_run, daemon=True).start()
 
 
+def _propose_and_surface_fix(contract_id: int) -> None:
+    """On first drift, generate the cheapest-correct-fix proposal (resolution_engine)
+    and surface it as a pending ApprovalRequest, de-duped per contract. Opens its
+    OWN short sessions and makes the ~45s Claude call with NO session held — never
+    pin a pooled connection across the network round-trip. Best-effort — a failure
+    here never breaks the drift-alert loop."""
+    def _has_pending(session) -> bool:
+        return any(
+            (a.payload or {}).get("contract_id") == contract_id
+            for a in session.query(ApprovalRequest).filter(
+                ApprovalRequest.action_type == "resolve_contract_drift",
+                ApprovalRequest.status == "pending",
+            ).all()
+        )
+    # 1. de-dupe check (short session, released before the slow call)
+    db = SessionLocal()
+    try:
+        if _has_pending(db):
+            return  # already proposed — don't spam duplicate approvals
+    finally:
+        db.close()
+    # 2. the ~45s Claude call — NO db session held here
+    try:
+        from resolution_engine import propose_resolution
+        prop = propose_resolution(contract_id)
+    except Exception as e:
+        log.warning(f"resolution proposal failed for contract {contract_id}: {e}")
+        prop = {}
+    # 3. insert (fresh short session; re-check de-dupe to close the check→insert race
+    #    between an overlapping scheduled run and a manual "Post Digest" trigger)
+    db = SessionLocal()
+    try:
+        if _has_pending(db):
+            return  # another run beat us to it
+        c = db.query(Contract).filter(Contract.id == contract_id).first()
+        if not c:
+            return
+        payload = {
+            "contract_id":   contract_id,
+            "contract_name": c.name,
+            "producer_task": c.producer.title if c.producer else "?",
+            "consumer_task": c.consumer.title if c.consumer else "?",
+            "summary":       prop.get("summary", "Interface drifted — manual review needed"),
+            "proposed_fix":  prop.get("fix", "(could not auto-generate a fix — review manually)"),
+            "rationale":     prop.get("rationale", ""),
+            "effort":        prop.get("effort", ""),
+            "who":           prop.get("who", ""),
+        }
+        db.add(ApprovalRequest(
+            company_id=c.company_id,
+            requested_by="Nexus · resolution engine",
+            action_type="resolve_contract_drift",
+            payload=payload,
+            status="pending",
+        ))
+        db.commit()
+    finally:
+        db.close()
+
+
 def run_drift_alerts() -> dict:
     """
     The directed half of the coordination story: for every cross-person task
@@ -205,6 +265,9 @@ def run_drift_alerts() -> dict:
     upstream state actually changes (the message text changes with it).
     """
     results = {"alerts": 0, "details": []}
+    newly_at_risk = []   # contracts that flip to at_risk this run — propose fixes
+                         # AFTER the drift session is released (below), so the ~45s
+                         # Claude calls never pin this pooled connection.
     db = SessionLocal()
     try:
         today = date.today()
@@ -266,6 +329,7 @@ def run_drift_alerts() -> dict:
             if c.status != "at_risk":
                 c.status = "at_risk"
                 db.commit()
+                newly_at_risk.append(c.id)   # defer the ~45s Claude proposal (below)
             msg = (f"Contract drift: \"{producer.title}\" changed after the interface \"{c.name}\" "
                    f"was agreed. Re-check it before integrating your \"{consumer.title}\".")
             dup = db.query(Notification).filter(
@@ -288,9 +352,18 @@ def run_drift_alerts() -> dict:
             results["details"].append({"to_owner": consumer.owner_id, "msg": msg[:70]})
 
         log.info(f"🔔 Drift alerts: {results['alerts']} sent")
-        return results
     finally:
         db.close()
+
+    # Session released — NOW make the deferred cheapest-correct-fix proposals.
+    # Each opens its own short session + a ~45s Claude call; capped per run so a
+    # mass-drift day can't stack dozens back-to-back. Any beyond the cap still
+    # lack a proposal and are picked up on the next run.
+    for cid in newly_at_risk[:8]:
+        _propose_and_surface_fix(cid)
+    if len(newly_at_risk) > 8:
+        log.warning(f"Drift proposals capped at 8; {len(newly_at_risk) - 8} deferred to next run.")
+    return results
 
 
 def run_all_digests(force: bool = False) -> dict:

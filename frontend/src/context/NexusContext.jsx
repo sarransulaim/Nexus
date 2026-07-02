@@ -77,10 +77,54 @@ export function NexusProvider({ children }) {
   // updates silently stopped on any network hiccup.
   const wsRef            = useRef(null);
   const wsReconnectDelay = useRef(1000); // starts 1s, doubles up to 30s
+  // FIX (#22): track the pending reconnect timer so we never stack parallel
+  // reconnect chains (onerror→close plus a server close both firing) into
+  // duplicate sockets — the untracked setTimeout could spawn several.
+  const wsReconnectTimer = useRef(null);
 
   // Stable ref so WS onmessage always sees the current user
   const currentUserRef = useRef(currentUser);
   useEffect(() => { currentUserRef.current = currentUser; }, [currentUser]);
+
+  // Mirror of notifications for stale-free reads inside async handlers.
+  const notificationsRef = useRef(notifications);
+  useEffect(() => { notificationsRef.current = notifications; }, [notifications]);
+
+  // ── Shared, de-duplicated access-token refresh ────────────────
+  // A single in-flight refresh is shared by ALL callers (a burst of 401s, or a
+  // WS auth-close racing an HTTP 401). Without this, each caller would POST its
+  // own /auth/refresh, rotating the refresh token N times so all but one become
+  // invalid — silently logging the user out mid-session. Returns the new access
+  // token, or null on failure (caller decides whether to log out / retry).
+  const refreshPromiseRef = useRef(null);
+  const refreshAccessToken = useCallback(async () => {
+    if (!refreshTokenRef.current) return null;
+    if (refreshPromiseRef.current) return refreshPromiseRef.current;
+
+    refreshPromiseRef.current = (async () => {
+      try {
+        const res = await axios.post(`${BACKEND_URL}/api/v1/auth/refresh`, {
+          refresh_token: refreshTokenRef.current,
+        });
+        const newToken = res.data?.access_token;
+        if (!newToken) return null;
+        accessTokenRef.current = newToken;
+        sessionStorage.setItem('nexus_access_token', newToken);
+        // Honor refresh-token rotation if the server issues a new one.
+        if (res.data?.refresh_token) {
+          refreshTokenRef.current = res.data.refresh_token;
+          sessionStorage.setItem('nexus_refresh_token', res.data.refresh_token);
+        }
+        return newToken;
+      } catch {
+        return null;
+      } finally {
+        refreshPromiseRef.current = null;
+      }
+    })();
+
+    return refreshPromiseRef.current;
+  }, [BACKEND_URL]);
 
 
   // ── FIX (Bug 2): Auto-refresh access token on 401 ──────────────
@@ -109,20 +153,16 @@ export function NexusProvider({ children }) {
           !originalRequest.url?.includes('/auth/refresh')
         ) {
           originalRequest._retry = true;
-          try {
-            const res = await axios.post(`${BACKEND_URL}/api/v1/auth/refresh`, {
-              refresh_token: refreshTokenRef.current,
-            });
-            const newToken = res.data.access_token;
-            accessTokenRef.current = newToken;
-            sessionStorage.setItem('nexus_access_token', newToken);
+          // Shared refresh — a burst of parallel 401s triggers ONE /auth/refresh
+          // (see refreshAccessToken) instead of N competing rotations.
+          const newToken = await refreshAccessToken();
+          if (newToken) {
             originalRequest.headers.Authorization = `Bearer ${newToken}`;
             return axios(originalRequest);
-          } catch (refreshErr) {
-            // Refresh failed — log out cleanly
-            handleDisconnectInternal();
-            return Promise.reject(refreshErr);
           }
+          // Refresh failed — log out cleanly
+          handleDisconnectInternal();
+          return Promise.reject(error);
         }
         return Promise.reject(error);
       }
@@ -140,6 +180,10 @@ export function NexusProvider({ children }) {
     accessTokenRef.current  = null;
     refreshTokenRef.current = null;
     authReadyRef.current    = false;
+    if (wsReconnectTimer.current) {
+      clearTimeout(wsReconnectTimer.current);
+      wsReconnectTimer.current = null;
+    }
     if (wsRef.current) {
       wsRef.current.onclose = null;
       wsRef.current.close();
@@ -176,8 +220,13 @@ export function NexusProvider({ children }) {
     try {
       const headers = { Authorization: `Bearer ${accessTokenRef.current}` };
       await axios.post(`${BACKEND_URL}/api/v1/notifications/read/${notifId}`, {}, { headers });
+      // Only decrement the badge if this notification was actually unread —
+      // re-marking an already-read one must not drive the count negative or
+      // desync it from the true unread total. (#24)
+      const target = notificationsRef.current.find(n => n.id === notifId);
+      const wasUnread = target ? !target.is_read : false;
       setNotifications(prev => prev.map(n => n.id === notifId ? { ...n, is_read: true } : n));
-      setUnreadCount(prev => Math.max(0, prev - 1));
+      if (wasUnread) setUnreadCount(prev => Math.max(0, prev - 1));
     } catch (e) { console.error('Mark read error', e); }
   };
 
@@ -224,6 +273,13 @@ export function NexusProvider({ children }) {
   const connectWebSocket = useCallback(() => {
     if (!currentUserRef.current) return;
 
+    // Cancel any pending reconnect — we're connecting now, so a queued retry
+    // would only create a duplicate socket.
+    if (wsReconnectTimer.current) {
+      clearTimeout(wsReconnectTimer.current);
+      wsReconnectTimer.current = null;
+    }
+
     // Clean up any existing dead connection
     if (wsRef.current) {
       const state = wsRef.current.readyState;
@@ -241,11 +297,17 @@ export function NexusProvider({ children }) {
     const wsUrl      = `${wsProtocol}//${window.location.hostname}:8000/api/v1/ws/${employeeId}?token=${encodeURIComponent(wsToken)}`;
 
     try {
+      // Per-socket flag: a failed HANDSHAKE (expired token → server closes
+      // before accept) never fires onopen, and the browser reports a generic
+      // 1006 instead of our 1008 — so "never opened" is also treated as auth
+      // failure below and triggers a token refresh before reconnecting.
+      let wsEverOpened = false;
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
       ws.onopen = () => {
         console.log('🌐 Nexus WS connected');
+        wsEverOpened = true;
         wsReconnectDelay.current = 1000; // Reset backoff on successful connect
       };
 
@@ -343,19 +405,35 @@ export function NexusProvider({ children }) {
         ws.close();
       };
 
-      ws.onclose = () => {
-        console.log(`🌐 Nexus WS disconnected. Reconnecting in ${wsReconnectDelay.current}ms...`);
-        if (!currentUserRef.current) return; // User logged out — don't reconnect
+      ws.onclose = (event) => {
+        if (!currentUserRef.current) return;          // User logged out — don't reconnect
+        if (wsRef.current && wsRef.current !== ws) return; // Superseded by a newer socket
+        if (wsReconnectTimer.current) return;         // A reconnect is already queued (#22)
 
         const delay = wsReconnectDelay.current;
         wsReconnectDelay.current = Math.min(delay * 2, 30000); // Cap at 30s
 
-        setTimeout(connectWebSocket, delay);
+        // FIX (#6 HIGH): if the socket was rejected for auth (expired access
+        // token in the handshake — code 1008, or a failed handshake that never
+        // opened → 1006), refresh the token BEFORE reconnecting. Otherwise we'd
+        // loop forever re-presenting the same dead token and real-time silently
+        // dies once the access token's ~8h lifetime expires.
+        const authFailure = event?.code === 1008 || !wsEverOpened;
+        console.log(`🌐 Nexus WS disconnected. Reconnecting in ${delay}ms...`);
+
+        wsReconnectTimer.current = setTimeout(async () => {
+          wsReconnectTimer.current = null;
+          if (!currentUserRef.current) return;
+          if (authFailure) {
+            await refreshAccessToken(); // updates accessTokenRef → reconnect uses fresh token
+          }
+          connectWebSocket();
+        }, delay);
       };
     } catch (e) {
       console.error('WS connection error:', e);
     }
-  }, [fetchDashboardData]);
+  }, [fetchDashboardData, refreshAccessToken]);
 
 
   // ── Boot: initial data fetch + WS ───────────────────────────
@@ -386,6 +464,10 @@ export function NexusProvider({ children }) {
 
     return () => {
       // On unmount, close WS cleanly without triggering reconnect
+      if (wsReconnectTimer.current) {
+        clearTimeout(wsReconnectTimer.current);
+        wsReconnectTimer.current = null;
+      }
       if (wsRef.current) {
         wsRef.current.onclose = null;
         wsRef.current.close();

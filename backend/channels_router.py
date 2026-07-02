@@ -264,11 +264,23 @@ async def whatsapp_inbound(request: Request, background_tasks: BackgroundTasks):
     form = await request.form()
     params = {key: form[key] for key in form.keys()}
 
-    # Verify Twilio signature
+    # Verify Twilio signature against every plausible public URL: the one derived
+    # from the actual request (honoring proxy/ngrok forwarding headers) AND the
+    # configured TWILIO_WEBHOOK_BASE. Twilio signs the exact public URL, which
+    # behind a proxy differs from what the app sees — checking a single guessed
+    # URL silently rejects every real webhook. Accepting extra candidates is safe
+    # (each still needs a valid HMAC signature an attacker can't forge). (#16)
     signature = request.headers.get("X-Twilio-Signature", "")
-    webhook_url = tw.build_webhook_url("/api/v1/channels/whatsapp/inbound")
-    if not tw.verify_signature(webhook_url, params, signature):
-        log.warning(f"⚠️  Invalid Twilio signature. URL used: {webhook_url}")
+    proto = request.headers.get("x-forwarded-proto") or request.url.scheme
+    host  = request.headers.get("x-forwarded-host") or request.headers.get("host")
+    query = ("?" + request.url.query) if request.url.query else ""
+    candidate_urls = []
+    if host:
+        candidate_urls.append(f"{proto}://{host}{request.url.path}{query}")
+    candidate_urls.append(str(request.url))
+    candidate_urls.append(tw.build_webhook_url("/api/v1/channels/whatsapp/inbound"))
+    if not tw.verify_signature_multi(candidate_urls, params, signature):
+        log.warning(f"⚠️  Invalid Twilio signature. URLs tried: {candidate_urls}")
         raise HTTPException(status_code=403, detail="Invalid signature.")
 
     from_phone  = tw.normalize_phone(params.get("From", ""))
@@ -404,8 +416,21 @@ def slack_start_link(
     This creates a pending connection with a placeholder identifier
     that the bot fills in when it sees the code.
     """
-    code    = tw.generate_verification_code()
     expires = _now() + timedelta(minutes=10)
+    # Pick a code that doesn't collide with any other LIVE pending slack code, so
+    # completing a link (matched by the 6-digit code alone) can never resolve to
+    # the wrong person's pending row on a collision.
+    code = tw.generate_verification_code()
+    for _ in range(20):
+        clash = db.query(ChannelConnection).filter(
+            ChannelConnection.platform               == "slack",
+            ChannelConnection.verification_code      == code,
+            ChannelConnection.verified               == False,  # noqa: E712
+            ChannelConnection.verification_expires_at > _now(),
+        ).first()
+        if not clash:
+            break
+        code = tw.generate_verification_code()
     placeholder = f"pending_{code}"
 
     # Clear any old pending slack links for this user

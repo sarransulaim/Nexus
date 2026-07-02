@@ -20,7 +20,7 @@ frontend already holds currentUser.dbId), same as the notifications router.
 
 from fastapi import APIRouter, Depends, HTTPException, Body
 from sqlalchemy.orm import Session
-from sqlalchemy import asc, desc, or_
+from sqlalchemy import asc, desc, or_, and_, func
 
 from database.core import get_db
 from database.models import (
@@ -200,28 +200,54 @@ def my_channels(
                   Channel.is_archived == False)
           .all()
     )
+    channel_ids = [c.id for c in rows]
     # per-channel last_read_at for this member, to compute unread counts
     last_read = {
         m.channel_id: m.last_read_at
         for m in db.query(ChannelMember).filter(ChannelMember.employee_id == employee_id).all()
     }
+
+    # ── Batched aggregates (was N+1: two queries PER channel) ──────────────
+    # Last message per channel in ONE query via Postgres DISTINCT ON. (#20)
+    last_map = {}
+    if channel_ids:
+        last_msgs = (
+            db.query(Message)
+              .filter(Message.channel_id.in_(channel_ids), Message.is_deleted == False)
+              .order_by(Message.channel_id, desc(Message.created_at))
+              .distinct(Message.channel_id)
+              .all()
+        )
+        last_map = {m.channel_id: m for m in last_msgs}
+
+    # Unread counts for all channels in ONE grouped query. Each channel carries
+    # its own last_read cutoff via an OR of per-channel conditions; channels with
+    # no unread simply don't appear in the result (default 0). unread = messages
+    # from others (incl. the AI, whose sender_id is NULL) since last read.
+    unread_map = {}
+    if channel_ids:
+        conds = []
+        for cid in channel_ids:
+            lr = last_read.get(cid)
+            if lr:
+                conds.append(and_(Message.channel_id == cid, Message.created_at > lr))
+            else:
+                conds.append(Message.channel_id == cid)
+        unread_rows = (
+            db.query(Message.channel_id, func.count(Message.id))
+              .filter(
+                  Message.is_deleted == False,
+                  or_(Message.sender_id != employee_id, Message.sender_id.is_(None)),
+                  or_(*conds),
+              )
+              .group_by(Message.channel_id)
+              .all()
+        )
+        unread_map = {cid: cnt for cid, cnt in unread_rows}
+
     out = []
     for c in rows:
-        last = (
-            db.query(Message)
-              .filter(Message.channel_id == c.id, Message.is_deleted == False)
-              .order_by(desc(Message.created_at))
-              .first()
-        )
-        # unread = messages from others (incl. the AI, whose sender_id is NULL) since last read
-        uq = db.query(Message).filter(
-            Message.channel_id == c.id,
-            Message.is_deleted == False,
-            or_(Message.sender_id != employee_id, Message.sender_id.is_(None)),
-        )
-        lr = last_read.get(c.id)
-        if lr:
-            uq = uq.filter(Message.created_at > lr)
+        last = last_map.get(c.id)
         out.append({
             "channel_id":   c.id,
             "name":         c.name,
@@ -229,7 +255,7 @@ def my_channels(
             "project_id":   c.project_id,
             "last_message": last.content[:80] if last else None,
             "last_at":      last.created_at.isoformat() if last and last.created_at else None,
-            "unread":       uq.count(),
+            "unread":       unread_map.get(c.id, 0),
         })
     return {"channels": out}
 

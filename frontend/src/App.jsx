@@ -15,7 +15,6 @@ import Directives from './pages/Directives';
 // Placeholder pages
 import Analytics       from './pages/Analytics';
 import GoogleWorkspace from './pages/GoogleWorkspace';
-import Integrations    from './pages/Integrations';
 import SettingsPage    from './pages/SettingsPage';
 import ApprovalsPage   from './pages/ApprovalsPage';
 import GoalsPage       from './pages/GoalsPage';
@@ -62,26 +61,25 @@ function Sidebar({ currentUser, activeTab, setActiveTab, isSyncing, handleDiscon
       items: [
         { id: 'tasks',    label: 'Task Registry', icon: ICON.tasks    },
         { id: 'team',     label: 'Team Matrix',   icon: ICON.team     },
-        { id: 'meetings', label: 'Meetings',      icon: ICON.meetings, soon: true },
-        { id: 'goals',    label: 'Goals',         icon: ICON.goals,    soon: true },
+        { id: 'meetings', label: 'Meetings',      icon: ICON.meetings },
+        { id: 'goals',    label: 'Goals',         icon: ICON.goals    },
       ],
     },
     {
       label: 'Intelligence',
       items: [
-        { id: 'google',    label: 'Google Workspace', icon: ICON.gmail,      soon: true },
+        { id: 'google',    label: 'Google Workspace', icon: ICON.gmail      },
         { id: 'analytics', label: 'Analytics',        icon: ICON.analytics},
       ],
     },
     {
       label: 'System',
       items: [
-        { id: 'integrations', label: 'Integrations', icon: ICON.integrations, soon: true },
-        { id: 'approvals',    label: 'Approvals',    icon: ICON.approvals,   soon: true },
+        { id: 'approvals',    label: 'Approvals',    icon: ICON.approvals    },
         { id: 'database',     label: 'Database',     icon: ICON.database     },
         { id: 'admin',        label: 'Admin',        icon: ICON.settings     },
         { id: 'connections',  label: 'Connections',  icon: ICON.integrations },
-        { id: 'settings',     label: 'Settings',     icon: ICON.settings,    soon: true },
+        { id: 'settings',     label: 'Settings',     icon: ICON.settings     },
       ],
     },
   ];
@@ -99,9 +97,9 @@ function Sidebar({ currentUser, activeTab, setActiveTab, isSyncing, handleDiscon
     {
       label: 'My Data',
       items: [
-        { id: 'goals',  label: 'My Goals',    icon: ICON.goals,    soon: true },
-        { id: 'google', label: 'My Emails',   icon: ICON.gmail,    soon: true },
-        { id: 'meetings', label: 'My Calendar', icon: ICON.calendar, soon: true },
+        { id: 'goals',  label: 'My Goals',    icon: ICON.goals    },
+        { id: 'google', label: 'My Emails',   icon: ICON.gmail    },
+        { id: 'meetings', label: 'My Calendar', icon: ICON.calendar },
       ],
     },
   ];
@@ -502,7 +500,6 @@ function MainApp() {
           {activeTab === 'database'     && <Database />}
           {activeTab === 'analytics'    && <Analytics />}
           {activeTab === 'google'       && <GoogleWorkspace />}
-          {activeTab === 'integrations' && <Integrations />}
           {activeTab === 'settings'     && <SettingsPage />}
           {activeTab === 'approvals'    && <ApprovalsPage />}
           {activeTab === 'goals'        && <GoalsPage />}

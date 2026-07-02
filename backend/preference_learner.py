@@ -35,6 +35,14 @@ log = logging.getLogger("nexus.learner")
 # Run extraction every N user turns (not every save — that's too often)
 EXTRACTION_INTERVAL = 5
 
+# Guard against concurrent extraction for the SAME agent. Rapid turns could
+# otherwise spawn overlapping daemon threads that each read-modify-write the
+# agent's key_preferences list, losing updates (#12). Only one extraction per
+# agent runs at a time; extra triggers are dropped (the next interval catches
+# any missed turns). Keyed by agent_id, guarded by the lock.
+_inflight_lock = threading.Lock()
+_inflight_agents: set = set()
+
 
 # ═══════════════════════════════════════════════════════════════
 # EXTRACTION PROMPT
@@ -120,13 +128,17 @@ def extract_preferences_sync(agent_id: str, company_id: int):
 
         print(f"🧠 Calling Ollama for preference extraction... ({len(transcript)} chars)")
 
-        # Call local Ollama for extraction (free)
+        # Call local Ollama for extraction (free). allow_fallback=False so an
+        # Ollama outage SKIPS this cycle instead of silently billing paid Haiku
+        # for what is advertised as a $0 background job (#10) — the error string
+        # returned in that case just fails the parse below and we skip.
         try:
             response = ai_router.call(
                 task_type=TaskType.PREFERENCE_EXTRACTION,
                 prompt=f"Conversation to analyze:\n\n{transcript}",
                 system=EXTRACTION_SYSTEM_PROMPT,
                 max_tokens=1024,
+                allow_fallback=False,
             )
             print(f"🧠 Ollama responded: {response[:200]}...")
         except Exception as e:
@@ -367,6 +379,14 @@ def maybe_extract_in_background(agent_id: str, company_id: int, current_turn_cou
     if current_turn_count == 0 or current_turn_count % EXTRACTION_INTERVAL != 0:
         return
 
+    # Drop this trigger if an extraction for the same agent is already running,
+    # so overlapping threads can't clobber each other's key_preferences merge.
+    with _inflight_lock:
+        if agent_id in _inflight_agents:
+            print(f"🧠 Extraction already running for {agent_id} — skipping trigger (turn {current_turn_count})")
+            return
+        _inflight_agents.add(agent_id)
+
     def _run():
         try:
             print(f"🧠 Starting preference extraction for {agent_id}...")
@@ -375,6 +395,9 @@ def maybe_extract_in_background(agent_id: str, company_id: int, current_turn_cou
         except Exception as e:
             print(f"⚠️  Background extraction error for {agent_id}: {e}")
             import traceback; traceback.print_exc()
+        finally:
+            with _inflight_lock:
+                _inflight_agents.discard(agent_id)
 
     threading.Thread(target=_run, daemon=True).start()
     print(f"🧠 Triggered preference learning for {agent_id} (turn {current_turn_count})")

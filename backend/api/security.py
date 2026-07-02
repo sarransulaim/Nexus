@@ -22,13 +22,21 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # CONFIG
 # ---------------------------------------------------------------------------
-JWT_SECRET      = os.getenv("JWT_SECRET", "nexus_change_this_in_production")
+JWT_SECRET      = os.getenv("JWT_SECRET", "")
 JWT_ALGORITHM   = "HS256"
 
-if JWT_SECRET == "nexus_change_this_in_production":
-    print("⚠️  SECURITY: JWT_SECRET is the built-in default. Set a strong, random "
-          "JWT_SECRET in the environment before any non-local deployment — anyone "
-          "who knows the default can forge valid login tokens for any user.")
+# Fail closed: a weak or default signing key lets anyone forge a manager token.
+# Refuse to start unless JWT_SECRET is explicitly set to a strong, non-default value.
+_KNOWN_WEAK_SECRETS = {
+    "", "nexus_change_this_in_production", "nexus_super_secret_change_this_now",
+    "changeme", "secret", "your-secret-key",
+}
+if JWT_SECRET in _KNOWN_WEAK_SECRETS or len(JWT_SECRET) < 32:
+    raise RuntimeError(
+        "JWT_SECRET is unset, a known default, or shorter than 32 characters. "
+        "Set a strong random JWT_SECRET in the environment before starting Nexus.\n"
+        "Generate one with:  python -c \"import secrets; print(secrets.token_urlsafe(48))\""
+    )
 ACCESS_TOKEN_EXPIRE_HOURS  = 8    # token lasts 8 hours
 REFRESH_TOKEN_EXPIRE_DAYS  = 30   # refresh token lasts 30 days
 

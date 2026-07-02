@@ -72,20 +72,17 @@ import hashlib
 from cryptography.fernet import Fernet
 
 
-def _fernet() -> Fernet:
-    secret = os.getenv("NEXUS_TOKEN_KEY") or os.getenv("JWT_SECRET", "nexus_change_this_in_production")
-    return Fernet(base64.urlsafe_b64encode(hashlib.sha256(secret.encode()).digest()))
-
-
-def _encrypt(plaintext: str) -> str:
-    return _fernet().encrypt(plaintext.encode()).decode()
+# Token encryption is centralized in token_crypto (multi-key: ENCRYPT with the
+# stable NEXUS_TOKEN_KEY, DECRYPT with any known key), so rotating JWT_SECRET
+# never bricks stored Google tokens and legacy rows keep decrypting.
+from api.token_crypto import encrypt_secret as _encrypt, decrypt_secret as _decrypt
 
 
 def _load_token_json(stored: str) -> dict:
     """Decrypt + parse stored token JSON. Falls back to legacy plaintext (which
     is then re-encrypted on the next save), so pre-existing rows keep working."""
     try:
-        return json.loads(_fernet().decrypt(stored.encode()).decode())
+        return json.loads(_decrypt(stored))
     except Exception:
         try:
             return json.loads(stored)   # legacy plaintext row
@@ -107,20 +104,29 @@ def _make_flow() -> Flow:
 
 def get_google_auth_url(employee_id: int) -> str:
     """
-    Generates the Google OAuth authorization URL.
-    Stores the flow object so we can complete the exchange in the callback.
+    Generates the Google OAuth authorization URL with a RANDOM, single-use state
+    (B4). The state is an opaque server-issued token bound to employee_id in
+    _pending_flows — never the employee_id itself — so the callback can't be
+    tricked into binding tokens to an attacker-chosen id.
     """
+    import secrets, time
     flow = _make_flow()
+    state = secrets.token_urlsafe(32)
 
-    auth_url, state = flow.authorization_url(
+    auth_url, _ = flow.authorization_url(
         access_type            = "offline",
         include_granted_scopes = "true",
         prompt                 = "consent",
-        state                  = str(employee_id),
+        state                  = state,
     )
 
-    # Store flow keyed by state so callback can retrieve it
-    _pending_flows[state] = flow
+    # Evict expired pending flows first — abandoned OAuth starts (user gets the
+    # URL but never returns) would otherwise leak Flow objects unbounded across
+    # the long-lived worker's lifetime. Then bind state → flow + employee_id (TTL).
+    now = time.time()
+    for _s in [k for k, v in _pending_flows.items() if v.get("exp", 0) < now]:
+        _pending_flows.pop(_s, None)
+    _pending_flows[state] = {"flow": flow, "employee_id": employee_id, "exp": now + 600}
     return auth_url
 
 
@@ -129,14 +135,17 @@ def handle_google_callback(code: str, state: str, db: Session) -> dict:
     Exchanges the authorization code for tokens.
     Uses the stored flow object to avoid PKCE mismatch.
     """
-    employee_id = int(state)
+    import time
 
-    # Retrieve the exact flow we created during auth URL generation
-    flow = _pending_flows.pop(state, None)
+    # Pull the SERVER-SIDE entry bound to this random state. employee_id comes from
+    # here, never from the state string (B4); the state is single-use + expiring,
+    # which closes the OAuth CSRF / account-linking hole.
+    entry = _pending_flows.pop(state, None)
+    if not entry or entry.get("exp", 0) < time.time():
+        raise ValueError("Invalid or expired OAuth state. Please start the connection again.")
 
-    if flow is None:
-        # Fallback: create a fresh flow (loses PKCE state but works for simple cases)
-        flow = _make_flow()
+    employee_id = entry["employee_id"]
+    flow = entry["flow"]
 
     # Allow http only for local/dev redirect URIs; production (https) stays strict.
     if GOOGLE_REDIRECT_URI.startswith("http://"):
@@ -174,6 +183,22 @@ def get_credentials(employee_id: int, db: Session) -> Credentials | None:
 
     token_data = _load_token_json(record.access_token)
 
+    # google-auth expects expiry as a NAIVE UTC datetime; our column is tz-aware.
+    # Passing it matters: without expiry, creds.expired is always False, so the
+    # proactive refresh below never runs and an expired token instead fails
+    # lazily INSIDE the first API call (bypassing the self-heal below).
+    # A NAIVE stored value (older rows / non-tz drivers) is treated as UTC —
+    # google-auth's own expiry is naive UTC, so that's the correct reading.
+    expiry = None
+    if record.token_expiry is not None:
+        try:
+            raw = record.token_expiry
+            if raw.tzinfo is None:
+                raw = raw.replace(tzinfo=timezone.utc)
+            expiry = raw.astimezone(timezone.utc).replace(tzinfo=None)
+        except Exception:
+            expiry = None
+
     creds = Credentials(
         token         = token_data.get("token"),
         refresh_token = token_data.get("refresh_token"),
@@ -181,12 +206,57 @@ def get_credentials(employee_id: int, db: Session) -> Credentials | None:
         client_id     = GOOGLE_CLIENT_ID,
         client_secret = GOOGLE_CLIENT_SECRET,
         scopes        = SCOPES,
+        expiry        = expiry,
     )
 
-    # Auto-refresh if expired
+    # Auto-refresh if expired. Two rules learned the hard way:
+    #  1. NEVER commit/rollback the CALLER's session here — callers (e.g. the
+    #     orchestrator's reschedule handler) may have their own uncommitted work
+    #     in flight; token maintenance runs on a PRIVATE short-lived session.
+    #  2. Only self-heal (delete the stored row → UI shows "reconnect") on
+    #     PERMANENT refresh failures (invalid_grant = revoked/expired refresh
+    #     token). Transient errors (network blip, Google 5xx) keep the token
+    #     and just report "not connected" for this one call.
     if creds.expired and creds.refresh_token:
-        creds.refresh(Request())
-        _save_tokens(employee_id, creds, db)
+        try:
+            creds.refresh(Request())
+        except Exception as e:
+            from google.auth.exceptions import RefreshError
+            from database.core import SessionLocal
+            _msg = str(e).lower()
+            _permanent = isinstance(e, RefreshError) and any(
+                k in _msg for k in ("invalid_grant", "invalid_client",
+                                    "unauthorized_client", "deleted_client")
+            )
+            # ASCII-only messages: an emoji here crashes with UnicodeEncodeError
+            # on cp1252 stdout (Windows), escaping this except mid-cleanup.
+            if _permanent:
+                print(f"[google_auth] token refresh failed permanently for employee "
+                      f"{employee_id}: {e} - clearing stored token.")
+                _tdb = SessionLocal()
+                try:
+                    _tdb.query(OAuthToken).filter(
+                        OAuthToken.employee_id == employee_id,
+                        OAuthToken.provider == "google",
+                    ).delete()
+                    _tdb.commit()
+                except Exception:
+                    _tdb.rollback()
+                finally:
+                    _tdb.close()
+            else:
+                print(f"[google_auth] transient token refresh error for employee "
+                      f"{employee_id}: {e} - keeping stored token.")
+            return None
+
+        # Refresh succeeded — persist the rotated token on a PRIVATE session so
+        # the caller's transaction is never committed as a side effect.
+        from database.core import SessionLocal
+        _tdb = SessionLocal()
+        try:
+            _save_tokens(employee_id, creds, _tdb)
+        finally:
+            _tdb.close()
 
     return creds
 
@@ -195,7 +265,15 @@ def get_credentials(employee_id: int, db: Session) -> Credentials | None:
 # SAVE TOKENS TO DB
 # ---------------------------------------------------------------------------
 def _save_tokens(employee_id: int, credentials: Credentials, db: Session):
-    """Upserts OAuth tokens for an employee."""
+    """Upserts OAuth tokens for an employee. NOTE: commits `db` — call it with a
+    dedicated session unless committing the caller's transaction is intended."""
+    # google-auth returns expiry as NAIVE UTC; our column is timestamptz. Storing
+    # it naive would make Postgres interpret it in the SERVER's timezone, shifting
+    # the instant by the UTC offset and silently defeating the proactive refresh.
+    expiry = credentials.expiry
+    if expiry is not None and expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+
     token_data = json.dumps({
         "token":         credentials.token,
         "refresh_token": credentials.refresh_token,
@@ -213,14 +291,14 @@ def _save_tokens(employee_id: int, credentials: Credentials, db: Session):
     encrypted = _encrypt(token_data)
     if existing:
         existing.access_token = encrypted
-        existing.token_expiry = credentials.expiry
+        existing.token_expiry = expiry
         existing.updated_at   = datetime.now(timezone.utc)
     else:
         db.add(OAuthToken(
             employee_id   = employee_id,
             provider      = "google",
             access_token  = encrypted,    # encrypted token JSON (Fernet, key in env)
-            token_expiry  = credentials.expiry,
+            token_expiry  = expiry,
             scope         = " ".join(SCOPES),
         ))
     db.commit()

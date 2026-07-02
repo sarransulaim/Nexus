@@ -45,13 +45,20 @@ def _require_self_or_manager(current_user: Employee, employee_id: int):
 # We redirect them to Google's consent screen
 # ---------------------------------------------------------------------------
 @router.get("/connect/{employee_id}")
-def connect_google(employee_id: int, db: Session = Depends(get_db)):
+def connect_google(
+    employee_id: int,
+    db: Session = Depends(get_db),
+    current_user: Employee = Depends(get_current_user),
+):
     """
-    Generates a Google OAuth URL and redirects the employee to it.
-    After they approve, Google sends them back to /callback.
+    Returns a Google OAuth URL for the AUTHENTICATED caller to open (B4). Auth is
+    required and you may only start a connect for yourself (managers: anyone), so
+    an attacker can't bind their Google account to someone else's employee id.
+    The frontend fetches this with its bearer token, then opens the returned URL.
     """
+    _require_self_or_manager(current_user, employee_id)
     auth_url = get_google_auth_url(employee_id)
-    return RedirectResponse(url=auth_url)
+    return {"auth_url": auth_url}
 
 
 # ---------------------------------------------------------------------------

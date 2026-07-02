@@ -34,6 +34,8 @@ pymupdf                   # PDF text extraction (fast, accurate)
 python-docx               # Word document extraction
 pandas                    # Excel/CSV processing
 openpyxl                  # Excel support for pandas
+numpy                     # RAG cosine similarity (rag.py imports it directly)
+apscheduler               # ALL background schedulers (briefings, digests, proactive, dep-mapping) - guarded imports silently disable if missing
 Pillow                    # Image processing
 
 # ── Async / HTTP ──────────────────────────────────────────────

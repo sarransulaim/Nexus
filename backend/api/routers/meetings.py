@@ -26,11 +26,21 @@ class MeetingUpdate(BaseModel):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def format_meeting(meeting: Meeting) -> dict:
+def format_meeting(meeting: Meeting, viewer: Employee = None) -> dict:
+    # `location` can now hold a Google Meet link (a joinable credential, not just
+    # a room name) — only managers and the meeting's own attendees get to see it.
+    # Everyone else still sees the meeting exists, just not how to join it.
+    location = meeting.location
+    if viewer is not None and viewer.system_role != "manager":
+        if viewer.id not in {a.id for a in meeting.attendees}:
+            location = None
     return {
         "id": meeting.id,
         "topic": meeting.topic,
         "scheduled_time": meeting.scheduled_time,
+        "scheduled_date": str(meeting.scheduled_date) if meeting.scheduled_date else None,
+        "duration_minutes": meeting.duration_minutes,
+        "location": location,
         # Return both the proper list AND a legacy comma string so the
         # existing frontend code doesn't break during transition
         "attendee_ids": ",".join(str(a.id) for a in meeting.attendees),
@@ -50,7 +60,7 @@ def get_all_meetings(
     current_user: Employee = Depends(get_current_user),
 ):
     meetings = db.query(Meeting).filter(Meeting.company_id == current_user.company_id).all()
-    return {"meetings": [format_meeting(m) for m in meetings]}
+    return {"meetings": [format_meeting(m, viewer=current_user) for m in meetings]}
 
 
 @router.post("/")

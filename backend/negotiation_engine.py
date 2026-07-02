@@ -158,7 +158,7 @@ class AgentNegotiator:
         Uses Claude to reason about the proposal.
         """
         try:
-            from api.claude_orchestrator import run_orchestrator
+            from api.claude_orchestrator import run_orchestrator, _negotiation_local
 
             # Ask the receiving agent if they can take the task
             proposal_prompt = (
@@ -171,10 +171,20 @@ class AgentNegotiator:
                 f"Respond with just ACCEPT or DECLINE: [reason]"
             )
 
-            response = run_orchestrator(
-                agent_id=f"Employee_{to_employee.id}",
-                command=proposal_prompt,
-            )
+            # Flag this thread as mid-negotiation so the candidate's orchestrator
+            # can't launch its OWN nested negotiation (negotiate_peer_help), which
+            # would re-enter the negotiation machinery and fan out unbounded
+            # AI-to-AI calls. The tool path sets this same guard — the background
+            # engine bypassed it, so nesting was possible from here. (#15)
+            _prev_neg = getattr(_negotiation_local, "active", False)
+            _negotiation_local.active = True
+            try:
+                response = run_orchestrator(
+                    agent_id=f"Employee_{to_employee.id}",
+                    command=proposal_prompt,
+                )
+            finally:
+                _negotiation_local.active = _prev_neg
 
             accepted = "ACCEPT" in response.upper()
 
@@ -257,7 +267,7 @@ class ManagerReporter:
             f"'{result.get('task')}' — "
             f"{'✅ Transferred' if result.get('accepted') else '❌ Declined'}"
         )
-        await notifier.broadcast(f"THOUGHT:{msg}")
+        await notifier.broadcast_to_managers(f"THOUGHT:{msg}")
         await notifier.broadcast("SYNC_REQUIRED")
 
     async def report_overload_resolution(self, employee_name: str, task_title: str, new_owner: str):
@@ -267,7 +277,7 @@ class ManagerReporter:
             f"'{task_title}' moved from {employee_name} → {new_owner}. "
             f"Team balance restored."
         )
-        await notifier.broadcast(f"THOUGHT:{msg}")
+        await notifier.broadcast_to_managers(f"THOUGHT:{msg}")
 
     async def report_deadline_alert(self, employee_name: str, task_count: int):
         """Alerts manager to unresolvable deadline conflicts."""
@@ -275,7 +285,7 @@ class ManagerReporter:
             f"Manager_1|[DEADLINE ALERT] {employee_name} has {task_count} tasks "
             f"due within 24 hours. Manual intervention may be needed."
         )
-        await notifier.broadcast(f"THOUGHT:{msg}")
+        await notifier.broadcast_to_managers(f"THOUGHT:{msg}")
 
 
 # ═══════════════════════════════════════════════════════════════
