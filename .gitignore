@@ -32,3 +32,6 @@ nexus-command/.vercel/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Vercel project links
+.vercel/
