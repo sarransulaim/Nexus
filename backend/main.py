@@ -39,7 +39,7 @@ print("✅ Schema managed via create_tables.py — Alembic auto-run disabled")
 
 from api.ws_manager import notifier
 from api.routers import tasks, employees, meetings, ai_commands, peer_requests, auth, notifications, goals, approvals
-from api.routers import analytics, files as files_router, integrations, mcp
+from api.routers import analytics, files as files_router, integrations, mcp, team_lead
 from api.google_router import router as google_router
 from database.core import SessionLocal
 from database.models import Task, Company, Employee
@@ -289,6 +289,7 @@ app.include_router(goals.router,         prefix="/api/v1/goals",         tags=["
 app.include_router(approvals.router,     prefix="/api/v1/approvals",     tags=["Approvals"])
 app.include_router(integrations.router,  prefix="/api/v1/integrations",  tags=["Integrations"])
 app.include_router(mcp.router,           prefix="/api/v1/mcp",           tags=["MCP / Connectors"])
+app.include_router(team_lead.router,     prefix="/api/v1/team-lead",     tags=["Team Lead"])
 app.include_router(analytics.router,     prefix="/api/v1/analytics",     tags=["Analytics"])
 app.include_router(google_router,        prefix="/api/v1/google",        tags=["Google Workspace"])
 app.include_router(ai_commands.router,   prefix="/api/v1/manager",       tags=["AI Swarm"])

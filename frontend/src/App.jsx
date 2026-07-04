@@ -21,6 +21,7 @@ import GoalsPage       from './pages/GoalsPage';
 import MeetingsPage    from './pages/MeetingsPage';
 import AdminPage       from './pages/AdminPage';
 import ConnectionsPage from './pages/ConnectionsPage';
+import TeamLeadPage    from './pages/TeamLeadPage';
 
 
 /* ─── Page metadata ──────────────────────────────────────────── */
@@ -32,6 +33,7 @@ const PAGE_META = {
   team:        { title: 'Team Matrix',       sub: 'Workload distribution and team coordination' },
   database:    { title: 'Database',          sub: 'Raw schema and AI-driven CRUD operations' },
   directives:  { title: 'My Directives',     sub: 'Tasks, meetings, and peer requests' },
+  myteam:      { title: 'My Team',           sub: 'Team workload, overdue work, and escalations at a glance' },
   analytics:   { title: 'Analytics',         sub: 'Performance metrics and productivity trends' },
   google:      { title: 'Google Workspace',  sub: 'Gmail, Calendar, and Drive integration' },
   integrations:{ title: 'Integrations',      sub: 'Connect your tools and services' },
@@ -104,7 +106,12 @@ function Sidebar({ currentUser, activeTab, setActiveTab, isSyncing, handleDiscon
     },
   ];
 
-  const sections = isManager ? managerSections : employeeSections;
+  let sections = isManager ? managerSections : employeeSections;
+  // Team leads keep the employee shell but get a live team dashboard —
+  // glanceable numbers are FREE (SQL), the AI is for reasoning.
+  if (!isManager && currentUser?.sysRole === 'team_lead') {
+    sections = [{ label: 'Lead', items: [{ id: 'myteam', label: 'My Team', icon: ICON.team }] }, ...employeeSections];
+  }
 
   return (
     <aside className="nx-sidebar">
@@ -497,6 +504,7 @@ function MainApp() {
           {activeTab === 'chat'         && <ChatPage />}
           {activeTab === 'team'         && <TeamMatrix />}
           {activeTab === 'directives'   && <Directives />}
+          {activeTab === 'myteam'       && <TeamLeadPage />}
           {activeTab === 'database'     && <Database />}
           {activeTab === 'analytics'    && <Analytics />}
           {activeTab === 'google'       && <GoogleWorkspace />}

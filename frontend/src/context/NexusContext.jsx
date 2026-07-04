@@ -443,6 +443,19 @@ export function NexusProvider({ children }) {
       fetchDashboardData();
       connectWebSocket();
 
+      // Sessions created before sysRole existed: backfill it once from /auth/me
+      // (team leads logged in with an old session would otherwise miss My Team).
+      if (currentUser.sysRole === undefined) {
+        axios.get(`${BACKEND_URL}/api/v1/auth/me`).then(r => {
+          setCurrentUser(prev => {
+            if (!prev) return prev;
+            const upd = { ...prev, sysRole: r.data?.role };
+            sessionStorage.setItem('nexus_user', JSON.stringify(upd));
+            return upd;
+          });
+        }).catch(() => {});
+      }
+
       // Polling fallback: fires every 60s — only triggers a refresh if WS isn't connected
       pollIntervalRef.current = setInterval(() => {
         const wsOpen = wsRef.current?.readyState === WebSocket.OPEN;
@@ -664,6 +677,7 @@ export function NexusProvider({ children }) {
 
       const userObj = {
         role: user.role === 'manager' ? 'Manager' : 'Employee',
+        sysRole: user.role,   // raw system_role: manager | team_lead | employee
         dbId: user.id,
         name: user.name,
         team: user.team,
