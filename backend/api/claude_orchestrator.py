@@ -93,6 +93,76 @@ def _audit_tool_execution(agent_id: str, tool_name: str, tool_input: dict, resul
 
 
 # ---------------------------------------------------------------------------
+# STRUCTURED NEGOTIATION DECISIONS
+# Agent-to-agent negotiation replies are free text (the responding agent
+# deliberates with its real tools/memory). The VERDICT, however, must never be
+# parsed with string matching — the old `"ACCEPT" in response.upper()` check
+# treated "I can't ACCEPT more work" as an acceptance and mutated org data on
+# a parsing bug. This extractor converts the reply into a schema-enforced
+# decision via forced tool use, and FAILS CLOSED (decline) on any ambiguity.
+# ---------------------------------------------------------------------------
+NEGOTIATION_DECISION_TOOL = {
+    "name": "record_decision",
+    "description": "Record the final decision extracted from a colleague's negotiation response.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "decision": {"type": "string", "enum": ["accept", "decline", "counter"],
+                         "description": "accept = clear unconditional yes; counter = yes WITH conditions "
+                                        "or an alternative offer; decline = no, unsure, or ambiguous"},
+            "reason": {"type": "string", "description": "one short sentence in the responder's own words"},
+            "counter_proposal": {"type": "string",
+                                 "description": "only when decision=counter: the exact condition/alternative offered "
+                                                "(e.g. 'can take it, but only after Friday')"},
+        },
+        "required": ["decision", "reason"],
+    },
+}
+
+
+def extract_negotiation_decision(request_summary: str, response_text: str) -> dict:
+    """Free-text negotiation reply → {"decision": accept|decline|counter, "reason", "counter_proposal"}.
+    Forced tool choice guarantees a parseable result; errors return decline."""
+    try:
+        resp = claude_client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=300,
+            tools=[NEGOTIATION_DECISION_TOOL],
+            tool_choice={"type": "tool", "name": "record_decision"},
+            messages=[{
+                "role": "user",
+                "content": (
+                    "A colleague's AI was asked:\n"
+                    f"<request>{(request_summary or '')[:800]}</request>\n\n"
+                    "It replied:\n"
+                    f"<response>{(response_text or '')[:2000]}</response>\n\n"
+                    "Record the decision. 'accept' ONLY if the reply clearly and unconditionally "
+                    "agrees to take the work. 'counter' ONLY if it agrees contingent on a SPECIFIC, "
+                    "concrete condition (a date, a prerequisite task, a scope limit) — and then "
+                    "counter_proposal MUST state that condition. Vague hedging ('maybe', 'it depends') "
+                    "with no concrete condition is 'decline'. 'decline' for refusals, hedging, "
+                    "uncertainty, errors, or anything ambiguous."
+                ),
+            }],
+        )
+        for block in resp.content:
+            if block.type == "tool_use" and block.name == "record_decision":
+                d = dict(block.input)
+                if d.get("decision") not in ("accept", "decline", "counter"):
+                    d["decision"] = "decline"
+                d.setdefault("reason", "")
+                d.setdefault("counter_proposal", "")
+                # Deterministic backstop: a counter MUST carry a concrete condition —
+                # a condition-less "counter" is hedging, and hedging never moves work.
+                if d["decision"] == "counter" and not str(d["counter_proposal"]).strip():
+                    d["decision"] = "decline"
+                return d
+    except Exception as e:
+        print(f"[negotiation] decision extraction failed: {e} - failing closed (decline)")
+    return {"decision": "decline", "reason": "could not reliably determine the decision", "counter_proposal": ""}
+
+
+# ---------------------------------------------------------------------------
 # BROADCAST HELPER
 # Centralised SYNC_REQUIRED fire-and-forget used by all DB-writing tools.
 # ---------------------------------------------------------------------------
@@ -2870,6 +2940,7 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             )
 
             # Try top 3 candidates
+            decline_reasons = []
             for score, candidate, active_count in scored[:3]:
 
                 glass_brain_queue.put(
@@ -2887,10 +2958,12 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
                     f"1. Call get_my_tasks with employee_id={candidate.id} to see your current workload\n"
                     f"2. If you have Google Calendar connected, call check_my_calendar with employee_id={candidate.id} "
                     f"to check for schedule conflicts\n\n"
-                    f"Based on your ACTUAL workload and schedule:\n"
-                    f"- If you have capacity, reply: ACCEPT — [brief reason, e.g. 'I have 1 task and free afternoons']\n"
-                    f"- If you're too busy, reply: DECLINE — [brief reason, e.g. 'I have 4 tasks and 3 meetings this week']\n\n"
-                    f"Start your reply with exactly ACCEPT or DECLINE."
+                    f"Then answer in plain language, based on your ACTUAL workload and schedule:\n"
+                    f"- If you clearly have capacity: agree to help and say why it fits.\n"
+                    f"- If you could help only under a condition (after a date, limited hours, after finishing "
+                    f"a specific task, only part of the work): say EXACTLY what condition — a conditional yes "
+                    f"is often more useful than a no.\n"
+                    f"- If you genuinely can't: say no and give the concrete reason."
                 )
 
                 # Call the candidate's personal AI — this is the actual AI-to-AI negotiation.
@@ -2910,14 +2983,22 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
                     f"Employee_{requester_id}|[GLASS BRAIN] 💬 {candidate.name}'s AI: {agent_response[:120]}..."
                 )
 
-                if "ACCEPT" in agent_response.upper():
-                    # AI-to-AI agreed — now create the peer request for human confirmation
+                # STRUCTURED VERDICT — never substring-parse the free-text reply.
+                verdict  = extract_negotiation_decision(negotiation_prompt, agent_response)
+                decision = verdict["decision"]
+                condition = (verdict.get("counter_proposal") or "").strip()
+
+                if decision in ("accept", "counter"):
+                    # AI-to-AI agreed (possibly with a condition) — create the peer
+                    # request for HUMAN confirmation, with the condition surfaced so
+                    # the humans approve exactly what was offered.
+                    _cond_note = f" (on one condition: {condition})" if decision == "counter" and condition else ""
                     req = PeerRequest(
                         company_id=DEFAULT_COMPANY_ID,
                         task_id=task_id,
                         sender_id=requester_id,
                         recipient_id=candidate.id,
-                        topic=help_description,
+                        topic=help_description + _cond_note,
                         status="Pending",
                     )
                     db.add(req)
@@ -2930,7 +3011,7 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
                         title="AI-Negotiated Help Request",
                         message=(
                             f"Your AI reviewed your workload and schedule and agreed to help "
-                            f"{requester.name} with '{task.title}'. "
+                            f"{requester.name} with '{task.title}'{_cond_note}. "
                             f"Please confirm: {help_description}"
                         ),
                     ))
@@ -2942,8 +3023,8 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
                         type="peer_request",
                         title="Help Negotiated Successfully",
                         message=(
-                            f"{candidate.name}'s AI reviewed their schedule and agreed to help with '{task.title}'. "
-                            f"Waiting for {candidate.name}'s final confirmation."
+                            f"{candidate.name}'s AI reviewed their schedule and agreed to help with '{task.title}'"
+                            f"{_cond_note}. Waiting for {candidate.name}'s final confirmation."
                         ),
                     ))
 
@@ -2952,7 +3033,8 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
 
                     glass_brain_queue.put(
                         f"Employee_{requester_id}|[GLASS BRAIN] ✅ Negotiation complete — "
-                        f"{candidate.name}'s AI accepted. Request sent for human confirmation."
+                        f"{candidate.name}'s AI {'accepted' if decision == 'accept' else 'offered a conditional yes'}. "
+                        f"Request sent for human confirmation."
                     )
 
                     return (
@@ -2960,14 +3042,17 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
                         f"workload and schedule and agreed to help with '{task.title}'. "
                         f"A peer request has been sent to {candidate.name} — they'll see it on their "
                         f"dashboard and give the final yes or no. "
-                        f"You'll get a notification once they confirm."
+                        + (f"Their condition: {condition}. " if _cond_note else "")
+                        + f"You'll get a notification once they confirm."
                     )
 
                 else:
-                    # This candidate's AI declined — try the next one
+                    # This candidate's AI declined — record why, try the next one
+                    _why = (verdict.get("reason") or "").strip()
+                    decline_reasons.append(f"{candidate.name}: {_why or 'no reason given'}")
                     glass_brain_queue.put(
-                        f"Employee_{requester_id}|[GLASS BRAIN] ❌ {candidate.name}'s AI declined. "
-                        f"Trying next candidate..."
+                        f"Employee_{requester_id}|[GLASS BRAIN] ❌ {candidate.name}'s AI declined"
+                        f"{' — ' + _why[:80] if _why else ''}. Trying next candidate..."
                     )
                     continue
 
@@ -2984,7 +3069,8 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
                 to_agent_id="Manager_1",
                 reason=(
                     f"{requester.name} needs help with '{task.title}' ({help_description}) "
-                    f"but all available colleagues' AIs are at capacity."
+                    f"but all available colleagues' AIs declined. "
+                    + (f"Reasons — {'; '.join(decline_reasons[:3])}" if decline_reasons else "")
                 ),
                 context_json=json.dumps({
                     "task_id":  task_id,

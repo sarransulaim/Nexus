@@ -166,9 +166,10 @@ class AgentNegotiator:
                 f"They want to transfer this task to you: '{task.title}' "
                 f"(Priority: {task.priority}, Due: {task.due_date}). "
                 f"Check your current workload using get_my_tasks with employee_id={to_employee.id}. "
-                f"If you have capacity, accept by saying ACCEPT. "
-                f"If you're also too busy, say DECLINE with a brief reason. "
-                f"Respond with just ACCEPT or DECLINE: [reason]"
+                f"Then answer in plain language: agree to take it if you clearly have capacity; "
+                f"if you could take it only under a condition (after a date, after finishing a "
+                f"specific task), say exactly what condition; if you genuinely can't, say no with "
+                f"the concrete reason."
             )
 
             # Flag this thread as mid-negotiation so the candidate's orchestrator
@@ -186,10 +187,19 @@ class AgentNegotiator:
             finally:
                 _negotiation_local.active = _prev_neg
 
-            accepted = "ACCEPT" in response.upper()
+            # STRUCTURED VERDICT — the old `"ACCEPT" in response.upper()` check
+            # treated "I can't ACCEPT more work" as a yes and transferred the task.
+            # Only a clear unconditional accept executes an autonomous transfer;
+            # a conditional yes (counter) is surfaced to the manager, not executed.
+            from api.claude_orchestrator import extract_negotiation_decision
+            verdict  = extract_negotiation_decision(proposal_prompt, response)
+            accepted = verdict["decision"] == "accept"
 
             return {
                 "accepted":    accepted,
+                "decision":    verdict["decision"],
+                "reason":      verdict.get("reason", ""),
+                "counter_proposal": verdict.get("counter_proposal", ""),
                 "response":    response,
                 "from":        from_employee.name,
                 "to":          to_employee.name,
@@ -261,11 +271,19 @@ class ManagerReporter:
 
     async def broadcast_negotiation_result(self, result: dict):
         """Broadcasts negotiation outcome to the Glass Brain."""
+        decision = result.get("decision") or ("accept" if result.get("accepted") else "decline")
+        if result.get("accepted"):
+            outcome = "✅ Transferred"
+        elif decision == "counter":
+            cond = (result.get("counter_proposal") or "").strip()
+            outcome = f"🤝 Conditional offer{': ' + cond[:100] if cond else ''} (not executed — your call)"
+        else:
+            why = (result.get("reason") or "").strip()
+            outcome = f"❌ Declined{' — ' + why[:100] if why else ''}"
         msg = (
             f"Manager_1|[NEXUS NEGOTIATION] "
             f"Agent {result.get('from')} ↔ Agent {result.get('to')}: "
-            f"'{result.get('task')}' — "
-            f"{'✅ Transferred' if result.get('accepted') else '❌ Declined'}"
+            f"'{result.get('task')}' — {outcome}"
         )
         await notifier.broadcast_to_managers(f"THOUGHT:{msg}")
         await notifier.broadcast("SYNC_REQUIRED")
