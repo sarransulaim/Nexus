@@ -80,8 +80,12 @@ def assess_contract_drift(contract_name: str, contract_description: str,
                 f"<before>{(old_snapshot or '')[:1200]}</before>\n\n"
                 "After the change:\n"
                 f"<after>{(new_content or '')[:1200]}</after>\n\n"
-                "Does this change plausibly affect what the producer promised to hand the "
-                "consumer? Judge against the CONTRACT, not against style."
+                "Does this CHANGE plausibly affect what the producer promised to hand the "
+                "consumer? Judge ONLY the difference between before and after — anything "
+                "present in BOTH was already accepted when the baseline was agreed and is "
+                "NOT new drift, even if it seems to conflict with the contract. Style, "
+                "wording, and scope notes that don't alter the handed-over interface are "
+                "not drift."
             )}],
         )
         for block in resp.content:

@@ -63,6 +63,17 @@ def test_contract_define_view_and_drift():
     finally:
         s.close()
 
+    # Start the producer from a KNOWN clean description and restore it after —
+    # otherwise each run's appended edits pollute the next run's baseline.
+    s = SessionLocal()
+    try:
+        t = s.query(Task).filter(Task.id == pid).first()
+        original_desc = t.description
+        t.description = "Deliver the payments endpoint returning a JSON payload."
+        s.commit()
+    finally:
+        s.close()
+
     try:
         # define via the real orchestrator tool handler
         out = co.execute_tool("define_contract", {
@@ -124,3 +135,10 @@ def test_contract_define_view_and_drift():
             s.close()
     finally:
         _wipe_drift()
+        s = SessionLocal()
+        try:
+            t = s.query(Task).filter(Task.id == pid).first()
+            t.description = original_desc
+            s.commit()
+        finally:
+            s.close()
