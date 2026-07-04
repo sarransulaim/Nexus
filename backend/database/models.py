@@ -875,7 +875,19 @@ class MCPConnection(Base):
     url            = Column(String(500), nullable=False)   # the MCP server URL (must be publicly reachable)
     auth_token_enc = Column(Text, nullable=True)           # Fernet-encrypted token (never returned to clients)
     enabled        = Column(Boolean, default=True)
+    # ── One-click OAuth (MCP authorization spec) ──────────────────
+    # auth_type "oauth" rows hold a refreshable token obtained via the MCP
+    # OAuth flow (DCR + PKCE); "token" rows are legacy pasted API keys.
+    auth_type              = Column(String(20), default="token")
+    refresh_token_enc      = Column(Text, nullable=True)
+    token_expires_at       = Column(DateTime(timezone=True), nullable=True)
+    oauth_client_id        = Column(String(300), nullable=True)
+    oauth_client_secret_enc = Column(Text, nullable=True)
+    oauth_token_endpoint   = Column(String(500), nullable=True)
+    # NULL owner = company-shared (legacy). OAuth connections are PER-USER —
+    # the token represents that person's consent at the provider.
+    owner_id       = Column(Integer, ForeignKey("employees.id", ondelete="CASCADE"), nullable=True, index=True)
     created_at     = Column(DateTime(timezone=True), default=_now)
     updated_at     = Column(DateTime(timezone=True), default=_now, onupdate=_now)
 
-    __table_args__ = (UniqueConstraint("company_id", "app", name="uq_mcp_company_app"),)
+    __table_args__ = (UniqueConstraint("company_id", "app", "owner_id", name="uq_mcp_company_app_owner"),)

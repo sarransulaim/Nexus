@@ -4006,36 +4006,60 @@ def assemble_context_snapshot(agent_id: str, is_employee: bool, emp_id: int = No
     )
 
 
-def _load_mcp_servers() -> list:
-    """Enabled MCP connections for the company → remote-connector server defs for
-    Anthropic's MCP connector. Returns [] when none, so the orchestrator stays on
-    the standard (non-beta) path and behaves exactly as before."""
+def _load_mcp_servers(own_employee_id: int = None) -> list:
+    """Enabled MCP connections → remote-connector server defs for Anthropic's
+    MCP connector. Returns [] when none, so the orchestrator stays on the
+    standard (non-beta) path and behaves exactly as before.
+
+    Visibility: company-SHARED connections (owner_id NULL — pasted tokens) plus
+    the CALLER'S OWN per-user OAuth connections. One user's OAuth consent is
+    never attached to someone else's agent.
+
+    OAuth tokens are refreshed here when near expiry (own short session), and
+    a connection whose token can't be produced is SKIPPED — attaching it
+    tokenless would 401 every AI call for the company."""
     try:
+        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
         from database.models import MCPConnection
-        from api.token_crypto import decrypt_secret
+        from api.token_crypto import decrypt_secret, encrypt_secret
+        from api import mcp_oauth
         db = SessionLocal()
         try:
-            rows = db.query(MCPConnection).filter(
+            q = db.query(MCPConnection).filter(
                 MCPConnection.company_id == DEFAULT_COMPANY_ID,
                 MCPConnection.enabled == True,  # noqa: E712
-            ).all()
+            )
+            if own_employee_id is None:
+                q = q.filter(MCPConnection.owner_id.is_(None))
+            else:
+                q = q.filter((MCPConnection.owner_id.is_(None))
+                             | (MCPConnection.owner_id == own_employee_id))
+            rows = q.all()
+
+            servers = []
+            for c in rows:
+                # Near-expiry OAuth token → refresh in place (commit per row).
+                if (c.auth_type == "oauth" and c.token_expires_at is not None):
+                    _exp = c.token_expires_at
+                    if _exp.tzinfo is None:
+                        _exp = _exp.replace(tzinfo=_tz.utc)
+                    if _exp <= _dt.now(_tz.utc) + _td(seconds=120):
+                        if mcp_oauth.refresh(c, decrypt_secret, encrypt_secret):
+                            db.commit()
+                        else:
+                            print(f"⚠️  MCP '{c.app}': token expired and refresh failed — skipping it.")
+                            continue
+                s = {"type": "url", "name": c.app, "url": c.url}
+                if c.auth_token_enc:
+                    try:
+                        s["authorization_token"] = decrypt_secret(c.auth_token_enc)
+                    except Exception:
+                        print(f"⚠️  MCP '{c.app}': stored token won't decrypt — skipping it.")
+                        continue
+                servers.append(s)
+            return servers
         finally:
             db.close()
-        servers = []
-        for c in rows:
-            s = {"type": "url", "name": c.app, "url": c.url}
-            if c.auth_token_enc:
-                try:
-                    s["authorization_token"] = decrypt_secret(c.auth_token_enc)
-                except Exception:
-                    # Token can't be decrypted (e.g. key changed). SKIP this
-                    # connection rather than attach an UNauthenticated server —
-                    # attaching it tokenless would 401 and break EVERY AI call
-                    # for the company, not just this one connector.
-                    print(f"⚠️  MCP '{c.app}': stored token won't decrypt — skipping it.")
-                    continue
-            servers.append(s)
-        return servers
     except Exception as e:
         print(f"⚠️  MCP load failed (continuing without MCP): {e}")
         return []
@@ -4105,7 +4129,19 @@ def run_orchestrator(agent_id: str, command: str, extra_context: str = None) -> 
     # tier — MCP tools run server-side, OUTSIDE the execute_tool allow-list, so an
     # @mention in a public channel could otherwise reach the company's GitHub/DB
     # connectors. Manager + employees (authenticated, private DM/web) still get MCP.
-    mcp_servers = [] if is_team else _load_mcp_servers()
+    if is_team:
+        mcp_servers = []
+    else:
+        # Per-user visibility: shared connections + the CALLER's own OAuth ones.
+        _own = emp_id
+        if _own is None:   # manager — resolve their Employee row (single-tenant)
+            _mdb0 = SessionLocal()
+            try:
+                _mgr0 = _mdb0.query(Employee).filter(Employee.system_role == "manager").first()
+                _own = _mgr0.id if _mgr0 else None
+            finally:
+                _mdb0.close()
+        mcp_servers = _load_mcp_servers(_own)
     if mcp_servers:
         tools = list(tools) + [{"type": "mcp_toolset", "mcp_server_name": s["name"]} for s in mcp_servers]
         print(f"🔌 MCP: {len(mcp_servers)} source(s) attached → {[s['name'] for s in mcp_servers]}")

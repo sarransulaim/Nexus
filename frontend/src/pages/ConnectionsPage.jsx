@@ -252,12 +252,12 @@ function SlackCard({ linked, authHeaders, onChange, setError }) {
 
 /* ── MCP enterprise apps / data sources ───────────────────────── */
 const MCP_CATALOG = [
-  { app: 'github',    label: 'GitHub',            color: '#6e5494', url: 'https://api.githubcopilot.com/mcp/', hint: 'Read-only PAT (repo) — repos, PRs, issues.' },
-  { app: 'notion',    label: 'Notion',            color: '#111111', url: 'https://mcp.notion.com/mcp',         hint: 'Notion internal integration token.' },
-  { app: 'linear',    label: 'Linear',            color: '#5E6AD2', url: 'https://mcp.linear.app/mcp',         hint: 'Linear API key / OAuth token.' },
-  { app: 'atlassian', label: 'Jira / Confluence', color: '#0052CC', url: 'https://mcp.atlassian.com/v1/sse',   hint: 'Atlassian API token.' },
+  { app: 'github',    label: 'GitHub',            color: '#6e5494', url: 'https://api.githubcopilot.com/mcp/', oauth: true, hint: 'One click — repos, PRs, issues.' },
+  { app: 'notion',    label: 'Notion',            color: '#111111', url: 'https://mcp.notion.com/mcp',         oauth: true, hint: 'One click — pages & databases.' },
+  { app: 'linear',    label: 'Linear',            color: '#5E6AD2', url: 'https://mcp.linear.app/mcp',         oauth: true, hint: 'One click — issues & projects.' },
+  { app: 'atlassian', label: 'Jira / Confluence', color: '#0052CC', url: 'https://mcp.atlassian.com/v1/sse',   oauth: true, hint: 'One click — issues & docs.' },
   { app: 'postgres',  label: 'Postgres',          color: '#336791', url: '',                                    hint: 'Public URL of your Postgres MCP server.' },
-  { app: 'custom',    label: 'Custom MCP server', color: '#10b981', url: '',                                    hint: 'Any MCP server — paste its URL + token.' },
+  { app: 'custom',    label: 'Custom MCP server', color: '#10b981', url: '',                                    hint: 'Any MCP server — OAuth if it supports it, or URL + token.' },
 ];
 
 function MCPCard({ app, connected, authHeaders, onChange, setError }) {
@@ -265,8 +265,35 @@ function MCPCard({ app, connected, authHeaders, onChange, setError }) {
   const [url, setUrl] = useState(app.url);
   const [token, setToken] = useState('');
   const [busy, setBusy] = useState(false);
+  const pollRef = useRef(null);
+  useEffect(() => () => { if (pollRef.current) clearInterval(pollRef.current); }, []);
 
-  const connect = async () => {
+  // One-click OAuth: backend does discovery + registration, we open the
+  // provider's consent page; the callback page postMessages us when done.
+  const oauthConnect = async (customUrl) => {
+    const target = (customUrl ?? app.url).trim();
+    if (!target) { setError('Enter the MCP server URL first.'); return; }
+    setBusy(true); setError(null);
+    try {
+      const res = await axios.post(`${BACKEND_URL}/api/v1/mcp/oauth/start`,
+        { app: app.app, label: app.label, url: target }, { headers: authHeaders() });
+      const popup = window.open(res.data.authorize_url, 'nexus-mcp-oauth', 'width=560,height=720');
+      if (!popup) { setError('Popup blocked — allow popups for this site and try again.'); setBusy(false); return; }
+      const cleanup = () => {
+        window.removeEventListener('message', onMsg);
+        if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null; }
+        setBusy(false); setOpen(false); onChange();
+      };
+      const onMsg = (ev) => { if (ev.data?.type === 'nexus-mcp-oauth') cleanup(); };
+      window.addEventListener('message', onMsg);
+      pollRef.current = setInterval(() => { if (popup.closed) cleanup(); }, 1200);
+    } catch (e) {
+      setError(e.response?.data?.detail || 'Could not start the OAuth connection.');
+      setBusy(false);
+    }
+  };
+
+  const connectToken = async () => {
     if (!url.trim()) { setError('Enter the MCP server URL.'); return; }
     setBusy(true);
     try {
@@ -284,20 +311,31 @@ function MCPCard({ app, connected, authHeaders, onChange, setError }) {
   const expand = (open && !connected) ? (
     <div style={{ marginTop: 10 }}>
       <input className="nx-input" value={url} onChange={e => setUrl(e.target.value)} placeholder="MCP server URL (https://…)" style={{ marginBottom: 6 }} />
-      <input className="nx-input" type="password" value={token} onChange={e => setToken(e.target.value)} placeholder="Auth token (encrypted)" style={{ marginBottom: 8 }} />
-      <div style={{ display: 'flex', gap: 8 }}>
-        <button className="btn btn-primary btn-sm" onClick={connect} disabled={busy}>{busy ? 'Connecting…' : 'Connect'}</button>
+      <input className="nx-input" type="password" value={token} onChange={e => setToken(e.target.value)} placeholder="API token (encrypted at rest)" style={{ marginBottom: 8 }} />
+      <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        <button className="btn btn-primary btn-sm" onClick={connectToken} disabled={busy}>{busy ? 'Connecting…' : 'Connect with token'}</button>
+        <button className="btn btn-ghost btn-sm" onClick={() => oauthConnect(url)} disabled={busy}>Try OAuth instead</button>
         <button className="btn btn-ghost btn-sm" onClick={() => { setOpen(false); setToken(''); }}>Cancel</button>
       </div>
     </div>
   ) : null;
 
+  const subLine = connected
+    ? <span style={{ color: 'var(--green)' }}>
+        ✓ Connected{connected.enabled ? '' : ' (off)'}{connected.auth_type === 'oauth' ? ' · OAuth' : ''}{connected.shared ? ' · shared' : ' · only you'}
+      </span>
+    : app.hint;
+
   return (
-    <ConnCard logo={<Logo color={app.color} />} name={app.label}
-              sub={connected ? <span style={{ color: 'var(--green)' }}>✓ Connected{connected.enabled ? '' : ' (off)'}</span> : app.hint} expand={expand}>
+    <ConnCard logo={<Logo color={app.color} />} name={app.label} sub={subLine} expand={expand}>
       {connected
         ? <button className="btn btn-ghost btn-sm" onClick={disconnect}>Disconnect</button>
-        : !open && <button className="btn btn-primary btn-sm" onClick={() => setOpen(true)}>Connect</button>}
+        : app.oauth
+          ? <>
+              <button className="btn btn-primary btn-sm" onClick={() => oauthConnect()} disabled={busy}>{busy ? 'Waiting…' : 'Connect'}</button>
+              {!open && <button className="btn btn-ghost btn-sm" onClick={() => setOpen(true)} title="Use an API token instead">⋯</button>}
+            </>
+          : !open && <button className="btn btn-primary btn-sm" onClick={() => setOpen(true)}>Connect</button>}
     </ConnCard>
   );
 }
