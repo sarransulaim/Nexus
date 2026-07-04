@@ -78,6 +78,12 @@ def link_channel(
         raise HTTPException(status_code=400, detail="Unsupported platform.")
 
     if platform == "whatsapp":
+        # Require an explicit country code: "2605550123" would otherwise be
+        # normalized to +260... — Zambia, not Indiana. (Seen in the wild.)
+        if not payload.identifier.strip().startswith("+"):
+            raise HTTPException(status_code=400,
+                                detail="Include the country code with a leading + "
+                                       "(e.g. +1 260 555 0123 for a US number).")
         identifier = tw.normalize_phone(payload.identifier)
         if not identifier or len(identifier) < 8:
             raise HTTPException(status_code=400, detail="Invalid phone number.")

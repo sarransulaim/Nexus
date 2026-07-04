@@ -139,8 +139,30 @@ def send_whatsapp(to_phone: str, body: str) -> dict:
             to=to,
             body=body,
         )
-        log.info(f"WhatsApp sent to {to}: SID={message.sid}")
-        return {"success": True, "sid": message.sid, "status": message.status}
+        # WhatsApp failures are often ASYNC: Twilio ACCEPTS the message and it
+        # fails a moment later (e.g. 63015 = recipient hasn't joined the
+        # sandbox). Without this check the caller reports "sent" while nothing
+        # ever arrives. Poll briefly for a terminal status so failures surface.
+        import time as _time
+        status, err_code = message.status, None
+        try:
+            for _ in range(2):
+                if status in ("failed", "undelivered", "sent", "delivered", "read"):
+                    break
+                _time.sleep(1.5)
+                m2 = client.messages(message.sid).fetch()
+                status, err_code = m2.status, m2.error_code
+        except Exception:
+            pass  # status polling is best-effort — never turn a sent message into an error
+        if status in ("failed", "undelivered"):
+            if err_code == 63015:
+                return {"success": False, "error": (
+                    "this number hasn't joined the Twilio WhatsApp sandbox (or the join "
+                    "expired — it lapses after 72h of inactivity). From WhatsApp, send "
+                    "'join <your-sandbox-phrase>' to +1 415 523 8886, then try again.")}
+            return {"success": False, "error": f"message {status} (Twilio error {err_code})"}
+        log.info(f"WhatsApp sent to {to}: SID={message.sid} status={status}")
+        return {"success": True, "sid": message.sid, "status": status}
     except Exception as e:
         log.error(f"WhatsApp send failed to {to}: {e}")
         return {"success": False, "error": str(e)}
