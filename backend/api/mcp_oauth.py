@@ -125,16 +125,41 @@ def register_client(registration_endpoint: str) -> dict:
     return {"client_id": data["client_id"], "client_secret": data.get("client_secret", "")}
 
 
+# Sensible default scopes for providers that need an explicit scope parameter
+# (override per deployment with MCP_SCOPE_<APP>).
+PROVIDER_DEFAULT_SCOPES = {"github": "repo read:org read:user"}
+
+
+def _env_key(app: str) -> str:
+    import re as _re
+    return _re.sub(r"[^A-Z0-9]", "_", app.upper())
+
+
 def start_flow(server_url: str, app: str, label: str,
                employee_id: int, company_id: int) -> str:
     """Discovery + registration + authorize-URL. Returns the URL to open."""
     meta = discover(server_url)
-    if not meta.get("registration_endpoint"):
+    k = _env_key(app)
+    scope = os.getenv(f"MCP_SCOPE_{k}", PROVIDER_DEFAULT_SCOPES.get(app.lower(), ""))
+
+    client = None
+    if meta.get("registration_endpoint"):
+        client = register_client(meta["registration_endpoint"])
+    else:
+        # Providers WITHOUT Dynamic Client Registration (e.g. GitHub) need a
+        # one-time pre-registered OAuth app; after that, one-click works for
+        # everyone. Callback URL for the provider's app config: REDIRECT_URI.
+        cid = os.getenv(f"MCP_CLIENT_ID_{k}", "").strip()
+        if cid:
+            client = {"client_id": cid,
+                      "client_secret": os.getenv(f"MCP_CLIENT_SECRET_{k}", "").strip()}
+    if client is None:
         raise ValueError(
-            "This server's OAuth doesn't support automatic app registration. "
-            "Use the Advanced option with an API token, or contact the provider."
+            f"{label} doesn't support automatic app registration. Use the Advanced option "
+            f"with an API token — or (one-time admin setup) register an OAuth app at the "
+            f"provider with callback URL {REDIRECT_URI} and set MCP_CLIENT_ID_{k} + "
+            f"MCP_CLIENT_SECRET_{k} on the server, then one-click works for everyone."
         )
-    client = register_client(meta["registration_endpoint"])
 
     state    = secrets.token_urlsafe(32)
     verifier = _b64url(secrets.token_bytes(48))
@@ -165,6 +190,8 @@ def start_flow(server_url: str, app: str, label: str,
         "code_challenge_method": "S256",
         "resource": meta["resource"],
     }
+    if scope:
+        q["scope"] = scope
     return f"{meta['authorization_endpoint']}{'&' if '?' in meta['authorization_endpoint'] else '?'}{urlencode(q)}"
 
 
