@@ -1,0 +1,156 @@
+"""Synthetic project fixtures with KNOWN dependency graphs (the gold labels).
+
+Each fixture: {"name", "tasks": [{id,title,description,owner}], "gold": [(producer_id, consumer_id), ...]}
+Two fixtures have NO dependencies at all — they measure over-prediction.
+Descriptions are written like a real manager would write them: the dependency
+is inferable from what the work consumes, never stated as "depends on task N".
+"""
+
+FIXTURES = [
+    {
+        "name": "E-commerce checkout revamp",
+        "tasks": [
+            {"id": 1, "title": "Build payments API", "owner": "Dana",
+             "description": "Implement the /payments endpoints: create-intent, capture, refund. Returns JSON with payment_id, status, receipt_url."},
+            {"id": 2, "title": "Checkout UI", "owner": "Leo",
+             "description": "New checkout flow screens. Calls the payments endpoints to create and capture payments, renders the receipt from the response."},
+            {"id": 3, "title": "Order confirmation emails", "owner": "Mia",
+             "description": "Send confirmation email after successful capture, including the receipt_url from the payment response."},
+            {"id": 4, "title": "Update pricing page copy", "owner": "Sam",
+             "description": "Refresh the marketing pricing page wording for the new plans."},
+            {"id": 5, "title": "End-to-end checkout QA", "owner": "Iris",
+             "description": "Test the full checkout flow in staging once the new checkout screens are complete."},
+        ],
+        "gold": [(1, 2), (1, 3), (2, 5)],
+    },
+    {
+        "name": "Mobile app login",
+        "tasks": [
+            {"id": 1, "title": "Design system components", "owner": "Ava",
+             "description": "Figma component library: buttons, inputs, error states, typography tokens."},
+            {"id": 2, "title": "Login screens", "owner": "Ben",
+             "description": "Build the login and signup screens using the component library."},
+            {"id": 3, "title": "Auth API", "owner": "Cleo",
+             "description": "Backend endpoints for signup, login, refresh; JWT in the response body."},
+            {"id": 4, "title": "Wire login to backend", "owner": "Ben",
+             "description": "Connect the finished login screens to the auth endpoints, store the JWT, handle error states."},
+            {"id": 5, "title": "App store listing", "owner": "Dee",
+             "description": "Screenshots and store description for the release."},
+        ],
+        "gold": [(1, 2), (2, 4), (3, 4)],
+    },
+    {
+        "name": "Analytics pipeline",
+        "tasks": [
+            {"id": 1, "title": "Event ingestion job", "owner": "Kai",
+             "description": "Kafka consumer writing raw product events into the events_raw table hourly."},
+            {"id": 2, "title": "dbt transform models", "owner": "Lena",
+             "description": "Transform events_raw into clean sessions and conversion tables."},
+            {"id": 3, "title": "Executive dashboard", "owner": "Mo",
+             "description": "Metabase dashboard on top of the sessions and conversion tables."},
+            {"id": 4, "title": "On-call runbook", "owner": "Kai",
+             "description": "Write the incident runbook for the data platform team."},
+        ],
+        "gold": [(1, 2), (2, 3)],
+    },
+    {
+        "name": "Product launch campaign",
+        "tasks": [
+            {"id": 1, "title": "Brand visuals pack", "owner": "Noor",
+             "description": "Logo lockups, hero illustrations, and social banners for the launch."},
+            {"id": 2, "title": "Launch landing page", "owner": "Omar",
+             "description": "Build the landing page with the new hero illustrations and the approved plan pricing."},
+            {"id": 3, "title": "Press kit", "owner": "Pia",
+             "description": "Assemble the press kit PDF using the launch visuals."},
+            {"id": 4, "title": "Finalize plan pricing", "owner": "Quinn",
+             "description": "Decide the three plan tiers and monthly prices to be shown publicly."},
+        ],
+        "gold": [(1, 2), (1, 3), (4, 2)],
+    },
+    {
+        "name": "ML recommendation feature",
+        "tasks": [
+            {"id": 1, "title": "Label training dataset", "owner": "Rui",
+             "description": "Produce the labeled purchases dataset (CSV: user_id, item_id, label)."},
+            {"id": 2, "title": "Train ranking model", "owner": "Sara",
+             "description": "Train the ranker on the labeled purchases dataset; export model artifact."},
+            {"id": 3, "title": "Inference service", "owner": "Tom",
+             "description": "Serve the trained model artifact behind a /recommendations endpoint returning item ids."},
+            {"id": 4, "title": "Show recommendations in app", "owner": "Uma",
+             "description": "Render the home-screen carousel from the /recommendations endpoint."},
+            {"id": 5, "title": "Responsible-AI review", "owner": "Vik",
+             "description": "Run the internal ethics checklist for personalization features."},
+        ],
+        "gold": [(1, 2), (2, 3), (3, 4)],
+    },
+    {
+        "name": "Operations misc (no dependencies)",
+        "tasks": [
+            {"id": 1, "title": "Write Q3 blog post", "owner": "Wes",
+             "description": "Thought-leadership piece on team productivity."},
+            {"id": 2, "title": "Office move logistics", "owner": "Xena",
+             "description": "Book movers and coordinate the desk plan for the new floor."},
+            {"id": 3, "title": "Hiring JD for designer", "owner": "Yara",
+             "description": "Draft and publish the product designer job description."},
+            {"id": 4, "title": "Expense report audit", "owner": "Zed",
+             "description": "Review last quarter's expense reports for policy compliance."},
+        ],
+        "gold": [],
+    },
+    {
+        "name": "Docs overhaul",
+        "tasks": [
+            {"id": 1, "title": "Docs information architecture", "owner": "Ana",
+             "description": "Define the new docs nav tree and page taxonomy."},
+            {"id": 2, "title": "Getting-started guide", "owner": "Bo",
+             "description": "Write the quickstart following the new nav tree and taxonomy."},
+            {"id": 3, "title": "API reference pages", "owner": "Cy",
+             "description": "Write the endpoint reference under the new taxonomy sections."},
+            {"id": 4, "title": "Docs site dark theme", "owner": "Dot",
+             "description": "Implement a dark color theme toggle for the docs site."},
+        ],
+        "gold": [(1, 2), (1, 3)],
+    },
+    {
+        "name": "Infra migration to Kubernetes",
+        "tasks": [
+            {"id": 1, "title": "Provision k8s cluster", "owner": "Eli",
+             "description": "Stand up the production cluster with node pools, ingress, and secrets store."},
+            {"id": 2, "title": "Containerize services", "owner": "Fay",
+             "description": "Dockerize the three services and push images to the registry."},
+            {"id": 3, "title": "Deploy services to cluster", "owner": "Gus",
+             "description": "Write manifests and deploy the service images onto the new cluster."},
+            {"id": 4, "title": "DNS cutover", "owner": "Hal",
+             "description": "Point production DNS at the cluster ingress once services are running there."},
+            {"id": 5, "title": "Decommission old VMs", "owner": "Eli",
+             "description": "After traffic is fully cut over, retire the legacy VMs."},
+        ],
+        "gold": [(1, 3), (2, 3), (3, 4), (4, 5)],
+    },
+    {
+        "name": "Game jam entry",
+        "tasks": [
+            {"id": 1, "title": "Character sprites", "owner": "Ida",
+             "description": "Draw the player and enemy sprite sheets."},
+            {"id": 2, "title": "Level design doc", "owner": "Jon",
+             "description": "Lay out the three levels: enemy placement, pacing, boss arena."},
+            {"id": 3, "title": "Gameplay build", "owner": "Kim",
+             "description": "Implement the game: load the sprite sheets, build the levels from the design doc, hook up the soundtrack stems."},
+            {"id": 4, "title": "Soundtrack", "owner": "Lou",
+             "description": "Compose the level and boss music stems for the game."},
+        ],
+        "gold": [(1, 3), (2, 3), (4, 3)],
+    },
+    {
+        "name": "Facilities & admin (no dependencies)",
+        "tasks": [
+            {"id": 1, "title": "Renew SSL certificates", "owner": "Max",
+             "description": "Renew the wildcard certs before the September expiry."},
+            {"id": 2, "title": "Draft quarterly OKRs", "owner": "Nia",
+             "description": "First draft of team OKRs for leadership review."},
+            {"id": 3, "title": "Clean stale test data", "owner": "Oli",
+             "description": "Purge old records from the QA environment database."},
+        ],
+        "gold": [],
+    },
+]

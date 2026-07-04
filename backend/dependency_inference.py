@@ -43,43 +43,96 @@ def _gather(project_id: int):
         db.close()
 
 
+_DEPENDENCIES_TOOL = {
+    "name": "record_dependencies",
+    "description": "Record the real inter-task dependencies found in the project.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "dependencies": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "producer_task_id": {"type": "integer"},
+                        "consumer_task_id": {"type": "integer"},
+                        "reason":           {"type": "string"},
+                        "contract": {
+                            "type": "object",
+                            "properties": {
+                                "name":        {"type": "string"},
+                                "description": {"type": "string"},
+                            },
+                            "required": ["name", "description"],
+                        },
+                    },
+                    "required": ["producer_task_id", "consumer_task_id", "reason", "contract"],
+                },
+            },
+        },
+        "required": ["dependencies"],
+    },
+}
+
+
+def infer_dependencies(project_name: str, tasks: list) -> dict:
+    """Core inference over (name, tasks) — no DB. `tasks` is a list of
+    {id, title, description, owner}. Structured via FORCED tool use, so the
+    result always parses (replaces the old text.index('{') hand-parse).
+    Also the entry point the eval harness measures (evals/run_evals.py)."""
+    task_list = "\n".join(
+        f"- Task {t['id']}: \"{t['title']}\" (owner: {t.get('owner', 'Unassigned')}). {t.get('description', '')}"
+        for t in tasks
+    )
+    prompt = (
+        f"Project: {project_name}\n\nTasks:\n{task_list}\n\n"
+        "Identify the DEPENDENCIES between these tasks — where one task PRODUCES something "
+        "another task CONSUMES (e.g. an API the UI calls, a dataset a model uses, a design the "
+        "build follows, a backend the integration wires up). For each REAL dependency, also "
+        "state the INTERFACE CONTRACT: what the producer must hand the consumer.\n\n"
+        "Only include dependencies you are confident are real — an empty list is a valid "
+        "answer for independent tasks. producer = the task that makes the thing; "
+        "consumer = the task that needs it."
+    )
+    resp = _client.messages.create(
+        model=MODEL,
+        max_tokens=2000,
+        tools=[_DEPENDENCIES_TOOL],
+        tool_choice={"type": "tool", "name": "record_dependencies"},
+        messages=[{"role": "user", "content": prompt}],
+    )
+    for block in resp.content:
+        if block.type == "tool_use" and block.name == "record_dependencies":
+            deps = block.input.get("dependencies") or []
+            # keep only well-formed int pairs (defense against schema edge cases)
+            clean = []
+            for d in deps:
+                try:
+                    clean.append({
+                        "producer_task_id": int(d["producer_task_id"]),
+                        "consumer_task_id": int(d["consumer_task_id"]),
+                        "reason": str(d.get("reason", "")),
+                        "contract": {
+                            "name": str((d.get("contract") or {}).get("name", "interface")),
+                            "description": str((d.get("contract") or {}).get("description", "")),
+                        },
+                    })
+                except (KeyError, TypeError, ValueError):
+                    continue
+            return {"dependencies": clean}
+    return {"dependencies": []}
+
+
 def propose_dependencies(project_id: int) -> dict:
     """Returns {dependencies: [{producer_task_id, consumer_task_id, reason, contract:{name,description}}]}.
     Read-only — never writes to the DB."""
     name, tasks = _gather(project_id)
     if not tasks:
         return {"error": "project not found or has no tasks", "dependencies": []}
-
-    task_list = "\n".join(
-        f"- Task {t['id']}: \"{t['title']}\" (owner: {t['owner']}). {t['description']}"
-        for t in tasks
-    )
-    prompt = (
-        f"Project: {name}\n\nTasks:\n{task_list}\n\n"
-        "Identify the DEPENDENCIES between these tasks — where one task PRODUCES something "
-        "another task CONSUMES (e.g. an API the UI calls, a dataset a model uses, a design the "
-        "build follows, a backend the integration wires up). For each REAL dependency, also "
-        "state the INTERFACE CONTRACT: what the producer must hand the consumer.\n\n"
-        "Return ONLY valid JSON, no prose, of exactly this shape:\n"
-        '{"dependencies": [{"producer_task_id": <int>, "consumer_task_id": <int>, '
-        '"reason": "<short why>", "contract": {"name": "<short name>", "description": "<the interface promise>"}}]}\n'
-        "Only include dependencies you are confident are real. producer = the task that makes the thing; "
-        "consumer = the task that needs it."
-    )
-
-    resp = _client.messages.create(
-        model=MODEL,
-        max_tokens=2000,
-        messages=[{"role": "user", "content": prompt}],
-    )
-    text = next((b.text for b in resp.content if hasattr(b, "text")), "")
     try:
-        data = json.loads(text[text.index("{"): text.rindex("}") + 1])
-        if "dependencies" not in data:
-            data = {"dependencies": []}
+        return infer_dependencies(name, tasks)
     except Exception as e:
-        return {"error": f"could not parse JSON: {e}", "raw": text[:600], "dependencies": []}
-    return data
+        return {"error": f"inference failed: {e}", "dependencies": []}
 
 
 # ═══════════════════════════════════════════════════════════════
