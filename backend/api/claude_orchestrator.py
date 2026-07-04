@@ -26,7 +26,7 @@ from database.models import (
     MeetingActionItem, Delegation, Escalation,
     Goal, TimeEntry, Notification, ApprovalRequest,
     AuditLog, EmployeePreference, DailyBriefing,
-    WorkloadSnapshot, Contract, Team,
+    WorkloadSnapshot, Contract, Team, GoalTask,
 )
 import queue
 import threading
@@ -1955,6 +1955,23 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
         if _own_id is not None:
             tool_input["employee_id"] = _own_id
 
+    def _get_or_create_team(_db, name: str):
+        """Resolve a team NAME to a real Team row, creating it if needed.
+        Employee.team (a free-text label) and the teams table historically
+        drifted apart — the AI created employees with only the string, so
+        team_id stayed NULL and the team-lead tier (keyed on team_id) could
+        never activate. Every team-setting write path goes through here now."""
+        name = (name or "").strip()
+        if not name or name.lower() in ("unassigned", "none", "management"):
+            return None
+        team = _db.query(Team).filter(Team.company_id == DEFAULT_COMPANY_ID,
+                                      Team.name.ilike(name)).first()
+        if not team:
+            team = Team(company_id=DEFAULT_COMPANY_ID, name=name)
+            _db.add(team)
+            _db.flush()   # assign id without committing the caller's transaction
+        return team
+
     def _own_employee_id(_db):
         """The caller's own Employee id: employees directly from the token-derived
         caller_id; the manager via row lookup (their real id isn't in 'Manager_1').
@@ -2363,10 +2380,12 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             import secrets as _secrets
             from api.security import hash_password as _hash_password
             temp_password = _secrets.token_urlsafe(9)
+            _team_row = _get_or_create_team(db, tool_input.get("team", "Unassigned"))
             emp = Employee(
                 company_id=DEFAULT_COMPANY_ID,
                 name=tool_input["name"], role=tool_input["role"],
                 team=tool_input.get("team", "Unassigned"),
+                team_id=_team_row.id if _team_row else None,
                 age=tool_input.get("age", 25), experience=tool_input.get("experience", 0),
                 skills=tool_input.get("skills", ""), gender=tool_input.get("gender", "Unspecified"),
                 system_role="employee", is_active=True,
@@ -2386,6 +2405,9 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             for field in ["name", "role", "team", "skills", "experience"]:
                 if tool_input.get(field) is not None:
                     setattr(emp, field, tool_input[field])
+            if tool_input.get("team") is not None:   # keep team_id in sync with the label
+                _t = _get_or_create_team(db, tool_input["team"])
+                emp.team_id = _t.id if _t else None
             db.commit()
             _broadcast_sync()
             return f"Employee {tool_input['employee_id']} updated."
@@ -2404,6 +2426,8 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             if not emp:
                 return "Employee not found."
             emp.team = tool_input["team_name"]
+            _t = _get_or_create_team(db, tool_input["team_name"])
+            emp.team_id = _t.id if _t else None
             db.commit()
             _broadcast_sync()
             return f"{emp.name} moved to team '{tool_input['team_name']}'."
@@ -2629,8 +2653,22 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             if emp.system_role == "manager":
                 return "That's the manager — managers can't be team leads."
             if tool_input.get("make_lead"):
+                # Self-heal: older orgs carry only the team LABEL (Employee.team)
+                # with no Team row / team_id — resolve or create the row now.
                 if not emp.team_id:
-                    return f"{emp.name} isn't assigned to a team yet — assign them to a team first."
+                    _t = _get_or_create_team(db, emp.team)
+                    if _t is None:
+                        return f"{emp.name} isn't assigned to a team yet — assign them to a team first."
+                    emp.team_id = _t.id
+                # Heal teammates that also only carry the label, so they are
+                # inside the lead's scope (scope is keyed on team_id).
+                if emp.team:
+                    for _mate in db.query(Employee).filter(
+                            Employee.team.ilike(emp.team),
+                            Employee.id != emp.id,
+                            Employee.team_id.is_(None),
+                            Employee.system_role != "manager").all():
+                        _mate.team_id = emp.team_id
                 emp.system_role = "team_lead"
                 team = db.query(Team).filter(Team.id == emp.team_id).first()
                 if team:
@@ -3200,10 +3238,15 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             task = db.query(Task).filter(Task.id == tool_input["task_id"]).first()
             if not goal or not task:
                 return "Goal or task not found."
-            if task not in goal.tasks:
-                goal.tasks.append(task)
-            db.commit()
-            return f"Task {tool_input['task_id']} linked to goal {tool_input['goal_id']}."
+            # Goal↔Task is an association-object link (GoalTask), NOT a direct
+            # goal.tasks collection — the old code raised AttributeError here.
+            exists = db.query(GoalTask).filter(
+                GoalTask.goal_id == goal.id, GoalTask.task_id == task.id).first()
+            if not exists:
+                db.add(GoalTask(goal_id=goal.id, task_id=task.id))
+                db.commit()
+                _broadcast_sync()
+            return f"Task {task.id} ('{task.title}') linked to goal '{goal.title}'."
 
         # ── TIME TRACKING ──────────────────────────────────────────────────
         elif tool_name == "start_time_entry":
