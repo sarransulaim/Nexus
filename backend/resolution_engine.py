@@ -24,6 +24,76 @@ _client = anthropic.Anthropic(api_key=os.getenv("CLAUDE_API_KEY"), timeout=45.0,
 MODEL = "claude-sonnet-4-5"   # match dependency_inference (the sibling coordination module)
 
 
+# ═══════════════════════════════════════════════════════════════
+# SEMANTIC DRIFT ASSESSMENT (drift v2)
+# v1 flagged a contract at-risk whenever the producer task was EDITED — any
+# typo fix or priority tweak alerted the consumer. v2 diffs the actual change
+# against the contract text and only alerts when the promised INTERFACE
+# plausibly changed. Cheap (Haiku), schema-enforced via forced tool use,
+# and FAILS TO ALERT on errors (never silently swallows a real drift).
+# ═══════════════════════════════════════════════════════════════
+
+def producer_content(task) -> str:
+    """The producer task's content as a stable snapshot string (what we diff)."""
+    nl = chr(10)
+    return nl.join([f"title: {task.title or ''}",
+                    f"description: {task.description or ''}",
+                    f"due: {task.due_date or ''}"])
+
+
+_DRIFT_ASSESS_TOOL = {
+    "name": "record_drift_assessment",
+    "description": "Record whether a task change affects the promised interface.",
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "interface_changed": {
+                "type": "boolean",
+                "description": "true ONLY if the change plausibly alters what the producer "
+                               "hands the consumer (format, fields, endpoints, protocol, scope "
+                               "of the deliverable, or its timing in a way that breaks the "
+                               "promise). Typo fixes, rewording, priority/status notes, and "
+                               "changes unrelated to the promised interface are false."},
+            "change_summary": {
+                "type": "string",
+                "description": "one short sentence: WHAT changed about the interface (empty if nothing)"},
+        },
+        "required": ["interface_changed", "change_summary"],
+    },
+}
+
+
+def assess_contract_drift(contract_name: str, contract_description: str,
+                          old_snapshot: str, new_content: str) -> dict:
+    """{"interface_changed": bool, "change_summary": str}. Errors → assume
+    changed (v1 behavior) so a broken assessor can never hide a real drift."""
+    try:
+        resp = _client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=250,
+            tools=[_DRIFT_ASSESS_TOOL],
+            tool_choice={"type": "tool", "name": "record_drift_assessment"},
+            messages=[{"role": "user", "content": (
+                "Two colleagues agreed on an interface contract between their tasks:\n"
+                f"<contract name={contract_name!r}>{(contract_description or '')[:600]}</contract>\n\n"
+                "The PRODUCER task then changed. Before the change:\n"
+                f"<before>{(old_snapshot or '')[:1200]}</before>\n\n"
+                "After the change:\n"
+                f"<after>{(new_content or '')[:1200]}</after>\n\n"
+                "Does this change plausibly affect what the producer promised to hand the "
+                "consumer? Judge against the CONTRACT, not against style."
+            )}],
+        )
+        for block in resp.content:
+            if block.type == "tool_use" and block.name == "record_drift_assessment":
+                d = dict(block.input)
+                return {"interface_changed": bool(d.get("interface_changed", True)),
+                        "change_summary": str(d.get("change_summary", ""))[:300]}
+    except Exception as e:
+        log.warning(f"drift assessment failed ({e}) — assuming changed (fail-to-alert)")
+    return {"interface_changed": True, "change_summary": ""}
+
+
 def propose_resolution(contract_id: int) -> dict:
     """Given a drifted contract (producer changed after the interface baseline), ask
     Claude for the single cheapest correct fix.

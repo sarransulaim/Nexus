@@ -849,6 +849,9 @@ class Contract(Base):
     description      = Column(Text, default="")              # the promise / interface details
     status           = Column(String(50), default="active")  # active / at_risk / broken / fulfilled
     baseline_at      = Column(DateTime(timezone=True), default=_now)  # producer state captured here
+    # The producer's CONTENT (title/description/due) at baseline — what semantic
+    # drift detection diffs against, so a typo fix no longer flags the contract.
+    baseline_snapshot = Column(Text, nullable=True)
     created_by       = Column(Integer, ForeignKey("employees.id", ondelete="SET NULL"), nullable=True)
     created_at       = Column(DateTime(timezone=True), default=_now)
     updated_at       = Column(DateTime(timezone=True), default=_now, onupdate=_now)

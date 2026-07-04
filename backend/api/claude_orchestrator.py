@@ -2074,6 +2074,7 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             consumer = db.query(Task).filter(Task.id == tool_input["consumer_task_id"]).first()
             if not producer or not consumer:
                 return "Couldn't find one of those tasks — look up the task IDs first."
+            from resolution_engine import producer_content as _pc
             c = Contract(
                 company_id=DEFAULT_COMPANY_ID,
                 project_id=producer.project_id or consumer.project_id,
@@ -2082,6 +2083,7 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
                 name=tool_input["name"],
                 description=tool_input.get("description", ""),
                 status="active",
+                baseline_snapshot=_pc(producer),   # what semantic drift diffs against
             )
             db.add(c)
             db.commit()
@@ -2108,11 +2110,18 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             return "\n".join(lines)
 
         elif tool_name == "confirm_dependency_map":
-            n = db.query(Contract).filter(
+            from resolution_engine import producer_content as _pc
+            _rows = db.query(Contract).filter(
                 Contract.company_id == DEFAULT_COMPANY_ID,
                 Contract.project_id == tool_input["project_id"],
                 Contract.status == "proposed",
-            ).update({"status": "active"}, synchronize_session=False)
+            ).all()
+            n = len(_rows)
+            for _c in _rows:
+                _c.status = "active"
+                _c.baseline_at = datetime.now(timezone.utc)
+                if _c.producer:   # capture what "agreed" looked like — drift diffs against this
+                    _c.baseline_snapshot = _pc(_c.producer)
             db.commit()
             _broadcast_sync()
             if not n:

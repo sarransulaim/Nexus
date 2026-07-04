@@ -319,19 +319,54 @@ def run_drift_alerts() -> dict:
             results["alerts"] += 1
             results["details"].append({"to_owner": blocked.owner_id, "msg": msg[:70]})
 
-        # Contract drift: the producer changed AFTER the interface was agreed.
+        # Contract drift v2: the producer changed AFTER the interface was agreed —
+        # but an EDIT is not a DRIFT. The change is diffed semantically against
+        # the contract text; only a plausible INTERFACE change alerts. Benign
+        # edits (typos, rewording, unrelated scope) re-baseline silently.
+        # Semantic checks are capped per run (each is a small AI call); beyond
+        # the cap we flag without assessment (fail-to-alert, v1 behavior).
+        from datetime import datetime as _dtm, timezone as _tzn
+        MAX_SEMANTIC_CHECKS = 10
+        semantic_checks = 0
         for c in db.query(Contract).filter(Contract.status.in_(["active", "at_risk"])).all():
             producer, consumer = c.producer, c.consumer
             if not producer or not consumer or consumer.owner_id is None or consumer.is_completed:
                 continue
             if not (producer.updated_at and c.baseline_at and producer.updated_at > c.baseline_at):
                 continue
+
+            drift_detail = ""
             if c.status != "at_risk":
+                from resolution_engine import producer_content, assess_contract_drift
+                new_content = producer_content(producer)
+                # Self-heal pre-v2 contracts: nothing to diff against — capture a
+                # snapshot now and treat this pass as the new baseline.
+                if not c.baseline_snapshot:
+                    c.baseline_snapshot = new_content
+                    c.baseline_at = _dtm.now(_tzn.utc)
+                    db.commit()
+                    continue
+                if semantic_checks < MAX_SEMANTIC_CHECKS:
+                    semantic_checks += 1
+                    verdict = assess_contract_drift(c.name, c.description,
+                                                    c.baseline_snapshot, new_content)
+                    if not verdict["interface_changed"]:
+                        # benign edit — quietly move the baseline forward
+                        c.baseline_snapshot = new_content
+                        c.baseline_at = _dtm.now(_tzn.utc)
+                        db.commit()
+                        results["details"].append({"contract": c.id, "benign_edit": True})
+                        continue
+                    drift_detail = (verdict.get("change_summary") or "").strip()
+                else:
+                    log.warning("Semantic drift checks capped this run — flagging without assessment.")
                 c.status = "at_risk"
                 db.commit()
                 newly_at_risk.append(c.id)   # defer the ~45s Claude proposal (below)
             msg = (f"Contract drift: \"{producer.title}\" changed after the interface \"{c.name}\" "
-                   f"was agreed. Re-check it before integrating your \"{consumer.title}\".")
+                   f"was agreed. "
+                   + (f"What changed: {drift_detail} " if drift_detail else "")
+                   + f"Re-check it before integrating your \"{consumer.title}\".")
             dup = db.query(Notification).filter(
                 Notification.recipient_id == consumer.owner_id,
                 Notification.type         == "contract_drift",
