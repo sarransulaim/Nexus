@@ -99,11 +99,25 @@ def test_contract_define_view_and_drift():
         view = co.execute_tool("view_contracts", {"task_id": pid}, "Manager_1")
         assert "_pytest_contract" in view
 
+        s = SessionLocal()
+        try:
+            con_id = s.query(Contract).filter(Contract.name == "_pytest_contract").first().id
+        finally:
+            s.close()
+
+        def _my_alerts(sess):
+            """Only THIS test's contract — seeded stress data has its own
+            deliberately-drifted contracts that also alert during runs."""
+            return sess.query(Notification).filter(
+                Notification.type == "contract_drift",
+                Notification.entity_type == "contract",
+                Notification.entity_id == con_id).count()
+
         # no drift until the producer changes
         pd.run_drift_alerts()
         s = SessionLocal()
         try:
-            assert s.query(Notification).filter(Notification.type == "contract_drift").count() == 0
+            assert _my_alerts(s) == 0
         finally:
             s.close()
 
@@ -122,8 +136,7 @@ def test_contract_define_view_and_drift():
             pd.run_drift_alerts()
             s = SessionLocal()
             try:
-                assert s.query(Notification).filter(Notification.type == "contract_drift").count() == 0, \
-                    "benign edit wrongly flagged as drift"
+                assert _my_alerts(s) == 0, "benign edit wrongly flagged as drift"
                 con = s.query(Contract).filter(Contract.name == "_pytest_contract").first()
                 assert con.status == "active"
                 assert con.baseline_snapshot and "clarified the wording" in con.baseline_snapshot  # rebaselined
@@ -142,7 +155,7 @@ def test_contract_define_view_and_drift():
         pd.run_drift_alerts()
         s = SessionLocal()
         try:
-            alerts = s.query(Notification).filter(Notification.type == "contract_drift").count()
+            alerts = _my_alerts(s)
             con = s.query(Contract).filter(Contract.name == "_pytest_contract").first()
             assert alerts >= 1
             assert con.status == "at_risk"

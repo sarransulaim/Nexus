@@ -47,8 +47,8 @@ class TaskType(str, Enum):
 # ═══════════════════════════════════════════════════════════════
 
 ROUTING_TABLE = {
-    TaskType.ORCHESTRATOR:          ("claude", "claude-sonnet-4-5"),
-    TaskType.NEGOTIATION:           ("claude", "claude-sonnet-4-5"),
+    TaskType.ORCHESTRATOR:          ("claude", "claude-sonnet-4-6"),
+    TaskType.NEGOTIATION:           ("claude", "claude-sonnet-4-6"),
     TaskType.SIMPLE_COMMAND:        ("claude", "claude-haiku-4-5"),
     TaskType.EMAIL_SUMMARY:         ("gemini", "gemini-2.5-pro"),
     TaskType.EMAIL_DRAFT:           ("gemini", "gemini-2.5-pro"),

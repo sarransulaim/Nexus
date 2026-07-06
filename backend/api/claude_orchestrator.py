@@ -3947,7 +3947,7 @@ def classify_command(command: str) -> str:
 
 MODEL_MAP = {
     "haiku":  "claude-haiku-4-5",
-    "sonnet": "claude-sonnet-4-5",
+    "sonnet": "claude-sonnet-4-6",
 }
 
 

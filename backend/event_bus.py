@@ -91,7 +91,7 @@ event_bus = EventBus()
 
 # ── Cost estimation ───────────────────────────────────────────
 PRICING = {
-    "claude-sonnet-4-5":  {"in": 3.00,  "out": 15.00},
+    "claude-sonnet-4-6":  {"in": 3.00,  "out": 15.00},
     "claude-haiku-4-5":   {"in": 1.00,  "out": 5.00},
     "gemini-2.5-pro":     {"in": 1.25,  "out": 5.00},
     "qwen2.5:3b":         {"in": 0.00,  "out": 0.00},

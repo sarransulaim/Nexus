@@ -20,7 +20,7 @@ from database.models import Project, Task, Employee
 log = logging.getLogger("nexus.depinfer")
 
 _client = anthropic.Anthropic(api_key=os.getenv("CLAUDE_API_KEY"))
-MODEL = "claude-sonnet-4-5"   # use the strongest model to measure the achievable ceiling
+MODEL = "claude-sonnet-4-6"   # use the strongest model to measure the achievable ceiling
 
 
 def _gather(project_id: int):

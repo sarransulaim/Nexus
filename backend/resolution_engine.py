@@ -21,7 +21,7 @@ from database.models import Contract, Task, Employee
 log = logging.getLogger("nexus.resolution")
 
 _client = anthropic.Anthropic(api_key=os.getenv("CLAUDE_API_KEY"), timeout=45.0, max_retries=1)
-MODEL = "claude-sonnet-4-5"   # match dependency_inference (the sibling coordination module)
+MODEL = "claude-sonnet-4-6"   # match dependency_inference (the sibling coordination module)
 
 
 # ═══════════════════════════════════════════════════════════════

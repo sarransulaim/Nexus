@@ -50,12 +50,12 @@
             4
           ],
           [
-            3,
-            4
+            2,
+            5
           ],
           [
-            4,
-            5
+            3,
+            4
           ]
         ],
         "gold": [
@@ -300,56 +300,56 @@
         "expect": false,
         "got": false,
         "ok": true,
-        "summary": "Typo correction: \"returing\" changed to \"returning\""
+        "summary": "Typo fix: \"returing\" corrected to \"returning\""
       },
       {
         "case": "rewording, same meaning",
         "expect": false,
         "got": false,
         "ok": true,
-        "summary": "Task description rephrased for clarity; endpoint, response format, and fields re"
+        "summary": "Rewording of task description; no change to promised JSON fields, endpoint, or f"
       },
       {
         "case": "collaboration note added",
         "expect": false,
         "got": false,
         "ok": true,
-        "summary": "Added a note about pairing with Sam on input states implementation."
+        "summary": "Added a note about pairing with Sam on input states, but the deliverable (Figma "
       },
       {
         "case": "formatting cleanup",
         "expect": false,
         "got": false,
         "ok": true,
-        "summary": "Task description reformatted from inline list to bulleted list; no change to pro"
+        "summary": "Task description reformatted from inline list to bulleted format with no changes"
       },
       {
         "case": "internal implementation detail",
         "expect": false,
         "got": false,
         "ok": true,
-        "summary": "Internal implementation switched from raw SQL to ORM for the query layer; endpoi"
+        "summary": "Internal implementation switched from raw SQL to ORM for query layer; endpoint a"
       },
       {
         "case": "both-sides pollution (delta is benign)",
         "expect": false,
         "got": false,
         "ok": true,
-        "summary": "Clarified wording in task description; no change to the actual interface being d"
+        "summary": "Clarified wording in task description; no change to the /orders endpoint interfa"
       },
       {
         "case": "progress note",
         "expect": false,
         "got": false,
         "ok": true,
-        "summary": "Added status note \"About halfway done\" \u2014 no change to the format, fields, endpoi"
+        "summary": "Added status note \"About halfway done\" to the task description."
       },
       {
         "case": "priority tag",
         "expect": false,
         "got": false,
         "ok": true,
-        "summary": "Added [P1] priority label to task"
+        "summary": "Added [P1] priority label to the task description."
       },
       {
         "case": "format change JSON\u2192XML",
@@ -363,35 +363,35 @@
         "expect": true,
         "got": true,
         "ok": true,
-        "summary": "All calls now require the X-Org-Token header for authentication."
+        "summary": "All calls now require the X-Org-Token header"
       },
       {
         "case": "endpoint renamed",
         "expect": true,
         "got": true,
         "ok": true,
-        "summary": "Endpoint changed from /orders to /v2/purchases, breaking the promised interface "
+        "summary": "Endpoint changed from /orders to /v2/purchases"
       },
       {
         "case": "field removed",
         "expect": true,
         "got": true,
         "ok": true,
-        "summary": "The /orders endpoint no longer returns the total field directly; it now requires"
+        "summary": "The total field is removed from the /orders endpoint response and moved to a sep"
       },
       {
         "case": "REST\u2192GraphQL",
         "expect": true,
         "got": true,
         "ok": true,
-        "summary": "Producer changed from REST /orders endpoint returning JSON to GraphQL schema ins"
+        "summary": "Producer changed from REST /orders endpoint returning JSON to GraphQL schema, al"
       },
       {
         "case": "deliverable artifact swapped",
         "expect": true,
         "got": true,
         "ok": true,
-        "summary": "Producer switched from delivering a Figma component library (buttons, inputs, to"
+        "summary": "Producer switched from delivering a reusable Figma component library to deliveri"
       },
       {
         "case": "promised date slips",
@@ -405,7 +405,7 @@
         "expect": true,
         "got": true,
         "ok": true,
-        "summary": "Producer switched from sending webhooks on order events to exposing a poll-based"
+        "summary": "Delivery mechanism changed from push-based webhooks to pull-based polling feed."
       }
     ],
     "n": 16,
