@@ -142,6 +142,17 @@ class ConnectionManager:
                        if eid in self._managers]
         await self._send_targets(targets, message)
 
+    async def send_stream(self, agent_id: str, frame: str):
+        """Raw live-typing frames (STREAM/STREAM_RESET/STREAM_END:...) routed to
+        the caller like thoughts, but WITHOUT the THOUGHT: prefix."""
+        if agent_id.startswith("Employee_"):
+            try:
+                await self.send_to_employee(int(agent_id.split("_")[1]), frame)
+            except (ValueError, IndexError):
+                pass
+        else:
+            await self.broadcast_to_managers(frame)
+
     async def send_thought(self, agent_id: str, thought: str):
         """Route Glass Brain thought to the correct employee."""
         message = f"THOUGHT:{agent_id}|{thought}"

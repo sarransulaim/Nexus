@@ -123,8 +123,11 @@ async def glass_brain_loop():
                 thought = glass_brain_queue.get_nowait()
                 if "|" in thought:
                     agent_id = thought.split("|")[0].strip()
-                    text = thought.split("|", 1)[1].strip()
-                    await notifier.send_thought(agent_id, text)
+                    text = thought.split("|", 1)[1]
+                    if text.startswith("STREAM"):      # live-typing frames, raw
+                        await notifier.send_stream(agent_id, text)
+                    else:
+                        await notifier.send_thought(agent_id, text.strip())
                 else:
                     await notifier.broadcast(f"THOUGHT:{thought}")
             except queue.Empty:

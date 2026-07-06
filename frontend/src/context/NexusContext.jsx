@@ -88,6 +88,10 @@ export function NexusProvider({ children }) {
   const notificationsRef = useRef(notifications);
   useEffect(() => { notificationsRef.current = notifications; }, [notifications]);
 
+  // Live-typing stream for the in-flight AI command: {id, buf}. Deltas arrive
+  // over the WS as STREAM:{id}|{delta}; the POST response stays authoritative.
+  const streamRef = useRef(null);
+
   // ── Shared, de-duplicated access-token refresh ────────────────
   // A single in-flight refresh is shared by ALL callers (a burst of 401s, or a
   // WS auth-close racing an HTTP 401). Without this, each caller would POST its
@@ -313,6 +317,23 @@ export function NexusProvider({ children }) {
 
         if (data === 'SYNC_REQUIRED') {
           fetchDashboardData();
+          return;
+        }
+
+        // ── STREAM: live-typing for the current AI command ────────
+        if (data.startsWith('STREAM_RESET:')) {
+          if (streamRef.current && data.slice(13) === streamRef.current.id) streamRef.current.buf = '';
+          return;
+        }
+        if (data.startsWith('STREAM_END:')) return;   // POST response is authoritative
+        if (data.startsWith('STREAM:')) {
+          const rest = data.slice(7);
+          const sep = rest.indexOf('|');
+          if (sep > 0 && streamRef.current && rest.slice(0, sep) === streamRef.current.id) {
+            streamRef.current.buf += rest.slice(sep + 1);
+            setIsThinking(false);
+            setAiResponse(streamRef.current.buf);
+          }
           return;
         }
 
@@ -626,11 +647,16 @@ export function NexusProvider({ children }) {
         ? 'Manager_1'
         : `Employee_${currentUser.dbId}`;
 
+      const streamId = (window.crypto?.randomUUID?.() || `s${Date.now()}`).replace(/[^A-Za-z0-9_-]/g, '');
+      streamRef.current = { id: streamId, buf: '' };
+
       const res = await axios.post(`${BACKEND_URL}/api/v1/manager/command`, {
         manager_id:   dynamicManagerId,
         command_text: trimmed,
         input_method: isListening ? 'voice' : 'manual',
+        stream_id:    streamId,
       });
+      streamRef.current = null;
 
       setIsThinking(false);
       const finalResponse = safeStr(res.data?.ai_response || 'Directive complete.');

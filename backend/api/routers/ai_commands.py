@@ -38,6 +38,7 @@ class CommandRequest(BaseModel):
     manager_id: str
     command_text: str
     input_method: str = "manual"
+    stream_id: str = ""     # client-chosen id for live-typing WS frames (optional)
 
 
 # ---------------------------------------------------------------------------
@@ -81,10 +82,18 @@ async def process_command(
     print(f"\n--- [INCOMING COMMAND] ---")
     print(f"Agent: {agent_id} | Input: {payload.command_text[:80]}")
 
+    # Live-typing stream id: client-chosen, echoed into WS frames — so only a
+    # safe charset is accepted (it is interpolated into the frame text).
+    import re as _re
+    stream_id = (payload.stream_id or "").strip()[:64]
+    if stream_id and not _re.fullmatch(r"[A-Za-z0-9_-]+", stream_id):
+        stream_id = ""
+
     try:
         async with _orchestrator_sem:
             final_response = await run_in_threadpool(
-                run_orchestrator, agent_id, payload.command_text.strip()
+                run_orchestrator, agent_id, payload.command_text.strip(),
+                None, stream_id or None,
             )
         # After any command, ping the frontend to refresh dashboard data
         background_tasks.add_task(broadcast_db_update)

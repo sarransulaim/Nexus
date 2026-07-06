@@ -4074,7 +4074,8 @@ def _load_mcp_servers(own_employee_id: int = None) -> list:
         return []
 
 
-def run_orchestrator(agent_id: str, command: str, extra_context: str = None) -> str:
+def run_orchestrator(agent_id: str, command: str, extra_context: str = None,
+                     stream_id: str = None) -> str:
     start = time.time()
 
     # PHASE 3: emit agent activation
@@ -4212,17 +4213,45 @@ def run_orchestrator(agent_id: str, command: str, extra_context: str = None) -> 
 
     def _call(msgs):
         """One Claude call — beta MCP-connector path when sources are attached,
-        otherwise the standard path (byte-identical to the original request)."""
+        otherwise the standard path (byte-identical to the original request).
+
+        When `stream_id` is set the call STREAMS: text deltas are batched and
+        pushed to the caller's dashboard over the existing WebSocket (via the
+        glass-brain pump) as `STREAM:{id}|{delta}` frames. Every turn starts
+        with STREAM_RESET, so interim tool-round text gets replaced and only
+        the final turn's answer remains on screen. The HTTP response stays the
+        authoritative result — with no WebSocket, behavior is unchanged."""
+        kwargs = dict(model=model, max_tokens=2048, system=system_blocks,
+                      tools=tools, messages=msgs)
+        ns = claude_client.messages
         if mcp_servers:
-            return claude_client.beta.messages.create(
-                model=model, max_tokens=2048, system=system_blocks,
-                tools=tools, messages=msgs,
-                betas=["mcp-client-2025-11-20"], mcp_servers=mcp_servers,
-            )
-        return claude_client.messages.create(
-            model=model, max_tokens=2048, system=system_blocks,
-            tools=tools, messages=msgs,
-        )
+            kwargs.update(betas=["mcp-client-2025-11-20"], mcp_servers=mcp_servers)
+            ns = claude_client.beta.messages
+        if not stream_id:
+            return ns.create(**kwargs)
+
+        glass_brain_queue.put(f"{agent_id}|STREAM_RESET:{stream_id}")
+        buf, last_flush = [], time.time()
+
+        def _flush():
+            nonlocal buf, last_flush
+            if buf:
+                glass_brain_queue.put(f"{agent_id}|STREAM:{stream_id}|{''.join(buf)}")
+                buf, last_flush = [], time.time()
+
+        try:
+            with ns.stream(**kwargs) as st:
+                for chunk in st.text_stream:
+                    buf.append(chunk)
+                    if sum(len(x) for x in buf) >= 48 or time.time() - last_flush > 0.25:
+                        _flush()
+                _flush()
+                return st.get_final_message()
+        except Exception as e:
+            # Streaming transport hiccup → fall back to the plain call so the
+            # command still completes (the POST response carries the answer).
+            print(f"⚠️  stream fallback ({type(e).__name__}: {e}) — using non-streaming call")
+            return ns.create(**kwargs)
 
     max_iterations = 10
     iteration      = 0
@@ -4284,6 +4313,8 @@ def run_orchestrator(agent_id: str, command: str, extra_context: str = None) -> 
                 emit_agent_idle(agent_id, duration_ms=int((time.time() - start) * 1000))
             except Exception:
                 pass
+            if stream_id:
+                glass_brain_queue.put(f"{agent_id}|STREAM_END:{stream_id}")
             return final_text or "Directive processed."
 
         elif response.stop_reason == "tool_use":
