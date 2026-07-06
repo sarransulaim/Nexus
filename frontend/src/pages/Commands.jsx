@@ -139,6 +139,7 @@ export default function Commands() {
   const threadRef = useRef(null);
   const lastResponseRef = useRef(null);
   const pendingRef = useRef(false);
+  const streamingRef = useRef(false);   // has the in-flight response's bubble been created yet?
 
   const agentId = currentUser?.role === 'Manager' ? 'Manager_1' : `Employee_${currentUser?.dbId}`;
 
@@ -159,19 +160,29 @@ export default function Commands() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [currentUser]);
 
-  // When a new aiResponse arrives, append the exchange to the thread
+  // aiResponse updates arrive LIVE while streaming (each is the growing answer),
+  // then once more with the authoritative final text. First update for the
+  // in-flight command CREATES the assistant bubble; every later update REPLACES
+  // that same bubble's content in place — so the message fills in as it streams
+  // instead of freezing on the first token.
   useEffect(() => {
     const resp = safeStr(aiResponse);
     if (!resp || resp === 'Processing directive...') return;
     if (resp === lastResponseRef.current) return;
     lastResponseRef.current = resp;
-    if (pendingRef.current) {
-      setThread(prev => {
-        const next = [...prev, { role: 'assistant', content: resp }];
-        return next.slice(-40);
-      });
-      pendingRef.current = false;
-    }
+    if (!pendingRef.current) return;   // no command in flight → ignore stray updates
+    setThread(prev => {
+      const next = [...prev];
+      if (streamingRef.current) {
+        for (let i = next.length - 1; i >= 0; i--) {
+          if (next[i].role === 'assistant') { next[i] = { ...next[i], content: resp }; break; }
+        }
+      } else {
+        next.push({ role: 'assistant', content: resp });
+        streamingRef.current = true;
+      }
+      return next.slice(-40);
+    });
   }, [aiResponse]);
 
   // Auto-scroll thread to bottom
@@ -214,6 +225,7 @@ export default function Commands() {
     if (!t) return;
     setThread(prev => [...prev, { role: 'user', content: t }].slice(-40));
     pendingRef.current = true;
+    streamingRef.current = false;   // next assistant update starts a fresh bubble
     sendCommandToNexus(t);
   };
 
@@ -231,6 +243,7 @@ export default function Commands() {
       if (spoken && (thread.length === 0 || thread[thread.length - 1].content !== spoken)) {
         setThread(prev => [...prev, { role: 'user', content: spoken }].slice(-40));
         pendingRef.current = true;
+        streamingRef.current = false;
       }
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
