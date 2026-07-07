@@ -109,7 +109,7 @@ def _find_employee_by_skill(db: Session, company_id: int, skill_hint: str) -> Op
     emps = db.query(Employee).filter(
         Employee.company_id == company_id,
         Employee.is_active  == True,
-        Employee.system_role == "employee",
+        Employee.system_role != "manager",
     ).all()
 
     # Score by skill overlap and active workload

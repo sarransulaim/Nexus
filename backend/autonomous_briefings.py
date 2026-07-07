@@ -89,7 +89,7 @@ def _compose_manager_briefing(employee: Employee, db) -> str | None:
     active_people = db.query(Employee).filter(
         Employee.company_id == employee.company_id,
         Employee.is_active  == True,
-        Employee.system_role == "employee",
+        Employee.system_role != "manager",
     ).count()
 
     # If the whole team is genuinely idle, skip

@@ -104,7 +104,7 @@ def get_analytics_summary(
 
     # Single-pass fetch
     all_tasks     = db.query(Task).all()
-    all_employees = db.query(Employee).filter(Employee.system_role == "employee").all()
+    all_employees = db.query(Employee).filter(Employee.system_role != "manager").all()
     all_requests  = db.query(PeerRequest).all()
     all_escs      = db.query(Escalation).all()
     all_memories  = db.query(AgentMemory).filter(AgentMemory.agent_id.like("Employee_%")).all()
@@ -295,7 +295,7 @@ def get_team_analytics(
     period_start, _, period_label, period_days = _get_period_bounds(period)
     today = datetime.now(timezone.utc).date()
 
-    members = db.query(Employee).filter(Employee.team == team_name, Employee.system_role == "employee").all()
+    members = db.query(Employee).filter(Employee.team == team_name, Employee.system_role != "manager").all()
     if not members:
         return {"error": f"No employees found in team '{team_name}'"}
 

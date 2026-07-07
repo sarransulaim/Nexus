@@ -51,7 +51,7 @@ class ProblemDetector:
         """
         overloaded = []
         employees = db.query(Employee).filter(
-            Employee.system_role == "employee"
+            Employee.system_role != "manager"
         ).all()
 
         for emp in employees:
@@ -80,7 +80,7 @@ class ProblemDetector:
         cutoff = (now + timedelta(hours=DEADLINE_WARNING_HRS)).date()
 
         employees = db.query(Employee).filter(
-            Employee.system_role == "employee"
+            Employee.system_role != "manager"
         ).all()
 
         for emp in employees:
@@ -108,7 +108,7 @@ class ProblemDetector:
         """
         available = []
         employees = db.query(Employee).filter(
-            Employee.system_role == "employee",
+            Employee.system_role != "manager",
             Employee.id != exclude_id,
         ).all()
 

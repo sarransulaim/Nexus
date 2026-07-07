@@ -1388,8 +1388,11 @@ EMPLOYEE_TOOLS = [
     {
         "name": "negotiate_peer_help",
         "description": (
-            "AI-to-AI negotiation for peer help. Use this INSTEAD of dispatch_peer_request when the employee "
-            "says they need help but hasn't specified who. This tool: "
+            "AI-to-AI negotiation for peer help. ONLY when the employee EXPLICITLY asks to find help or "
+            "hand work off ('find me help', 'can someone take this'). A status update, a mention of "
+            "remaining work, or a complaint is NOT a request — NEVER initiate this on your own; this "
+            "tool contacts real colleagues and creates a request they see. Use it INSTEAD of "
+            "dispatch_peer_request when they haven't specified who. This tool: "
             "(1) finds the best available colleague by skill and workload, "
             "(2) asks that colleague's personal AI to check their own tasks AND calendar before agreeing, "
             "(3) only creates the peer request after their AI accepts — humans only see pre-negotiated requests. "
@@ -1911,9 +1914,14 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
                 return "Not authorized — that action requires a manager."
 
         if not caller_is_lead:
+            # SET the self-identity fields, don't just overwrite-if-present: the
+            # model frequently omits employee_id entirely and handlers then crash
+            # with KeyError ("Tool error in get_my_tasks: 'employee_id'"), leaving
+            # the agent to guess — a real source of wrong-data answers. Employee-
+            # tier tools always act as the CALLER (the B1 rule); handlers simply
+            # ignore fields they don't use.
             for _f in ("employee_id", "sender_id", "author_id"):
-                if _f in tool_input:
-                    tool_input[_f] = caller_id
+                tool_input[_f] = caller_id
             # `from_agent_id` is a STRING agent id (String column), NOT an int FK — so
             # force the caller's real id in the "Employee_<id>" form the handlers and
             # the Team path use. Writing the bare int here broke create_escalation
@@ -2441,7 +2449,7 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             )
 
         elif tool_name == "search_employees":
-            q = db.query(Employee).filter(Employee.system_role == "employee")
+            q = db.query(Employee).filter(Employee.system_role != "manager")
             if tool_input.get("keyword"):
                 kw = f"%{tool_input['keyword']}%"
                 q = q.filter((Employee.name.ilike(kw)) | (Employee.role.ilike(kw)) | (Employee.skills.ilike(kw)))
@@ -2540,7 +2548,7 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             name_query = tool_input["name"].strip()
             matches = db.query(Employee).filter(
                 Employee.name.ilike(f"%{name_query}%"),
-                Employee.system_role == "employee",
+                Employee.system_role != "manager",
             ).all()
             if not matches:
                 return f"No employee found matching '{name_query}'. Use get_team_status to see all employees."
@@ -2859,7 +2867,7 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
 
         elif tool_name == "find_available_colleague":
             exclude_id = tool_input["exclude_id"]
-            q = db.query(Employee).filter(Employee.id != exclude_id, Employee.system_role == "employee")
+            q = db.query(Employee).filter(Employee.id != exclude_id, Employee.system_role != "manager")
             if tool_input.get("role_keyword"):
                 q = q.filter(Employee.role.ilike(f"%{tool_input['role_keyword']}%"))
             employees = q.all()
@@ -2925,7 +2933,7 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             # Find all active colleagues excluding the requester
             candidates = db.query(Employee).filter(
                 Employee.id          != requester_id,
-                Employee.system_role == "employee",
+                Employee.system_role != "manager",
                 Employee.is_active   == True,
             ).all()
 
@@ -3888,7 +3896,9 @@ STOP and call the tool first. A wrong answer destroys trust.
 THE PROPOSE-AND-WAIT RHYTHM:
 For any action that goes outward or is hard to undo — posting publicly, contacting a peer,
 creating an escalation — first state what you propose (who, what, the exact content), ask for
-confirmation, then STOP and wait. Only call the action tool once {employee_name}
+confirmation, then STOP and wait. NEVER initiate peer help or negotiation on your own: a status
+update ("I'm done with most of it, just X left") is NOT a request for help — acknowledge it and
+move on unless they EXPLICITLY ask you to find someone or hand work off. Only call the action tool once {employee_name}
 confirms, in that same turn. Never claim something is done unless the tool actually ran.
 For reads and small reversible changes, just do it. After completing something, name the obvious
 next step if there is one.
