@@ -11,6 +11,7 @@ export default function ConnectionsPage() {
   const [channels, setChannels]              = useState([]);
   const [googleConnected, setGoogleConnected] = useState(false);
   const [mcp, setMcp]                          = useState([]);
+  const [mcpQuery, setMcpQuery]                = useState('');
   const [loading, setLoading]                  = useState(true);
   const [error, setError]                      = useState(null);
 
@@ -91,15 +92,31 @@ export default function ConnectionsPage() {
       </div>
 
       <SectionLabel>Apps &amp; data sources · MCP</SectionLabel>
-      <p style={{ color: 'var(--t3)', fontSize: 12, marginTop: -6, marginBottom: 12 }}>
-        Plug enterprise tools in over MCP so the AI reads your real code, docs, and data — not just task text. Tokens are encrypted at rest.
+      <p style={{ color: 'var(--t3)', fontSize: 12, marginTop: -6, marginBottom: 10 }}>
+        Connect the tools your team already uses — most are one click. The AI then reads your real
+        code, docs, and data, not just task text. Tokens are encrypted at rest; OAuth connections
+        are personal to whoever approves them.
       </p>
-      <div className="nx-grid-3">
-        {MCP_CATALOG.map(app => (
-          <MCPCard key={app.app} app={app} connected={mcp.find(c => c.app === app.app)}
-                   authHeaders={authHeaders} onChange={loadAll} setError={setError} />
-        ))}
-      </div>
+      <input className="nx-input" value={mcpQuery} onChange={e => setMcpQuery(e.target.value)}
+             placeholder="Search apps… (Linear, Stripe, Notion, Jira…)"
+             style={{ maxWidth: 340, marginBottom: 14 }} />
+      {MCP_CATEGORIES.map(cat => {
+        const apps = MCP_CATALOG.filter(a => a.cat === cat &&
+          (a.label + ' ' + a.app).toLowerCase().includes(mcpQuery.trim().toLowerCase()));
+        if (!apps.length) return null;
+        return (
+          <div key={cat} style={{ marginBottom: 16 }}>
+            <div style={{ fontSize: 11, color: 'var(--t3)', textTransform: 'uppercase',
+                          letterSpacing: '0.07em', margin: '2px 0 8px' }}>{cat}</div>
+            <div className="nx-grid-3">
+              {apps.map(app => (
+                <MCPCard key={app.app} app={app} connected={mcp.find(c => c.app === app.app)}
+                         authHeaders={authHeaders} onChange={loadAll} setError={setError} />
+              ))}
+            </div>
+          </div>
+        );
+      })}
 
       {loading && <div style={{ color: 'var(--t3)', fontSize: 13, marginTop: 16 }}>Loading…</div>}
     </div>
@@ -250,15 +267,39 @@ function SlackCard({ linked, authHeaders, onChange, setError }) {
   );
 }
 
-/* ── MCP enterprise apps / data sources ───────────────────────── */
+/* ── MCP enterprise apps / data sources ─────────────────────
+   Every entry probed live against its OAuth metadata (2026-07-06).
+   oauth:true = true one-click (dynamic client registration).
+   admin:true = OAuth works after a one-time admin setup (MCP_CLIENT_ID_<APP>
+   env on the server — the Connect button explains it). */
 const MCP_CATALOG = [
-  { app: 'github',    label: 'GitHub',            color: '#6e5494', url: 'https://api.githubcopilot.com/mcp/', oauth: true, hint: 'One click — repos, PRs, issues.' },
-  { app: 'notion',    label: 'Notion',            color: '#111111', url: 'https://mcp.notion.com/mcp',         oauth: true, hint: 'One click — pages & databases.' },
-  { app: 'linear',    label: 'Linear',            color: '#5E6AD2', url: 'https://mcp.linear.app/mcp',         oauth: true, hint: 'One click — issues & projects.' },
-  { app: 'atlassian', label: 'Jira / Confluence', color: '#0052CC', url: 'https://mcp.atlassian.com/v1/sse',   oauth: true, hint: 'One click — issues & docs.' },
-  { app: 'postgres',  label: 'Postgres',          color: '#336791', url: '',                                    hint: 'Public URL of your Postgres MCP server.' },
-  { app: 'custom',    label: 'Custom MCP server', color: '#10b981', url: '',                                    hint: 'Any MCP server — OAuth if it supports it, or URL + token.' },
+  // Project & work management
+  { cat: 'Project & work', app: 'linear',    label: 'Linear',            color: '#5E6AD2', url: 'https://mcp.linear.app/mcp',       oauth: true, hint: 'One click — issues, projects, cycles.' },
+  { cat: 'Project & work', app: 'atlassian', label: 'Jira / Confluence', color: '#0052CC', url: 'https://mcp.atlassian.com/v1/sse', oauth: true, hint: 'One click — issues, boards, pages.' },
+  { cat: 'Project & work', app: 'asana',     label: 'Asana',             color: '#F06A6A', url: 'https://mcp.asana.com/sse',        oauth: true, hint: 'One click — tasks & projects.' },
+  { cat: 'Project & work', app: 'monday',    label: 'Monday.com',        color: '#FF3D57', url: 'https://mcp.monday.com/sse',       oauth: true, hint: 'One click — boards & items.' },
+  { cat: 'Project & work', app: 'clickup',   label: 'ClickUp',           color: '#7B68EE', url: 'https://mcp.clickup.com/mcp',      oauth: true, hint: 'One click — tasks, docs, goals.' },
+  // Dev & code
+  { cat: 'Dev & code', app: 'github', label: 'GitHub', color: '#6e5494', url: 'https://api.githubcopilot.com/mcp/', oauth: true, admin: true, hint: 'Repos, PRs, issues — one-time admin setup or a PAT.' },
+  { cat: 'Dev & code', app: 'sentry', label: 'Sentry', color: '#8b5cf6', url: 'https://mcp.sentry.dev/mcp',         oauth: true, hint: 'One click — errors & performance issues.' },
+  // Docs & design
+  { cat: 'Docs & design', app: 'notion', label: 'Notion', color: '#111111', url: 'https://mcp.notion.com/mcp', oauth: true, hint: 'One click — pages & databases.' },
+  { cat: 'Docs & design', app: 'figma',  label: 'Figma',  color: '#F24E1E', url: 'https://mcp.figma.com/mcp',  oauth: true, hint: 'One click — files & components.' },
+  { cat: 'Docs & design', app: 'canva',  label: 'Canva',  color: '#00C4CC', url: 'https://mcp.canva.com/mcp',  oauth: true, hint: 'One click — designs & folders.' },
+  { cat: 'Docs & design', app: 'box',    label: 'Box',    color: '#0061D5', url: 'https://mcp.box.com/mcp',    oauth: true, admin: true, hint: 'Files & folders — one-time admin setup.' },
+  // Sales & support
+  { cat: 'Sales & support', app: 'hubspot',  label: 'HubSpot',  color: '#FF7A59', url: 'https://mcp.hubspot.com/',     oauth: true, admin: true, hint: 'CRM — one-time admin setup.' },
+  { cat: 'Sales & support', app: 'intercom', label: 'Intercom', color: '#1F8DED', url: 'https://mcp.intercom.com/mcp', oauth: true, hint: 'One click — conversations & customers.' },
+  // Payments & finance
+  { cat: 'Payments', app: 'stripe', label: 'Stripe', color: '#635BFF', url: 'https://mcp.stripe.com/',      oauth: true, hint: 'One click — payments, customers, invoices.' },
+  { cat: 'Payments', app: 'paypal', label: 'PayPal', color: '#003087', url: 'https://mcp.paypal.com/mcp',   oauth: true, hint: 'One click — transactions & invoices.' },
+  { cat: 'Payments', app: 'square', label: 'Square', color: '#3E4348', url: 'https://mcp.squareup.com/sse', oauth: true, hint: 'One click — payments & catalog.' },
+  // Automation & data
+  { cat: 'Automation & data', app: 'zapier',   label: 'Zapier',            color: '#FF4F00', url: 'https://mcp.zapier.com/api/mcp/mcp', oauth: true, hint: 'One click — your Zaps & 7000+ app actions.' },
+  { cat: 'Automation & data', app: 'postgres', label: 'Postgres',          color: '#336791', url: '', hint: 'Public URL of your Postgres MCP server.' },
+  { cat: 'Automation & data', app: 'custom',   label: 'Custom MCP server', color: '#10b981', url: '', hint: 'Any MCP server — OAuth if it supports it, or URL + token.' },
 ];
+const MCP_CATEGORIES = [...new Set(MCP_CATALOG.map(a => a.cat))];
 
 function MCPCard({ app, connected, authHeaders, onChange, setError }) {
   const [open, setOpen] = useState(false);
