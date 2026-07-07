@@ -163,6 +163,99 @@ def extract_negotiation_decision(request_summary: str, response_text: str) -> di
 
 
 # ---------------------------------------------------------------------------
+# MCP CONNECTOR HEALTH
+# A connector that keeps breaking calls (dead server, revoked token) gets
+# auto-disabled after MCP_DISABLE_AFTER consecutive failures and its owner is
+# notified — otherwise every single command pays a failed-attach + retry tax
+# and the Glass Brain fills with warnings forever.
+# ---------------------------------------------------------------------------
+MCP_DISABLE_AFTER = 3
+
+
+def _mcp_isolate_culprits(servers: list) -> list:
+    """The API error never says WHICH attached server broke the call — and
+    punishing all of them disables healthy connectors (observed: a working
+    GitHub got disabled for a dead test server's sins). Probe each connector
+    alone with a tiny call and return only the ones that actually fail.
+    Runs only in the (rare) failure path; each probe is a few tokens."""
+    culprits = []
+    for s in servers:
+        try:
+            claude_client.beta.messages.create(
+                model="claude-haiku-4-5", max_tokens=8,
+                betas=["mcp-client-2025-11-20"],
+                mcp_servers=[s],
+                tools=[{"type": "mcp_toolset", "mcp_server_name": s.get("name")}],
+                messages=[{"role": "user", "content": "Say ok."}],
+            )
+        except Exception:
+            culprits.append(s.get("name"))
+    # If every probe passes, the failure was something else (transient) —
+    # blame nobody rather than everybody.
+    return culprits
+
+
+def _mcp_mark_failure(names: list):
+    """Bump fail_count for these connectors; disable + notify at the threshold.
+    Own short session; never raises."""
+    if not names:
+        return
+    try:
+        from database.models import MCPConnection
+        _db = SessionLocal()
+        try:
+            rows = _db.query(MCPConnection).filter(
+                MCPConnection.company_id == DEFAULT_COMPANY_ID,
+                MCPConnection.app.in_(names),
+                MCPConnection.enabled == True,  # noqa: E712
+            ).all()
+            for c in rows:
+                c.fail_count = (c.fail_count or 0) + 1
+                if c.fail_count >= MCP_DISABLE_AFTER:
+                    c.enabled = False
+                    recipient = c.owner_id
+                    if recipient is None:   # shared connector → tell the manager
+                        _mgr = _db.query(Employee).filter(
+                            Employee.system_role == "manager").first()
+                        recipient = _mgr.id if _mgr else None
+                    if recipient:
+                        _db.add(Notification(
+                            company_id=c.company_id, recipient_id=recipient,
+                            type="connector", title="Connector disabled",
+                            message=(f"'{c.label}' failed {c.fail_count} times in a row and was "
+                                     f"turned off so it stops slowing your AI down. Fix or "
+                                     f"reconnect it in Connections."),
+                        ))
+                    print(f"⚠️  MCP '{c.app}' auto-disabled after {c.fail_count} consecutive failures.")
+            _db.commit()
+        finally:
+            _db.close()
+    except Exception as e:
+        print(f"⚠️  MCP failure tracking error: {e}")
+
+
+def _mcp_mark_success(names: list):
+    """Healthy attached call → reset counters (writes only when needed)."""
+    if not names:
+        return
+    try:
+        from database.models import MCPConnection
+        _db = SessionLocal()
+        try:
+            n = _db.query(MCPConnection).filter(
+                MCPConnection.company_id == DEFAULT_COMPANY_ID,
+                MCPConnection.app.in_(names),
+                MCPConnection.fail_count > 0,
+            ).update({"fail_count": 0}, synchronize_session=False)
+            if n:
+                _db.commit()
+        finally:
+            _db.close()
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # BROADCAST HELPER
 # Centralised SYNC_REQUIRED fire-and-forget used by all DB-writing tools.
 # ---------------------------------------------------------------------------
@@ -4067,6 +4160,7 @@ def _load_mcp_servers(own_employee_id: int = None) -> list:
                             db.commit()
                         else:
                             print(f"⚠️  MCP '{c.app}': token expired and refresh failed — skipping it.")
+                            _mcp_mark_failure([c.app])   # repeated → auto-disable + notify
                             continue
                 s = {"type": "url", "name": c.app, "url": c.url}
                 if c.auth_token_enc:
@@ -4265,6 +4359,7 @@ def run_orchestrator(agent_id: str, command: str, extra_context: str = None,
 
     max_iterations = 10
     iteration      = 0
+    _mcp_health_reset = False   # reset connector fail-counters once per healthy run
 
     while iteration < max_iterations:
         iteration += 1
@@ -4293,18 +4388,27 @@ def run_orchestrator(agent_id: str, command: str, extra_context: str = None,
                 # unreachable server, oversized toolset — e.g. a misbehaving
                 # Zapier connector). ONE FLAKY CONNECTOR MUST NEVER BRICK THE
                 # ASSISTANT: drop MCP for this run and answer without it.
-                _dropped = [s.get("name") for s in mcp_servers]
+                _attached = list(mcp_servers)
                 print(f"⚠️  MCP-attached call failed ({type(api_err).__name__}: {err_str[:180]}) "
-                      f"— skipping connector(s) {_dropped} for this run.")
+                      f"— skipping connectors for this run.")
+                # Blame only the connectors that individually fail a probe —
+                # never punish healthy ones for a broken neighbor.
+                _culprits = (_mcp_isolate_culprits(_attached) if len(_attached) > 1
+                             else [s.get("name") for s in _attached])
+                _mcp_mark_failure(_culprits)   # repeated failures → auto-disable + notify owner
                 mcp_servers = []
                 tools = [t for t in tools
                          if not (isinstance(t, dict) and t.get("type") == "mcp_toolset")]
                 glass_brain_queue.put(
-                    f"{agent_id}|[GLASS BRAIN] ⚠️ Connector {', '.join(_dropped)} failed — "
-                    f"answering without it (check Connections).")
+                    f"{agent_id}|[GLASS BRAIN] ⚠️ Connector {', '.join(_culprits) or 'attach'} failed — "
+                    f"answering without connectors this time (check Connections).")
                 response = _call(request_messages)   # raises to outer handler if still failing
             else:
                 raise api_err
+
+        if mcp_servers and not _mcp_health_reset:
+            _mcp_mark_success([s.get("name") for s in mcp_servers])
+            _mcp_health_reset = True
 
         _log_usage(agent_id, model, response)
         messages.append({"role": "assistant", "content": serialize_message_content(response.content)})

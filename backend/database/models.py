@@ -890,6 +890,11 @@ class MCPConnection(Base):
     # NULL owner = company-shared (legacy). OAuth connections are PER-USER —
     # the token represents that person's consent at the provider.
     owner_id       = Column(Integer, ForeignKey("employees.id", ondelete="CASCADE"), nullable=True, index=True)
+    # Consecutive attach/refresh failures. Incremented when this connector
+    # breaks an AI call or a token refresh; reset on success. At the disable
+    # threshold the connector is turned off and its owner notified — one dead
+    # connector must not keep taxing every command with a failed attach.
+    fail_count     = Column(Integer, default=0)
     created_at     = Column(DateTime(timezone=True), default=_now)
     updated_at     = Column(DateTime(timezone=True), default=_now, onupdate=_now)
 
