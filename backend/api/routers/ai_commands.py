@@ -100,9 +100,22 @@ async def process_command(
         return {"status": "success", "ai_response": final_response}
 
     except Exception as e:
-        print(f"\n❌ ORCHESTRATOR ERROR: {e}\n")
-        # Don't leak exception internals to the client
-        return {"status": "error", "ai_response": "The AI core hit an error processing that. Please try again."}
+        # Log the FULL traceback via logging (stderr, unbuffered) — the old
+        # print() went to block-buffered stdout and the evidence evaporated.
+        import logging
+        logging.getLogger("nexus.ai_commands").exception("Orchestrator error for %s", agent_id)
+        # Don't leak internals to the client, but DO tell the truth about
+        # transient conditions so the user knows a retry will work.
+        import anthropic as _an
+        if isinstance(e, _an.RateLimitError):
+            msg = "The AI is briefly rate-limited — wait a few seconds and try again."
+        elif isinstance(e, _an.APIStatusError) and getattr(e, "status_code", 0) >= 500:
+            msg = "The AI provider is momentarily overloaded — try again in a moment."
+        elif isinstance(e, (_an.APIConnectionError, _an.APITimeoutError)):
+            msg = "Lost the connection to the AI provider mid-request — try again."
+        else:
+            msg = "The AI core hit an error processing that. Please try again."
+        return {"status": "error", "ai_response": msg}
 
 
 # ---------------------------------------------------------------------------
