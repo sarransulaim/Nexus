@@ -4277,6 +4277,7 @@ def run_orchestrator(agent_id: str, command: str, extra_context: str = None,
             response = _call(request_messages)
         except Exception as api_err:
             err_str = str(api_err)
+            _status = getattr(api_err, "status_code", 0)
             if "tool_use_id" in err_str or "tool_result" in err_str:
                 print(f"⚠️  Memory corruption for {agent_id} — clearing and retrying...")
                 clear_agent_memory(agent_id)
@@ -4286,6 +4287,22 @@ def run_orchestrator(agent_id: str, command: str, extra_context: str = None,
                     response = _call(messages)
                 except Exception as retry_err:
                     return f"System error after memory reset: {str(retry_err)}"
+            elif mcp_servers and ("mcp" in err_str.lower()
+                                  or (400 <= _status < 500 and _status != 429)):
+                # A connected MCP server broke the whole call (bad/expired token,
+                # unreachable server, oversized toolset — e.g. a misbehaving
+                # Zapier connector). ONE FLAKY CONNECTOR MUST NEVER BRICK THE
+                # ASSISTANT: drop MCP for this run and answer without it.
+                _dropped = [s.get("name") for s in mcp_servers]
+                print(f"⚠️  MCP-attached call failed ({type(api_err).__name__}: {err_str[:180]}) "
+                      f"— skipping connector(s) {_dropped} for this run.")
+                mcp_servers = []
+                tools = [t for t in tools
+                         if not (isinstance(t, dict) and t.get("type") == "mcp_toolset")]
+                glass_brain_queue.put(
+                    f"{agent_id}|[GLASS BRAIN] ⚠️ Connector {', '.join(_dropped)} failed — "
+                    f"answering without it (check Connections).")
+                response = _call(request_messages)   # raises to outer handler if still failing
             else:
                 raise api_err
 
