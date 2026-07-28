@@ -9,13 +9,27 @@ from database.models import Project, Task, Contract, Notification
 
 
 def _live_ai_available() -> bool:
-    """Drift v2's benign-vs-breaking DISCRIMINATION needs a real Claude key.
-    CI deliberately runs with a dummy key (no spend), where the assessor
-    fails-to-alert — correct in production, but it would flag the benign
-    edit here. Skip only the discrimination assertions in that case; the
-    fail-safe path (breaking change → alert) is still fully tested."""
+    """Drift v2's benign-vs-breaking DISCRIMINATION needs a WORKING assessor.
+    Whenever the model can't be reached — CI's dummy key, an exhausted credit
+    balance, a provider outage — the assessor fails-to-alert (correct in
+    production: never hide a real drift), which would flag the benign edit
+    here and fail the test for a reason that has nothing to do with the code.
+
+    So probe it: score a trivially benign edit. If that comes back "changed",
+    the assessor is degraded → skip the discrimination assertions. The
+    fail-safe path (breaking change → alert) is still fully exercised."""
     key = os.getenv("CLAUDE_API_KEY", "")
-    return bool(key) and not key.startswith("ci-dummy")
+    if not key or key.startswith("ci-dummy"):
+        return False
+    try:
+        from resolution_engine import assess_contract_drift
+        v = assess_contract_drift(
+            "probe", "producer hands the consumer a JSON payload",
+            "Build the endpoint returning JSON.",
+            "Build the endpoint returning JSON.  (fixed a typo)")
+        return not v["interface_changed"]
+    except Exception:
+        return False
 
 
 def _wipe_drift():

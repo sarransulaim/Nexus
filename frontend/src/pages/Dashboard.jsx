@@ -2,10 +2,10 @@ import React, { useMemo } from 'react';
 import { useNexus } from '../context/NexusContext';
 import { StatCard, SectionHeader, EmptyState, ICON, Icon, ProgressBar } from '../components/ui/SharedUI';
 import { safeStr } from '../utils/helpers';
-import WorkMap from '../components/WorkMap';
+import AttentionPanel from '../components/AttentionPanel';
 
 export default function Dashboard() {
-  const { tasks, employees } = useNexus();
+  const { tasks, employees, setActiveTab } = useNexus();
 
   const empMap = useMemo(() => {
     const m = {};
@@ -180,8 +180,8 @@ export default function Dashboard() {
         </div>
       </div>
 
-      {/* ── 3D Brain ── */}
-      <WorkMap employees={employees} tasks={tasks} />
+      {/* ── Needs your decision (replaced the 3D work map) ── */}
+      <AttentionPanel onOpenApprovals={() => setActiveTab('approvals')} />
     </div>
   );
 }
