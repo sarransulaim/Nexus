@@ -236,3 +236,90 @@ a { color: inherit; text-decoration: none; }
 .pulse-anim    { animation:pulse 2s ease-in-out infinite; }
 
 .delay-1{animation-delay:60ms} .delay-2{animation-delay:120ms} .delay-3{animation-delay:180ms} .delay-4{animation-delay:240ms}
+
+/* ═══════════════════════════════════════════════════════════════
+   RESPONSIVE  —  collapsible sidebar (desktop) + drawer (mobile)
+   The app was desktop-only: fixed 232px sidebar, fixed-column grids,
+   wide tables and panels. Everything below makes it usable from 360px up.
+   ═══════════════════════════════════════════════════════════════ */
+
+/* Shown only on one form factor (JS renders both; CSS picks) */
+.nx-only-mobile  { display:none; }
+.nx-only-desktop { display:inline-flex; }
+
+/* Sidebar transitions between full width and the icon rail */
+.nx-sidebar { transition:width var(--base) var(--ease), transform var(--base) var(--ease); }
+
+/* ── Desktop: collapsed icon rail ── */
+.nx-app.sidebar-collapsed .nx-sidebar { width:60px; }
+.nx-app.sidebar-collapsed .nx-nav-item { justify-content:center; padding-left:0; padding-right:0; }
+.nx-app.sidebar-collapsed .nx-nav-label { text-align:center; padding:0; font-size:9px; opacity:0.6; }
+
+/* Main + side column (e.g. workload | completion donut).
+   Declared BEFORE the breakpoints so the media queries below win. */
+.nx-grid-main-side { display:grid; grid-template-columns:1fr 220px; gap:16px; }
+
+/* Drawer overlay (mobile only) */
+.nx-nav-overlay { display:none; }
+
+@media (max-width: 900px) {
+  .nx-only-mobile  { display:inline-flex; }
+  .nx-only-desktop { display:none !important; }
+
+  /* Sidebar becomes an off-canvas drawer; it must never squeeze the page */
+  .nx-sidebar { position:fixed; top:0; left:0; bottom:0; width:262px;
+                transform:translateX(-100%); box-shadow:0 0 40px rgba(0,0,0,0.5); }
+  .nx-app.nav-open .nx-sidebar { transform:translateX(0); }
+  /* the desktop rail must not apply on mobile — the drawer is full width */
+  .nx-app.sidebar-collapsed .nx-sidebar { width:262px; }
+  .nx-app.nav-open .nx-nav-overlay { display:block; position:fixed; inset:0; z-index:39;
+                                     background:rgba(9,9,13,0.6); animation:fadeIn var(--fast) var(--ease); }
+
+  /* Breathing room: tighter chrome, full-width content */
+  .nx-page   { padding:14px; }
+  .nx-topbar { padding:0 12px; gap:8px; }
+
+  /* Content-heavy grids fold to a single column... */
+  .nx-grid-3, .nx-grid-2, .nx-grid-auto, .nx-grid-main-side {
+    grid-template-columns:1fr;
+  }
+  /* ...but the 4-up stat tiles stay 2-up: one number per row would burn
+     an entire phone screen on four figures. */
+  .nx-grid-4 { grid-template-columns:repeat(2,1fr); gap:10px; }
+
+  /* Split panes (chat) stack instead of sitting side by side */
+  .nx-split      { flex-direction:column; height:auto; }
+  .nx-split-list { width:100%; max-height:38vh; border-right:none;
+                   border-bottom:1px solid var(--b1); }
+  .nx-split-detail { padding:14px; }
+
+  /* Panels that were wider than a phone */
+  .nx-notif-drop { width:min(320px, calc(100vw - 24px)); right:-4px; }
+  .nx-modal      { max-height:92vh; }
+  .nx-modal-header, .nx-modal-body, .nx-modal-footer { padding-left:16px; padding-right:16px; }
+  .nx-empty      { padding:40px 16px; }
+
+  /* Tables keep readable column widths and scroll inside their card
+     (every table already sits in an overflow-x:auto wrapper) rather than
+     squashing to unreadable slivers. */
+  .nx-table { min-width:620px; }
+}
+
+/* Tablet: 4-up becomes 2-up before collapsing to a single column */
+@media (min-width: 901px) and (max-width: 1200px) {
+  .nx-grid-4 { grid-template-columns:repeat(2,1fr); }
+}
+
+/* Wide tables scroll horizontally inside their card instead of
+   stretching the page and creating a body-level scrollbar. */
+.nx-table-wrap { width:100%; overflow-x:auto; -webkit-overflow-scrolling:touch; }
+.nx-table-wrap > table { min-width:640px; }
+
+/* Nothing may push the document sideways */
+html, body, #root { max-width:100%; overflow-x:hidden; }
+
+@media (max-width: 480px) {
+  .nx-page   { padding:10px; }
+  .nx-topbar { padding:0 10px; }
+  .nx-modal-header, .nx-modal-body, .nx-modal-footer { padding-left:14px; padding-right:14px; }
+}

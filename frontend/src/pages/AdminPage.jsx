@@ -609,7 +609,7 @@ function EventLog({ events }) {
       <PanelHeader title="Live Events" subtitle={`${events.length} / 80`} />
       <div style={{
         display: 'grid',
-        gridTemplateColumns: 'repeat(auto-fill, minmax(480px, 1fr))',
+        gridTemplateColumns: 'repeat(auto-fill, minmax(min(480px, 100%), 1fr))',
         maxHeight: 280, overflowY: 'auto',
         fontFamily: 'var(--font-mono, monospace)', fontSize: 11,
       }}>

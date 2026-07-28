@@ -92,7 +92,7 @@ export function GoalsPage() {
   return (
     <div className="animate-in">
       <div style={{ opacity: 0.45, pointerEvents: 'none', filter: 'blur(0.5px)', marginBottom: 24 }}>
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(260px, 1fr))', gap: 14 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(min(260px, 100%), 1fr))', gap: 14 }}>
           {mockGoals.map((g, i) => (
             <div key={i} className="card">
               <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 14 }}>

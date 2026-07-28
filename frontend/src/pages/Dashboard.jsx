@@ -61,7 +61,7 @@ export default function Dashboard() {
       </div>
 
       {/* ── Charts row ── */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 220px', gap: 16 }}>
+      <div className="nx-grid-main-side">
 
         {/* Workload bars */}
         <div className="card">
@@ -123,7 +123,7 @@ export default function Dashboard() {
       </div>
 
       {/* ── Team + Recent Activity ── */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+      <div className="nx-grid-2">
 
         {/* Team summary */}
         <div className="card">

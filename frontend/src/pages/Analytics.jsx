@@ -172,7 +172,7 @@ function TeamDrillContent({ data }) {
   return (
     <>
       {/* Stats row */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 }}>
+      <div className="nx-grid-3">
         {[
           { label: 'Completion', value: `${stats.completion_rate}%`, color: stats.completion_rate >= 70 ? C.green : C.amber },
           { label: 'Active',     value: stats.active,               color: C.t1 },
@@ -254,7 +254,7 @@ function EmployeeDrillContent({ data }) {
             <div style={{ fontSize: 11, color: C.t3, marginTop: 2 }}>{employee.experience}yr exp · {employee.skills || 'No skills listed'}</div>
           </div>
         </div>
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 }}>
+        <div className="nx-grid-3">
           {[
             { label: 'Completion', value: `${stats.completion_rate}%`, color: stats.completion_rate >= 70 ? C.green : C.amber },
             { label: 'AI Cmds',    value: stats.ai_messages,           color: C.ai },
@@ -396,7 +396,7 @@ function OverviewTab({ d, period, onEmpClick }) {
       </div>
 
       {/* Scatter + Trend */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+      <div className="nx-grid-2">
 
         {/* Workload vs Performance scatter */}
         <Section title="Workload vs Performance — Click a dot to drill in">
@@ -455,7 +455,7 @@ function OverviewTab({ d, period, onEmpClick }) {
       </div>
 
       {/* Priority + Peer + Escalation */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 16 }}>
+      <div className="nx-grid-3">
 
         <Section title="Active Priority Breakdown">
           {priority_breakdown.length === 0 ? (
@@ -577,7 +577,7 @@ function TeamsTab({ d, period, onTeamClick }) {
                   <div style={{ fontSize: 10, color: C.t3, marginTop: 2 }}>completion</div>
                 </div>
               </div>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8, marginBottom: 14 }}>
+              <div className="nx-grid-3">
                 {[
                   { l: 'Active',   v: team.active,    c: C.t1 },
                   { l: 'Done',     v: team.completed, c: C.green },
@@ -719,7 +719,7 @@ function AITab({ d }) {
         )}
       </Section>
 
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+      <div className="nx-grid-2">
 
         {/* Peer request stats */}
         <Section title="Peer Collaboration Stats">

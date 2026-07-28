@@ -41,6 +41,8 @@ export const ICON = {
   check:        'M5 13l4 4L19 7',
   chevronDown:  'M19 9l-7 7-7-7',
   chevronRight: 'M9 5l7 7-7 7',
+  chevronLeft:  'M15 19l-7-7 7-7',
+  menu:         'M4 6h16M4 12h16M4 18h16',
   plus:         'M12 4v16m8-8H4',
   search:       'M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0',
   filter:       'M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z',

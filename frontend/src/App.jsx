@@ -46,7 +46,8 @@ const PAGE_META = {
 };
 
 /* ─── Sidebar ────────────────────────────────────────────────── */
-function Sidebar({ currentUser, activeTab, setActiveTab, isSyncing, handleDisconnect }) {
+function Sidebar({ currentUser, activeTab, setActiveTab, isSyncing, handleDisconnect,
+                  collapsed, onToggleCollapse, onNavigate }) {
   const isManager = currentUser?.role === 'Manager';
 
   const managerSections = [
@@ -116,35 +117,57 @@ function Sidebar({ currentUser, activeTab, setActiveTab, isSyncing, handleDiscon
   return (
     <aside className="nx-sidebar">
       {/* Logo */}
-      <div style={{ padding: '16px 14px', borderBottom: '1px solid var(--b1)', display: 'flex', alignItems: 'center', gap: 10 }}>
+      {/* Collapsed rail is only 60px wide — stack the toggle UNDER the logo so
+          it stays reachable (side by side it gets squeezed out of view, which
+          left no way to expand the sidebar again). */}
+      <div style={{ padding: collapsed ? '14px 8px' : '16px 14px', borderBottom: '1px solid var(--b1)',
+                    display: 'flex', alignItems: 'center', gap: collapsed ? 8 : 10,
+                    flexDirection: collapsed ? 'column' : 'row' }}>
         <div style={{ width: 30, height: 30, borderRadius: 8, background: 'var(--p-bg)', border: '1px solid var(--p-border)', display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--p)', flexShrink: 0 }}>
           <Icon path={ICON.nexus} size={15} />
         </div>
-        <div style={{ minWidth: 0 }}>
+        {!collapsed && (
+        <div style={{ minWidth: 0, flex: 1 }}>
           <div style={{ fontSize: 14, fontWeight: 700, color: 'var(--t1)', letterSpacing: '-0.01em' }}>Nexus</div>
           <div style={{ fontSize: 10, color: 'var(--t3)', fontWeight: 500, textTransform: 'uppercase', letterSpacing: '0.06em' }}>
             {isManager ? 'Chief of Staff' : 'Co-Pilot'}
           </div>
         </div>
+        )}
+        {/* Desktop: collapse to an icon rail. Mobile uses the drawer instead. */}
+        <button
+          className="nx-only-desktop"
+          onClick={onToggleCollapse}
+          title={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+          aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+          style={{ marginLeft: collapsed ? 0 : 'auto', background: 'none', border: 'none', cursor: 'pointer',
+                   color: 'var(--t3)', padding: 4, borderRadius: 6, alignItems: 'center' }}
+        >
+          <Icon path={collapsed ? ICON.chevronRight : ICON.chevronLeft} size={16} />
+        </button>
       </div>
 
       {/* Nav sections */}
       <nav style={{ flex: 1, overflowY: 'auto', padding: '8px 0' }}>
         {sections.map(section => (
           <div key={section.label} className="nx-nav-section">
-            <span className="nx-nav-label">{section.label}</span>
+            <span className="nx-nav-label" title={section.label}>
+              {collapsed ? section.label.charAt(0) : section.label}
+            </span>
             {section.items.map(item => (
               <button
                 key={item.id}
-                onClick={() => !item.soon && setActiveTab(item.id)}
+                onClick={() => { if (!item.soon) { setActiveTab(item.id); onNavigate?.(); } }}
                 className={`nx-nav-item ${activeTab === item.id ? 'active' : ''} ${item.soon ? 'dim' : ''}`}
                 title={item.soon ? 'Coming soon' : item.label}
               >
                 <Icon path={item.icon} size={15} />
+                {!collapsed && (
                 <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis' }}>
                   {item.label}
                 </span>
-                {item.soon && (
+                )}
+                {item.soon && !collapsed && (
                   <span style={{ fontSize: 9, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.06em', color: 'var(--t4)', flexShrink: 0 }}>
                     Soon
                   </span>
@@ -155,8 +178,9 @@ function Sidebar({ currentUser, activeTab, setActiveTab, isSyncing, handleDiscon
         ))}
       </nav>
 
-      {/* Bottom: status + user + logout */}
-      <div style={{ borderTop: '1px solid var(--b1)', padding: '10px 10px 12px' }}>
+      {/* Bottom: status + user + logout — hidden on the collapsed rail */}
+      <div style={{ borderTop: '1px solid var(--b1)', padding: '10px 10px 12px',
+                    display: collapsed ? 'none' : 'block' }}>
         {/* Sync status */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '6px 10px', marginBottom: 4 }}>
           <div style={{ width: 6, height: 6, borderRadius: '50%', background: isSyncing ? 'var(--voice)' : 'var(--green)', flexShrink: 0, animation: isSyncing ? 'pulse-anim 1.5s infinite' : 'none' }} />
@@ -262,14 +286,28 @@ function NotificationBell({ notifications, unreadCount, markNotificationRead, ma
 }
 
 /* ─── Top Bar ────────────────────────────────────────────────── */
-function TopBar({ activeTab, currentUser, notifications, unreadCount, markNotificationRead, markAllNotificationsRead, onAudit }) {
+function TopBar({ activeTab, currentUser, notifications, unreadCount, markNotificationRead,
+                 markAllNotificationsRead, onAudit, onOpenNav }) {
   const meta = PAGE_META[activeTab] || { title: 'Nexus', sub: '' };
 
   return (
     <header className="nx-topbar">
-      <div>
-        <div style={{ fontSize: 15, fontWeight: 600, color: 'var(--t1)', letterSpacing: '-0.01em' }}>{meta.title}</div>
-        <div style={{ fontSize: 12, color: 'var(--t3)', marginTop: 1 }}>{meta.sub}</div>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
+        <button
+          className="nx-only-mobile"
+          onClick={onOpenNav}
+          aria-label="Open menu"
+          style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--t2)',
+                   padding: 6, borderRadius: 8, alignItems: 'center', flexShrink: 0 }}
+        >
+          <Icon path={ICON.menu} size={18} />
+        </button>
+        <div style={{ minWidth: 0 }}>
+        <div style={{ fontSize: 15, fontWeight: 600, color: 'var(--t1)', letterSpacing: '-0.01em',
+                      overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{meta.title}</div>
+        <div style={{ fontSize: 12, color: 'var(--t3)', marginTop: 1, overflow: 'hidden',
+                      textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{meta.sub}</div>
+        </div>
       </div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
         {currentUser?.role === 'Manager' && (
@@ -451,6 +489,33 @@ function MainApp() {
     handlePeerRequestAction,
   } = useNexus();
 
+  // Sidebar: a persisted icon-rail collapse on desktop, and an off-canvas
+  // drawer on mobile (separate state — a phone should never open the rail).
+  const [collapsed, setCollapsed] = useState(
+    () => localStorage.getItem('nexus_sidebar_collapsed') === '1'
+  );
+  const [navOpen, setNavOpen] = useState(false);
+
+  const toggleCollapse = useCallback(() => {
+    setCollapsed(prev => {
+      localStorage.setItem('nexus_sidebar_collapsed', prev ? '0' : '1');
+      return !prev;
+    });
+  }, []);
+
+  // Escape closes the drawer; lock body scroll behind it
+  useEffect(() => {
+    if (!navOpen) return;
+    const onKey = (e) => { if (e.key === 'Escape') setNavOpen(false); };
+    window.addEventListener('keydown', onKey);
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      document.body.style.overflow = prevOverflow;
+    };
+  }, [navOpen]);
+
   // System audit — uses currentUser.dbId (not .id — bug we fixed earlier)
   const handleManualAudit = useCallback(async () => {
     try {
@@ -478,13 +543,18 @@ function MainApp() {
   if (!currentUser) return <Login />;
 
   return (
-    <div className="nx-app">
+    <div className={`nx-app${collapsed ? ' sidebar-collapsed' : ''}${navOpen ? ' nav-open' : ''}`}>
+      {/* Tap-outside target for the mobile drawer (CSS shows it only when open) */}
+      <div className="nx-nav-overlay" onClick={() => setNavOpen(false)} aria-hidden="true" />
       <Sidebar
         currentUser={currentUser}
         activeTab={activeTab}
         setActiveTab={setActiveTab}
         isSyncing={isSyncing}
         handleDisconnect={handleDisconnect}
+        collapsed={collapsed}
+        onToggleCollapse={toggleCollapse}
+        onNavigate={() => setNavOpen(false)}
       />
 
       <div className="nx-main">
@@ -496,6 +566,7 @@ function MainApp() {
           markNotificationRead={markNotificationRead}
           markAllNotificationsRead={markAllNotificationsRead}
           onAudit={handleManualAudit}
+          onOpenNav={() => setNavOpen(true)}
         />
 
         <main className="nx-page">
