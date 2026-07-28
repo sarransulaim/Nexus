@@ -182,32 +182,18 @@ def _notify(db, manager, ntype, title, message, entity_id=None, urgent=False) ->
 
 
 def _push_to_channel(db, employee, text):
-    """Send to the employee's primary verified channel (best-effort).
+    """Send to the employee's best linked channel (best-effort).
 
-    Reuses autonomous_briefings._primary_connection so we rely on the SAME
-    proven channel-selection logic the briefings use — no duplicated query
-    that could drift from the real schema.
+    Delegates to api.channel_delivery so Slack, WhatsApp and Telegram are all
+    reachable from one place — this previously routed through the briefing
+    module's WhatsApp/Telegram-only path and skipped Slack users entirely.
     """
     try:
-        from autonomous_briefings import _primary_connection
-        conn = _primary_connection(employee, db)
-        if not conn:
-            return
-        if conn.platform == "whatsapp":
-            import twilio_client as tw
-            if tw.is_configured():
-                tw.send_whatsapp(conn.platform_user_id, text)
-        elif conn.platform == "telegram":
-            import telegram_client as tg
-            if tg.is_configured():
-                tg.send_message(conn.platform_user_id, text)
+        from api.channel_delivery import deliver
+        return deliver(employee, text, db)
     except Exception as e:
-        log.warning(f"proactive channel push failed: {e}")
-
-
-# ═══════════════════════════════════════════════════════════════
-# SCHEDULED JOB + MANUAL TRIGGER
-# ═══════════════════════════════════════════════════════════════
+        log.warning(f"channel push failed for employee {getattr(employee, 'id', '?')}: {e}")
+        return "error"
 
 def run_proactive_scan(force: bool = False) -> dict:
     """The job the scheduler calls. Scans the default company."""

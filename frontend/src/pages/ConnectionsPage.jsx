@@ -279,6 +279,9 @@ const MCP_CATALOG = [
   { cat: 'Project & work', app: 'asana',     label: 'Asana',             color: '#F06A6A', url: 'https://mcp.asana.com/sse',        oauth: true, hint: 'One click — tasks & projects.' },
   { cat: 'Project & work', app: 'monday',    label: 'Monday.com',        color: '#FF3D57', url: 'https://mcp.monday.com/sse',       oauth: true, hint: 'One click — boards & items.' },
   { cat: 'Project & work', app: 'clickup',   label: 'ClickUp',           color: '#7B68EE', url: 'https://mcp.clickup.com/mcp',      oauth: true, hint: 'One click — tasks, docs, goals.' },
+  // Team chat — the MCP server reads channels/history/search as YOU.
+  // (The Slack BOT above is a separate thing: it replies in channels and DMs.)
+  { cat: 'Team chat', app: 'slack', label: 'Slack (search & history)', color: '#4A154B', url: 'https://mcp.slack.com/mcp', oauth: true, admin: true, hint: 'Let the AI search your Slack history — needs the app client id/secret.' },
   // Dev & code
   { cat: 'Dev & code', app: 'github', label: 'GitHub', color: '#6e5494', url: 'https://api.githubcopilot.com/mcp/', oauth: true, admin: true, hint: 'Repos, PRs, issues — one-time admin setup or a PAT.' },
   { cat: 'Dev & code', app: 'sentry', label: 'Sentry', color: '#8b5cf6', url: 'https://mcp.sentry.dev/mcp',         oauth: true, hint: 'One click — errors & performance issues.' },

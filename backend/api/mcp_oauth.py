@@ -127,7 +127,18 @@ def register_client(registration_endpoint: str) -> dict:
 
 # Sensible default scopes for providers that need an explicit scope parameter
 # (override per deployment with MCP_SCOPE_<APP>).
-PROVIDER_DEFAULT_SCOPES = {"github": "repo read:org read:user"}
+PROVIDER_DEFAULT_SCOPES = {
+    "github": "repo read:org read:user",
+    # Slack's MCP server authorizes as the USER (oauth/v2_user/authorize)
+    "slack":  "channels:read channels:history groups:history im:history search:read users:read",
+}
+
+# Providers whose OAuth client can be reused from credentials we already hold,
+# so the operator doesn't have to register a second app. Slack in particular:
+# the workspace app powering the bot is the same app the MCP server expects.
+CLIENT_ID_FALLBACK_ENV = {
+    "slack": ("SLACK_CLIENT_ID", "SLACK_CLIENT_SECRET"),
+}
 
 
 def _env_key(app: str) -> str:
@@ -150,9 +161,16 @@ def start_flow(server_url: str, app: str, label: str,
         # one-time pre-registered OAuth app; after that, one-click works for
         # everyone. Callback URL for the provider's app config: REDIRECT_URI.
         cid = os.getenv(f"MCP_CLIENT_ID_{k}", "").strip()
+        csec = os.getenv(f"MCP_CLIENT_SECRET_{k}", "").strip()
+        if not cid:
+            # Reuse credentials we already hold for this provider (e.g. the
+            # Slack app that runs the bot IS the app Slack's MCP expects).
+            fb = CLIENT_ID_FALLBACK_ENV.get(app.lower())
+            if fb:
+                cid = os.getenv(fb[0], "").strip()
+                csec = os.getenv(fb[1], "").strip()
         if cid:
-            client = {"client_id": cid,
-                      "client_secret": os.getenv(f"MCP_CLIENT_SECRET_{k}", "").strip()}
+            client = {"client_id": cid, "client_secret": csec}
     if client is None:
         raise ValueError(
             f"{label} doesn't support automatic app registration. Use the Advanced option "

@@ -283,20 +283,10 @@ def send_briefing_to(employee: Employee, db) -> dict:
         log.warning(f"in-app notification failed for {employee.id}: {e}")
         db.rollback()
 
-    # External channel (if linked)
-    conn = _primary_connection(employee, db)
-    channel_status = "no_channel"
-    if conn:
-        if conn.platform == "whatsapp":
-            import twilio_client as tw
-            if tw.is_configured():
-                res = tw.send_whatsapp(conn.platform_user_id, briefing)
-                channel_status = "sent_whatsapp" if res.get("success") else "whatsapp_failed"
-        elif conn.platform == "telegram":
-            import telegram_client as tg
-            if tg.is_configured():
-                res = tg.send_message(conn.platform_user_id, briefing)
-                channel_status = "sent_telegram" if res.get("success") else "telegram_failed"
+    # External channel (if linked). One shared dispatcher — this used to know
+    # only WhatsApp/Telegram, so anyone linked via SLACK silently got nothing.
+    from api.channel_delivery import deliver
+    channel_status = deliver(employee, briefing, db)
 
     # Tell the admin board something autonomous just happened
     try:

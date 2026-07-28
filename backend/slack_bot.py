@@ -509,6 +509,28 @@ def _resolve_channel_id(channel: str):
     return None
 
 
+def send_dm(slack_user_id: str, message: str) -> dict:
+    """DM a person on Slack. Used by api/channel_delivery so briefings and
+    proactive alerts reach people where they already are — Slack DMs are free
+    and instant, unlike the WhatsApp sandbox.
+
+    Posting to a user id opens (or reuses) the bot↔user DM automatically.
+    Returns {"success": bool, "error": str} — never raises."""
+    if not app:
+        return {"success": False, "error": "slack not configured"}
+    if not slack_user_id:
+        return {"success": False, "error": "no slack user id"}
+    try:
+        resp = app.client.chat_postMessage(
+            channel=slack_user_id, text=format_for_slack(message))
+        if resp.get("ok"):
+            return {"success": True, "ts": resp.get("ts")}
+        return {"success": False, "error": str(resp.get("error") or resp)[:120]}
+    except Exception as e:
+        log.warning(f"Slack DM to {slack_user_id} failed: {e}")
+        return {"success": False, "error": str(e)[:120]}
+
+
 def post_to_channel(channel: str, message: str) -> str:
     """
     Post a message to a Slack channel as the Nexus bot.
