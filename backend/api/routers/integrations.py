@@ -21,7 +21,5 @@ def integrations_status(current_user: Employee = Depends(get_current_user)):
     """Which of the integrations the backend actually supports are configured here."""
     return {
         "slack":    _configured("SLACK_BOT_TOKEN"),
-        "whatsapp": _configured("TWILIO_ACCOUNT_SID"),
-        "telegram": _configured("TELEGRAM_BOT_TOKEN"),
         "google":   _configured("GOOGLE_CLIENT_ID"),
     }

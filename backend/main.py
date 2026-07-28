@@ -303,7 +303,7 @@ app.include_router(files_router.router,  prefix="/api/v1/files",         tags=["
 from admin_router import router as admin_router
 app.include_router(admin_router, prefix="/api/v1/admin", tags=["Admin"])
 
-# Channels router (Phase 4) — WhatsApp/Telegram/Slack omnichannel
+# Channels router (Phase 4) — Slack/Slack omnichannel
 from channels_router import router as channels_router
 app.include_router(channels_router, prefix="/api/v1/channels", tags=["Channels"])
 

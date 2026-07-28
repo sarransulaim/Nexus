@@ -284,7 +284,7 @@ def send_briefing_to(employee: Employee, db) -> dict:
         db.rollback()
 
     # External channel (if linked). One shared dispatcher — this used to know
-    # only WhatsApp/Telegram, so anyone linked via SLACK silently got nothing.
+    # only Slack, so anyone linked via SLACK silently got nothing.
     from api.channel_delivery import deliver
     channel_status = deliver(employee, briefing, db)
 

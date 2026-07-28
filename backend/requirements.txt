@@ -48,7 +48,6 @@ aiofiles                  # Async file I/O for uploads
 # ── Omnichannel ───────────────────────────────────────────────
 slack-bolt
 slack-sdk
-twilio                    # WhatsApp + SMS
 
 # ── Meetings ──────────────────────────────────────────────────
 livekit                   # Livekit server SDK

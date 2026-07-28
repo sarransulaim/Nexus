@@ -6,8 +6,6 @@ import { Spinner } from '../components/ui/SharedUI';
 // Channels the backend actually supports — status comes from /integrations/status.
 const SUPPORTED = [
   { key: 'slack',    name: 'Slack',            cat: 'Team chat',        color: '#E01E5A' },
-  { key: 'whatsapp', name: 'WhatsApp',         cat: 'Messaging',        color: '#25D366' },
-  { key: 'telegram', name: 'Telegram',         cat: 'Messaging',        color: '#229ED9' },
   { key: 'google',   name: 'Google Workspace', cat: 'Email · Calendar', color: '#4285F4' },
 ];
 

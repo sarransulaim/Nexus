@@ -4,7 +4,7 @@ import axios from 'axios';
 
 import { BACKEND_URL } from '../config';
 
-/* One clean hub for every integration — Productivity, Messaging, and MCP data sources.
+/* One clean hub for every integration — Productivity, Slack, and MCP data sources.
  * (Replaces the old separate Integrations page; all connect flows live here.) */
 export default function ConnectionsPage() {
   const { currentUser } = useNexus();
@@ -87,8 +87,6 @@ export default function ConnectionsPage() {
       <SectionLabel>Messaging</SectionLabel>
       <div className="nx-grid-3" style={{ marginBottom: 26 }}>
         <SlackCard linked={linked('slack')} authHeaders={authHeaders} onChange={loadAll} setError={setError} />
-        <ChannelCard channel={WHATSAPP} linked={linked('whatsapp')} authHeaders={authHeaders} onChange={loadAll} />
-        <ChannelCard channel={TELEGRAM} linked={linked('telegram')} authHeaders={authHeaders} onChange={loadAll} />
       </div>
 
       <SectionLabel>Apps &amp; data sources · MCP</SectionLabel>
@@ -159,69 +157,6 @@ function ConnCard({ logo, name, sub, children, expand }) {
   );
 }
 
-/* ── Messaging: WhatsApp / Telegram (code-link flow) ───────────── */
-const WHATSAPP = { id: 'whatsapp', name: 'WhatsApp', color: '#25D366', placeholder: '+1 234 567 8900',
-  hint: 'Chat with your AI on WhatsApp', prereq: 'First send the join code to the Twilio sandbox number on WhatsApp.' };
-const TELEGRAM = { id: 'telegram', name: 'Telegram', color: '#229ED9', placeholder: 'your numeric chat ID',
-  hint: 'Chat with your AI on Telegram', prereq: 'First open the Nexus bot in Telegram and press Start.' };
-
-function ChannelCard({ channel, linked, authHeaders, onChange }) {
-  const [stage, setStage] = useState('idle');
-  const [identifier, setId] = useState('');
-  const [code, setCode] = useState('');
-  const [busy, setBusy] = useState(false);
-  const [msg, setMsg] = useState(null);
-
-  const startLink = async () => {
-    setBusy(true); setMsg(null);
-    try {
-      await axios.post(`${BACKEND_URL}/api/v1/channels/link`, { platform: channel.id, identifier }, { headers: authHeaders() });
-      setStage('code_sent'); setMsg(`Code sent. Check your ${channel.name}.`);
-    } catch (e) { setMsg(e.response?.data?.detail || 'Failed to send code.'); }
-    finally { setBusy(false); }
-  };
-  const confirmCode = async () => {
-    setBusy(true); setMsg(null);
-    try {
-      await axios.post(`${BACKEND_URL}/api/v1/channels/verify`, { platform: channel.id, identifier, code }, { headers: authHeaders() });
-      setStage('done'); setMsg('Linked.'); onChange();
-      setTimeout(() => { setStage('idle'); setId(''); setCode(''); setMsg(null); }, 1600);
-    } catch (e) { setMsg(e.response?.data?.detail || 'Invalid code.'); }
-    finally { setBusy(false); }
-  };
-
-  const expand = (stage !== 'idle' || msg) ? (
-    <div style={{ marginTop: 12 }}>
-      {stage === 'entering' && (
-        <>
-          <div style={{ color: '#f59e0b', fontSize: 11, marginBottom: 8 }}>{channel.prereq}</div>
-          <input className="nx-input" value={identifier} onChange={e => setId(e.target.value)} placeholder={channel.placeholder} style={{ marginBottom: 8 }} />
-          <div style={{ display: 'flex', gap: 8 }}>
-            <button className="btn btn-primary btn-sm" onClick={startLink} disabled={busy || !identifier}>{busy ? 'Sending…' : 'Send code'}</button>
-            <button className="btn btn-ghost btn-sm" onClick={() => { setStage('idle'); setMsg(null); }}>Cancel</button>
-          </div>
-        </>
-      )}
-      {stage === 'code_sent' && (
-        <>
-          <input className="nx-input" value={code} onChange={e => setCode(e.target.value)} placeholder="6-digit code" maxLength={6} style={{ marginBottom: 8 }} />
-          <div style={{ display: 'flex', gap: 8 }}>
-            <button className="btn btn-primary btn-sm" onClick={confirmCode} disabled={busy || !code}>{busy ? 'Verifying…' : 'Verify'}</button>
-            <button className="btn btn-ghost btn-sm" onClick={() => { setStage('idle'); setCode(''); setMsg(null); }}>Cancel</button>
-          </div>
-        </>
-      )}
-      {msg && <div style={{ marginTop: 8, fontSize: 12, color: stage === 'done' ? 'var(--green)' : 'var(--t2)' }}>{msg}</div>}
-    </div>
-  ) : null;
-
-  return (
-    <ConnCard logo={<Logo color={channel.color} />} name={channel.name}
-              sub={linked ? <span style={{ color: 'var(--green)' }}>✓ Linked</span> : channel.hint} expand={expand}>
-      {stage === 'idle' && !linked && <button className="btn btn-primary btn-sm" onClick={() => setStage('entering')}>Connect</button>}
-    </ConnCard>
-  );
-}
 
 /* ── Slack (DM-the-bot code flow) ──────────────────────────────── */
 function SlackCard({ linked, authHeaders, onChange, setError }) {

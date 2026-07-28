@@ -42,7 +42,7 @@ OVERLOAD_MIN_TASKS    = int(os.getenv("PROACTIVE_OVERLOAD_MIN", "4"))
 OVERLOAD_MARGIN       = int(os.getenv("PROACTIVE_OVERLOAD_MARGIN", "3"))
 DEFAULT_COMPANY_ID    = 1
 
-# Push urgent alerts to the manager's channel (WhatsApp/Telegram)?
+# Push urgent alerts to the manager's Slack DM?
 # Default OFF so we don't spam during development. Flip to "1" when ready.
 PUSH_TO_CHANNEL = os.getenv("PROACTIVE_PUSH_CHANNEL", "0") == "1"
 
@@ -186,7 +186,7 @@ def _push_to_channel(db, employee, text):
 
     Delegates to api.channel_delivery so Slack, WhatsApp and Telegram are all
     reachable from one place — this previously routed through the briefing
-    module's WhatsApp/Telegram-only path and skipped Slack users entirely.
+    module's Slack-only path and skipped Slack users entirely.
     """
     try:
         from api.channel_delivery import deliver
