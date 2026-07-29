@@ -5,6 +5,19 @@ import { BACKEND_URL, WS_BASE } from '../config';
 
 const NexusContext = createContext();
 
+// Registered at IMPORT time, not in an effect: React runs child effects before
+// parent effects, so a page fetching on mount would otherwise race the
+// provider and go out with no Authorization header (observed as a 401 on the
+// dashboard's attention panel after every reload). Reads sessionStorage
+// directly so it always sees the freshest token, including after a refresh.
+axios.interceptors.request.use((config) => {
+  const token = sessionStorage.getItem('nexus_access_token');
+  if (token && !config.headers.Authorization) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
+
 export function useNexus() {
   return useContext(NexusContext);
 }
@@ -135,14 +148,6 @@ export function NexusProvider({ children }) {
   // This interceptor catches one 401, tries to refresh, retries the
   // original request. If refresh fails, logs the user out cleanly.
   useEffect(() => {
-    const requestInterceptor = axios.interceptors.request.use((config) => {
-      const token = accessTokenRef.current;
-      if (token && !config.headers.Authorization) {
-        config.headers.Authorization = `Bearer ${token}`;
-      }
-      return config;
-    });
-
     const responseInterceptor = axios.interceptors.response.use(
       (response) => response,
       async (error) => {
@@ -171,7 +176,6 @@ export function NexusProvider({ children }) {
     );
 
     return () => {
-      axios.interceptors.request.eject(requestInterceptor);
       axios.interceptors.response.eject(responseInterceptor);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -718,6 +722,11 @@ export function NexusProvider({ children }) {
 
       setCurrentUser(userObj);
       setActiveTab(user.role === 'manager' ? 'dashboard' : 'directives');
+
+      // Load the dashboard immediately — the poll below only fires when the
+      // WebSocket is DOWN, so without this the app showed zeros after every
+      // fresh login until some unrelated sync happened to arrive.
+      fetchDashboardData();
 
       // Open WebSocket now that user is logged in
       wsReconnectDelay.current = 1000;
