@@ -3182,11 +3182,11 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
                     f"but all available colleagues' AIs declined. "
                     + (f"Reasons — {'; '.join(decline_reasons[:3])}" if decline_reasons else "")
                 ),
-                context_json=json.dumps({
+                context_json={          # JSON column — store the dict itself
                     "task_id":  task_id,
                     "skill_needed": skill_needed,
                     "candidates_tried": [str(c.id) for _, c, _ in scored[:3]],
-                }),
+                },
                 status="pending",
             ))
             db.commit()
@@ -3244,7 +3244,9 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
                 from_agent_id=tool_input["from_agent_id"],
                 to_agent_id="Manager_1",
                 reason=tool_input["reason"],
-                context_json=tool_input.get("context"),
+                # Keep the column a consistent shape: the model passes free text.
+                context_json=({"context": tool_input["context"]}
+                              if tool_input.get("context") else None),
                 status="pending",
             )
             db.add(esc)
@@ -3269,11 +3271,25 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
                 return "Escalation not found."
             esc.status     = "resolved"
             esc.resolved_at = datetime.now(timezone.utc)
-            # Store resolution text in context_json
+            # Store resolution text in context_json. NOTE: context_json is a
+            # JSON column — SQLAlchemy hands back a dict already, so the old
+            # json.loads()/json.dumps() pair raised TypeError and made EVERY
+            # resolve-with-a-note fail. Legacy rows may hold a JSON *string*
+            # (double-encoded by the writer below), so decode those defensively.
             if tool_input.get("resolution"):
-                existing_ctx = json.loads(esc.context_json) if esc.context_json else {}
+                raw = esc.context_json
+                if isinstance(raw, str):
+                    try:
+                        raw = json.loads(raw)
+                    except (ValueError, TypeError):
+                        raw = {"context": raw}
+                # dict(...) COPIES: a JSON column isn't change-tracked in place,
+                # so mutating the dict SQLAlchemy handed us and assigning the
+                # same object back is a silent no-op — the row committed
+                # unchanged and the resolution note vanished.
+                existing_ctx = dict(raw) if isinstance(raw, dict) else {}
                 existing_ctx["resolution"] = tool_input["resolution"]
-                esc.context_json = json.dumps(existing_ctx)
+                esc.context_json = existing_ctx
             db.commit()
             return f"Escalation {tool_input['escalation_id']} resolved."
 
@@ -3811,9 +3827,16 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
         except Exception:
             pass
         _tool_failed = True
-        # Clean, non-technical message for the user/AI — no raw exceptions leaked
-        return (f"I couldn't complete that action ({tool_name.replace('_', ' ')}) just now. "
-                f"It may be a temporary issue or a setup step that's missing.")
+        # Clean, non-technical message — no raw exceptions leaked to the user.
+        # It also has to stop the model INVENTING a cause: the old wording
+        # ("may be a temporary issue...") invited speculation, and the agent
+        # was observed telling a manager "same backend issue we hit before,
+        # it's not something on our end" — a diagnosis it had no basis for.
+        return (f"TOOL FAILED: {tool_name.replace('_', ' ')} did not complete, and the reason "
+                f"is unknown to you. Tell the user plainly that it failed and that you don't "
+                f"know why; the error is logged for whoever maintains Nexus. Do NOT guess at a "
+                f"cause, do NOT blame a backend/network/known issue, and do NOT promise it will "
+                f"clear on its own. Do not claim the action succeeded.")
     finally:
         # PHASE 3: emit completion — only emit success if we didn't already emit failure
         try:
@@ -3889,7 +3912,7 @@ follow this cadence every time:
   (b) State the specific action you propose to take — concrete details (who, what, when).
   (c) Ask for confirmation, then STOP and wait. Do not call the action tool yet.
   (d) Only when the manager confirms (yes / go ahead / do it) do you call the tool — in that turn.
-Never claim something is done unless the tool actually ran. Never fabricate a success message.
+Never claim something is done unless the tool actually ran. Never fabricate a success message. When a tool FAILS, say so plainly and say you do not know why — never invent a cause (a backend problem, a known issue, something that will clear on its own). Guessing sounds authoritative and sends people chasing nothing.
 For pure reads (status, counts, lookups) and small reversible internal changes (set a priority,
 add a checklist item), just do it — no confirmation needed. Reserve the rhythm for things that
 leave the system or can't be easily undone.
@@ -3992,7 +4015,7 @@ creating an escalation — first state what you propose (who, what, the exact co
 confirmation, then STOP and wait. NEVER initiate peer help or negotiation on your own: a status
 update ("I'm done with most of it, just X left") is NOT a request for help — acknowledge it and
 move on unless they EXPLICITLY ask you to find someone or hand work off. Only call the action tool once {employee_name}
-confirms, in that same turn. Never claim something is done unless the tool actually ran.
+confirms, in that same turn. Never claim something is done unless the tool actually ran. When a tool FAILS, say so plainly and say you do not know why — never invent a cause (a backend problem, a known issue, something that will clear on its own). Guessing sounds authoritative and sends people chasing nothing.
 For reads and small reversible changes, just do it. After completing something, name the obvious
 next step if there is one.
 5. For email tasks, check_google_connection first. If connected, use Gmail tools. If not, give the connect URL.
