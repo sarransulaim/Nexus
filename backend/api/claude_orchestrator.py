@@ -2666,10 +2666,26 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             organizer_id = _own_employee_id(db)
             start_iso    = (tool_input.get("start_iso") or "").strip()
 
+            # Store an ABSOLUTE time string. The user says "tomorrow 2 PM" and
+            # that phrase used to be saved verbatim — so a month later the
+            # meeting still read "tomorrow 2 PM". When we have the exact
+            # start_iso, render a stable display time from it instead.
+            _display_time = tool_input["time"]
+            if start_iso:
+                try:
+                    from api.google_services import _parse_start_iso
+                    _dt = _parse_start_iso(start_iso)
+                    # %-I is glibc-only (breaks on Windows dev), so strip the
+                    # leading zero by hand — portable across both.
+                    _hour = _dt.strftime("%I").lstrip("0") or "12"
+                    _display_time = f"{_dt.strftime('%b %d, %Y')} at {_hour}:{_dt.strftime('%M %p')}"
+                except Exception:
+                    pass   # keep the user's phrasing if the ISO time won't parse
+
             meeting = Meeting(
                 company_id=DEFAULT_COMPANY_ID,
                 topic=tool_input["topic"],
-                scheduled_time=tool_input["time"],
+                scheduled_time=_display_time,
                 # also populate the Date column so briefings / "meetings today" see it
                 scheduled_date=_parse_date(tool_input["time"]),
                 duration_minutes=tool_input.get("duration_minutes"),

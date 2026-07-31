@@ -34,12 +34,20 @@ def format_meeting(meeting: Meeting, viewer: Employee = None) -> dict:
     if viewer is not None and viewer.system_role != "manager":
         if viewer.id not in {a.id for a in meeting.attendees}:
             location = None
+    # is_past is decided HERE, from the date column, so every client groups
+    # meetings the same way instead of re-deriving it (and drifting).
+    # A meeting is past only once its day is fully over; undated meetings are
+    # never "past" — they'd silently disappear into a collapsed section.
+    from datetime import date as _date
+    is_past = bool(meeting.scheduled_date and meeting.scheduled_date < _date.today())
     return {
         "id": meeting.id,
         "topic": meeting.topic,
         "scheduled_time": meeting.scheduled_time,
         "scheduled_date": str(meeting.scheduled_date) if meeting.scheduled_date else None,
         "duration_minutes": meeting.duration_minutes,
+        "status": meeting.status,
+        "is_past": is_past,
         "location": location,
         # Return both the proper list AND a legacy comma string so the
         # existing frontend code doesn't break during transition
