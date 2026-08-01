@@ -58,6 +58,41 @@ jobs:
       - name: Run tests
         run: python -m pytest tests/ -q
 
+      # Called out separately from the suite above so a failure here reads as
+      # "a security invariant broke", not "some test failed". These are the
+      # standing rules (every route authenticated, AI tool tiers hold), not
+      # the per-phase regression tests.
+      - name: Security invariants
+        run: python -m pytest tests/test_security_coverage.py tests/test_security_phase0.py tests/test_security_phase1.py tests/test_security_phase2.py tests/test_security_phase3.py tests/test_security_phase4.py tests/test_security_phase5.py -q
+
+  dependencies:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # requirements.txt is intentionally unpinned, so every build picks up
+      # the current releases — which is why production stays patched without
+      # anyone maintaining pins. The trade-off is that a compromised upstream
+      # release would flow straight through, so this job is the compensating
+      # control: it fails the build on a known-vulnerable dependency.
+      - name: Audit Python dependencies
+        working-directory: backend
+        run: |
+          pip install pip-audit
+          pip install -r requirements.txt
+          pip-audit --progress-spinner off
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Audit npm dependencies
+        working-directory: frontend
+        run: npm audit --audit-level=high
+
   frontend:
     name: Frontend (build)
     runs-on: ubuntu-latest
