@@ -105,11 +105,33 @@ def oauth_callback(state: str = "", code: str = "", error: str = "",
     credential (same pattern as the Google OAuth callback). Stores the tokens
     encrypted on a PER-USER connection and closes the popup."""
     def _page(title: str, body: str, ok: bool) -> HTMLResponse:
-        return HTMLResponse(f"""<!doctype html><html><body style="font-family:sans-serif;
+        # REFLECTED XSS: `body` carries the provider's `error` query parameter
+        # and exception text derived from a user-supplied URL, and both were
+        # interpolated raw into the document. A link to
+        #   /api/v1/mcp/oauth/callback?error=<img src=x onerror=…>
+        # executed attacker script on the BACKEND's origin — the origin that
+        # answers every authenticated API call. Escape both interpolations.
+        import html as _html
+        import secrets as _secrets
+        nonce = _secrets.token_urlsafe(16)
+        safe_title, safe_body = _html.escape(str(title)), _html.escape(str(body))
+        return HTMLResponse(
+            f"""<!doctype html><html><body style="font-family:sans-serif;
             background:#0b0b12;color:#e8e8f0;display:flex;align-items:center;justify-content:center;height:96vh">
-            <div style="text-align:center"><h2>{'✅' if ok else '⚠️'} {title}</h2><p>{body}</p></div>
-            <script>try{{window.opener&&window.opener.postMessage({{type:'nexus-mcp-oauth',ok:{str(ok).lower()}}},'*')}}catch(e){{}}
-            setTimeout(()=>window.close(), {2500 if ok else 6000});</script></body></html>""")
+            <div style="text-align:center"><h2>{'✅' if ok else '⚠️'} {safe_title}</h2><p>{safe_body}</p></div>
+            <script nonce="{nonce}">try{{window.opener&&window.opener.postMessage({{type:'nexus-mcp-oauth',ok:{str(ok).lower()}}},'*')}}catch(e){{}}
+            setTimeout(()=>window.close(), {2500 if ok else 6000});</script></body></html>""",
+            headers={
+                # This page legitimately needs one inline script, so it gets its
+                # own nonce-based policy rather than the API-wide default. With
+                # a nonce present, any injected <script> without it won't run —
+                # so escaping and CSP each cover the other's gaps.
+                "Content-Security-Policy": (
+                    f"default-src 'none'; script-src 'nonce-{nonce}'; "
+                    f"style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"
+                ),
+            },
+        )
 
     if error:
         return _page("Connection cancelled", f"The provider reported: {error}", False)

@@ -18,7 +18,7 @@ Auth follows the app convention: employee_id passed by the caller (the
 frontend already holds currentUser.dbId), same as the notifications router.
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Body
+from fastapi import APIRouter, Depends, HTTPException, Body, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import asc, desc, or_, and_, func
 
@@ -268,7 +268,7 @@ def my_channels(
 @router.get("/{channel_id}/messages")
 def get_messages(
     channel_id: int,
-    limit: int = 50,
+    limit: int = Query(50, ge=1, le=200),
     db: Session = Depends(get_db),
     current_user: Employee = Depends(get_current_user),
 ):
@@ -360,7 +360,7 @@ async def send_message(
 @router.post("/{channel_id}/summarize")
 def summarize_channel(
     channel_id: int,
-    limit: int = Body(40, embed=True),
+    limit: int = Body(40, embed=True, ge=1, le=200),
     db: Session = Depends(get_db),
     current_user: Employee = Depends(get_current_user),
 ):

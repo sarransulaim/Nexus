@@ -229,10 +229,23 @@ async def lifespan(app: FastAPI):
 
 # ── App ───────────────────────────────────────────────────────
 
+# Interactive docs enumerate every route, its parameters, and its schemas —
+# a complete map of the attack surface, served to anyone. Useful locally,
+# not something to publish. Railway sets RAILWAY_ENVIRONMENT=production;
+# NEXUS_PUBLIC_DOCS=1 forces them back on if they're ever wanted there.
+IS_PRODUCTION = (
+    os.getenv("RAILWAY_ENVIRONMENT", "").lower() == "production"
+    or os.getenv("NEXUS_ENV", "").lower() == "production"
+)
+_EXPOSE_DOCS = (not IS_PRODUCTION) or os.getenv("NEXUS_PUBLIC_DOCS", "") == "1"
+
 app = FastAPI(
     title="Nexus Command Enterprise API",
     version="3.0.0",
     lifespan=lifespan,
+    docs_url="/docs" if _EXPOSE_DOCS else None,
+    redoc_url="/redoc" if _EXPOSE_DOCS else None,
+    openapi_url="/openapi.json" if _EXPOSE_DOCS else None,
 )
 
 app.state.limiter = limiter
@@ -260,6 +273,58 @@ app.add_middleware(
 MAX_BODY_BYTES   = int(os.getenv("MAX_REQUEST_BODY_MB", "2")) * 1024 * 1024
 MAX_UPLOAD_BYTES = 50 * 1024 * 1024   # matches file_intelligence.MAX_FILE_SIZE
 _UPLOAD_PATHS    = ("/api/v1/files/upload",)
+
+
+# ── Security response headers ─────────────────────────────────
+# This service answers API calls for a separate frontend origin, so most of
+# these matter less than they would for a site that renders its own HTML —
+# but it DOES serve HTML on the OAuth callback, and a browser that is tricked
+# into treating a JSON response as a document is exactly the case these
+# headers close. Cheap, and they cost nothing to keep correct.
+_SECURITY_HEADERS = {
+    # No inline anything by default; the OAuth callback overrides this with its
+    # own nonce policy (see routers/mcp.py). frame-ancestors 'none' is the
+    # modern X-Frame-Options and stops the API being framed for clickjacking.
+    "Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'; base-uri 'none'",
+    # Stop browsers guessing a JSON/text response is HTML and executing it.
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",              # for browsers predating frame-ancestors
+    "Referrer-Policy": "no-referrer",       # never leak our URLs to third parties
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=()",
+}
+
+# Deliberately NOT set, with reasons — both would break working features:
+#   Cross-Origin-Opener-Policy: same-origin  severs window.opener, and the MCP
+#     OAuth popup calls window.opener.postMessage to tell the app it finished.
+#   Cross-Origin-Resource-Policy: same-site  blocks no-cors loads from another
+#     site, and the frontend (vercel.app) is a different site from this API
+#     (railway.app) — it would break <audio> playback of /manager/speak.
+# Neither buys much for a JSON API that exists to be called cross-site.
+
+# Swagger loads its JS/CSS from a CDN, so the blanket default-src 'none' policy
+# would leave a blank page wherever docs are enabled (local dev).
+_CSP_EXEMPT_PATHS = ("/docs", "/redoc", "/openapi.json")
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    exempt_csp = request.url.path.startswith(_CSP_EXEMPT_PATHS)
+    for header, value in _SECURITY_HEADERS.items():
+        if header == "Content-Security-Policy" and exempt_csp:
+            continue
+        # setdefault semantics: a route that set its own policy (the OAuth
+        # callback's nonce CSP) must win over the blanket default.
+        if header not in response.headers:
+            response.headers[header] = value
+    # HSTS only over TLS — sending it on plain http is meaningless, and
+    # asserting it from a local dev server would pin localhost to https in the
+    # developer's browser for a year.
+    if request.url.scheme == "https" or request.headers.get("x-forwarded-proto") == "https":
+        response.headers.setdefault(
+            "Strict-Transport-Security", "max-age=31536000; includeSubDomains"
+        )
+    return response
 
 
 @app.middleware("http")

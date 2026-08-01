@@ -9,6 +9,7 @@ Gemini will be re-added here for Google Workspace tasks in the next phase.
 import edge_tts
 import tempfile
 from fastapi.responses import FileResponse, JSONResponse
+from starlette.background import BackgroundTask
 from fastapi import APIRouter, BackgroundTasks, Request, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -176,6 +177,15 @@ def get_command_history(
     return {"thread": thread[-40:]}
 
 
+def _unlink_quietly(path: str) -> None:
+    """Delete a temp file, ignoring the case where it's already gone."""
+    import os
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
 @router.post("/speak")
 async def generate_speech(request: Request, current_user: Employee = Depends(get_current_user)):
     """
@@ -202,18 +212,31 @@ async def generate_speech(request: Request, current_user: Employee = Depends(get
     # Retry the flaky free Edge TTS endpoint a few times before giving up.
     last_err = None
     for attempt in range(3):
+        temp_name = None
         try:
             temp_audio = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
             temp_audio.close()
+            temp_name = temp_audio.name
             communicate = edge_tts.Communicate(clean_text, voice, rate="+10%")
-            await communicate.save(temp_audio.name)
+            await communicate.save(temp_name)
             # Sanity check: did we actually get audio bytes?
             import os
-            if os.path.getsize(temp_audio.name) > 0:
-                return FileResponse(temp_audio.name, media_type="audio/mpeg")
+            if os.path.getsize(temp_name) > 0:
+                # delete=False with no cleanup meant every spoken reply left an
+                # .mp3 behind forever — unbounded disk growth on a container
+                # nobody is watching, each file holding a transcript fragment.
+                # BackgroundTask runs after the response is sent, so the
+                # download still completes.
+                return FileResponse(
+                    temp_name, media_type="audio/mpeg",
+                    background=BackgroundTask(_unlink_quietly, temp_name),
+                )
             last_err = "empty audio file"
+            _unlink_quietly(temp_name)
         except Exception as e:
             last_err = str(e)
+            if temp_name:
+                _unlink_quietly(temp_name)   # a failed attempt must not leak either
             await asyncio.sleep(0.6 * (attempt + 1))  # brief backoff
 
     # All retries failed — fail cleanly so the frontend just skips audio.

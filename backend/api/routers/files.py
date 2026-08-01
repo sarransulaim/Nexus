@@ -20,7 +20,7 @@ from datetime import datetime, date, timezone
 from typing import Optional, List
 
 import aiofiles
-from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, UploadFile, File, Depends, HTTPException, BackgroundTasks, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
@@ -472,7 +472,7 @@ async def execute_extraction(
 
 @router.get("/recent")
 def list_recent_files(
-    limit: int = 20,
+    limit: int = Query(20, ge=1, le=100),
     current_user: Employee = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
