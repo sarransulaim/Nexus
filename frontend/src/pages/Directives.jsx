@@ -1,7 +1,7 @@
 import React, { useMemo } from 'react';
 import { useNexus } from '../context/NexusContext';
 import { Icon, ICON, PriorityBadge, StatusBadge, EmptyState, ProgressBar } from '../components/ui/SharedUI';
-import { formatDueDate, safeStr } from '../utils/helpers';
+import { formatDueDate, safeStr, parseLocalDay, startOfToday, isPastDay } from '../utils/helpers';
 
 export default function Directives() {
   const { currentUser, tasks, meetings, employees, setSelectedTask, handlePeerRequestAction } = useNexus();
@@ -12,10 +12,23 @@ export default function Directives() {
     return m;
   }, [employees]);
 
-  const myTasks = useMemo(() =>
-    (tasks || []).filter(t => String(t.owner_id) === String(currentUser?.dbId)),
-    [tasks, currentUser]
-  );
+  // Mine, ordered by what actually needs attention: overdue first, then
+  // soonest due, undated after that, and anything finished at the end.
+  // (Previously just reversed — so a completed task could sit above one
+  // that was overdue.)
+  const myTasks = useMemo(() => {
+    const mine = (tasks || []).filter(t => String(t.owner_id) === String(currentUser?.dbId));
+    const rank = (t) => {
+      if (t.is_completed) return 3;
+      if (t.due_date && isPastDay(t.due_date)) return 0;   // overdue
+      return t.due_date ? 1 : 2;                            // dated, then undated
+    };
+    return mine.sort((a, b) => {
+      const ra = rank(a), rb = rank(b);
+      if (ra !== rb) return ra - rb;
+      return String(a.due_date || '9999').localeCompare(String(b.due_date || '9999'));
+    });
+  }, [tasks, currentUser]);
 
   const { pending, assisting } = useMemo(() => {
     const p = [], a = [];
@@ -30,12 +43,20 @@ export default function Directives() {
     return { pending: p, assisting: a };
   }, [tasks, currentUser, empMap]);
 
+  // This section is titled "Upcoming Meetings" but had no date filter, so
+  // employees were shown meetings that already happened. Keep only ones that
+  // haven't passed (today counts as upcoming), soonest first.
   const myMeetings = useMemo(() => {
     if (currentUser?.role !== 'Employee') return [];
-    return (meetings || []).filter(m => {
-      if (!m.attendee_ids) return false;
-      return m.attendee_ids.split(',').map(id => id.trim()).includes(String(currentUser?.dbId));
+    const mine = (meetings || []).filter(m => {
+      const ids = m.attendee_ids ? String(m.attendee_ids).split(',').map(id => id.trim()) : [];
+      return ids.includes(String(currentUser?.dbId))
+          || (m.attendees || []).some(a => String(a.id) === String(currentUser?.dbId));
     });
+    const upcoming = mine.filter(m =>
+      m.is_past !== undefined ? !m.is_past : !isPastDay(m.scheduled_date));
+    return upcoming.sort((a, b) =>
+      String(a.scheduled_date || '9999').localeCompare(String(b.scheduled_date || '9999')));
   }, [meetings, currentUser]);
 
   const hasContent = myTasks.length || assisting.length || myMeetings.length || pending.length;
@@ -88,7 +109,13 @@ export default function Directives() {
                   </div>
                   <div>
                     <div style={{ fontSize: 14, fontWeight: 500, color: 'var(--t1)' }}>{safeStr(m.topic)}</div>
-                    <div style={{ fontSize: 12, color: 'var(--t3)', marginTop: 2, fontFamily: 'var(--font-mono)' }}>{safeStr(m.scheduled_time)}</div>
+                    <div style={{ fontSize: 12, color: 'var(--t3)', marginTop: 2, fontFamily: 'var(--font-mono)' }}>
+                      {safeStr(m.scheduled_time)}
+                      {parseLocalDay(m.scheduled_date) && (() => {
+                        const diff = Math.round((parseLocalDay(m.scheduled_date) - startOfToday()) / 86400000);
+                        return diff === 0 ? ' · Today' : diff === 1 ? ' · Tomorrow' : ` · in ${diff} days`;
+                      })()}
+                    </div>
                   </div>
                 </div>
               </div>
@@ -104,7 +131,7 @@ export default function Directives() {
             <span className="nx-label">Active Directives</span>
           </div>
           <div className="nx-grid-auto">
-            {[...myTasks].reverse().map(task => {
+            {myTasks.map(task => {
               const subs = task.subtasks || [];
               const done = subs.filter(s => s.is_completed).length;
               const pct  = subs.length > 0 ? Math.round((done / subs.length) * 100) : (task.is_completed ? 100 : 0);
@@ -117,7 +144,12 @@ export default function Directives() {
                       <PriorityBadge priority={task.priority} />
                       <StatusBadge isCompleted={task.is_completed} />
                     </div>
-                    <span style={{ fontSize: 11, color: 'var(--t3)', fontFamily: 'var(--font-mono)', flexShrink: 0 }}>{formatDueDate(task.due_date)}</span>
+                    <span style={{ fontSize: 11, fontFamily: 'var(--font-mono)', flexShrink: 0,
+                                   color: (!task.is_completed && task.due_date && isPastDay(task.due_date))
+                                     ? 'var(--red)' : 'var(--t3)' }}>
+                      {(!task.is_completed && task.due_date && isPastDay(task.due_date)) ? 'Overdue · ' : ''}
+                      {formatDueDate(task.due_date)}
+                    </span>
                   </div>
                   <div style={{ fontSize: 14, fontWeight: 600, color: 'var(--t1)', marginBottom: 10 }}>{safeStr(task.title)}</div>
                   {collab.length > 0 && (

@@ -32,7 +32,20 @@ export function formatDueDate(raw) {
   if (lower === 'today') date = now;
   else if (lower === 'tomorrow') { date = new Date(now); date.setDate(now.getDate() + 1); }
   else if (lower === 'yesterday') { date = new Date(now); date.setDate(now.getDate() - 1); }
-  else date = new Date(raw);
+  else {
+    // A date-only value ("2026-08-05") is parsed by new Date() as UTC
+    // midnight, which renders as the PREVIOUS day in any timezone behind
+    // UTC — a task due the 5th showed "04 Aug". Build it as a local
+    // calendar day instead. Values carrying a time are left alone; those
+    // are real instants and parse correctly.
+    const dateOnly = /^\d{4}-\d{2}-\d{2}$/.test(String(raw).trim());
+    if (dateOnly) {
+      const [y, m, d] = String(raw).trim().split('-').map(Number);
+      date = new Date(y, m - 1, d);
+    } else {
+      date = new Date(raw);
+    }
+  }
   if (isNaN(date.getTime())) return String(raw);
   const hasTime = String(raw).includes('T') || String(raw).includes(':') || lower === 'today' || lower === 'tomorrow';
   const dateStr = date.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
@@ -41,3 +54,21 @@ export function formatDueDate(raw) {
 }
 
 export const safeStr = (val) => (val === null || val === undefined ? '' : String(val));
+
+/* A "YYYY-MM-DD" day parsed as a LOCAL calendar day. new Date() would treat
+   it as UTC midnight, which renders as the previous day anywhere behind UTC. */
+export function parseLocalDay(raw) {
+  if (!raw) return null;
+  const [y, m, d] = String(raw).trim().split('-').map(Number);
+  if (!y || !m || !d) return null;
+  const dt = new Date(y, m - 1, d);
+  return isNaN(dt) ? null : dt;
+}
+
+export const startOfToday = () => { const t = new Date(); t.setHours(0, 0, 0, 0); return t; };
+
+/* A day is past only once it is fully over, so today's items stay current. */
+export function isPastDay(raw) {
+  const d = parseLocalDay(raw);
+  return d ? d < startOfToday() : false;
+}

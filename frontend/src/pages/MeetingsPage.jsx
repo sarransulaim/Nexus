@@ -1,23 +1,9 @@
 import React, { useMemo } from 'react';
 import { useNexus } from '../context/NexusContext';
 import { ICON, EmptyState } from '../components/ui/SharedUI';
-import { safeStr } from '../utils/helpers';
+import { safeStr, parseLocalDay, startOfToday } from '../utils/helpers';
 
 const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-
-/* `scheduled_date` arrives as a plain "YYYY-MM-DD" day. new Date("2026-07-12")
-   parses that as UTC midnight, which in any timezone behind UTC renders as the
-   PREVIOUS day — a meeting on the 12th showed up as the 11th. Parse the parts
-   explicitly so the day is always the local calendar day the user meant. */
-function parseDay(s) {
-  if (!s) return null;
-  const [y, m, d] = String(s).split('-').map(Number);
-  if (!y || !m || !d) return null;
-  const dt = new Date(y, m - 1, d);
-  return isNaN(dt) ? null : dt;
-}
-
-const startOfToday = () => { const t = new Date(); t.setHours(0, 0, 0, 0); return t; };
 
 /* Human label for how far away a meeting is — "Today"/"Tomorrow" are what
    people actually scan for. */
@@ -35,7 +21,7 @@ function whenLabel(day, isPast) {
 }
 
 function MeetingCard({ m, past }) {
-  const day = parseDay(m.scheduled_date);
+  const day = parseLocalDay(m.scheduled_date);
   const names = (m.attendees || []).map(a => a.name).filter(Boolean);
   const when = whenLabel(day, m.is_past);
   return (
@@ -98,7 +84,7 @@ export default function MeetingsPage() {
     const today = startOfToday();
     const up = [], old = [], none = [];
     for (const m of visible) {
-      const day = parseDay(m.scheduled_date);
+      const day = parseLocalDay(m.scheduled_date);
       if (!day) { none.push(m); continue; }
       const isPast = m.is_past !== undefined ? m.is_past : day < today;
       (isPast ? old : up).push(m);
