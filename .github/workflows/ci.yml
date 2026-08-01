@@ -13,6 +13,8 @@ jobs:
   backend:
     name: Backend (migrations + seed + tests)
     runs-on: ubuntu-latest
+    permissions:
+      contents: write        # to post the failure summary as a commit comment
     services:
       postgres:
         image: postgres:16
@@ -56,7 +58,47 @@ jobs:
       - name: Seed demo data
         run: python seed_demo.py
       - name: Run tests
-        run: python -m pytest tests/ -q
+        run: python -m pytest tests/ -q --junitxml=junit.xml
+
+      # A red build whose logs need a token to read is a red build nobody
+      # diagnoses. On failure, post the actual failing tests as a commit
+      # comment, which is readable by anyone who can see the repo.
+      - name: Report failing tests on the commit
+        if: failure()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          python - <<'PY'
+          import json, os, urllib.request, xml.etree.ElementTree as ET
+
+          try:
+              root = ET.parse("junit.xml").getroot()
+          except Exception as e:
+              body = f"CI backend tests failed, and the JUnit report was unreadable: {e}"
+          else:
+              lines = []
+              for case in root.iter("testcase"):
+                  for kind in ("failure", "error"):
+                      node = case.find(kind)
+                      if node is None:
+                          continue
+                      where = f"{case.get('classname','')}::{case.get('name','')}"
+                      detail = (node.get("message") or node.text or "").strip()
+                      lines.append(f"**{kind.upper()}** `{where}`\n```\n{detail[:1200]}\n```")
+              body = ("### CI backend tests failed\n\n" + "\n\n".join(lines)) if lines else \
+                     "### CI backend tests failed, but no individual test reported a failure."
+
+          req = urllib.request.Request(
+              f"https://api.github.com/repos/{os.environ['REPO']}/commits/{os.environ['SHA']}/comments",
+              data=json.dumps({"body": body[:60000]}).encode(),
+              headers={"Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
+                       "Accept": "application/vnd.github+json"},
+              method="POST")
+          with urllib.request.urlopen(req) as r:
+              print("posted commit comment:", r.status)
+          PY
 
       # Called out separately from the suite above so a failure here reads as
       # "a security invariant broke", not "some test failed". These are the

@@ -2,3 +2,4 @@
 __pycache__/
 *.pyc
 nexus_core.db
+backend/junit.xml
