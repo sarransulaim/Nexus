@@ -233,11 +233,27 @@ async def lifespan(app: FastAPI):
 # a complete map of the attack surface, served to anyone. Useful locally,
 # not something to publish. Railway sets RAILWAY_ENVIRONMENT=production;
 # NEXUS_PUBLIC_DOCS=1 forces them back on if they're ever wanted there.
-IS_PRODUCTION = (
-    os.getenv("RAILWAY_ENVIRONMENT", "").lower() == "production"
-    or os.getenv("NEXUS_ENV", "").lower() == "production"
-)
-_EXPOSE_DOCS = (not IS_PRODUCTION) or os.getenv("NEXUS_PUBLIC_DOCS", "") == "1"
+def is_production(env=None) -> bool:
+    """Whether this process is a production deployment."""
+    env = os.environ if env is None else env
+    return (env.get("RAILWAY_ENVIRONMENT", "").lower() == "production"
+            or env.get("NEXUS_ENV", "").lower() == "production")
+
+
+def docs_enabled(env=None) -> bool:
+    """Whether to publish /docs, /redoc and /openapi.json.
+
+    A plain function of the environment so it can be tested directly. The
+    first version of this test re-imported `main` under a patched environment
+    to check the result, which mutates sys.modules for every test that runs
+    afterwards — a fragile trick to verify a boolean.
+    """
+    env = os.environ if env is None else env
+    return (not is_production(env)) or env.get("NEXUS_PUBLIC_DOCS", "") == "1"
+
+
+IS_PRODUCTION = is_production()
+_EXPOSE_DOCS = docs_enabled()
 
 app = FastAPI(
     title="Nexus Command Enterprise API",

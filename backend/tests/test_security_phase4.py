@@ -90,34 +90,37 @@ def test_hsts_sent_when_proxy_reports_https(client):
 
 
 # ── P4.3 docs must not be public in production ────────────────────
-def test_docs_are_disabled_in_production():
+@pytest.mark.parametrize("env,expected", [
+    ({"RAILWAY_ENVIRONMENT": "production"},            False),   # the real deployment
+    ({"NEXUS_ENV": "production"},                      False),
+    ({"NEXUS_ENV": "PRODUCTION"},                      False),   # case-insensitive
+    ({},                                               True),    # local dev keeps docs
+    ({"NEXUS_ENV": "development"},                     True),
+    ({"NEXUS_ENV": "production", "NEXUS_PUBLIC_DOCS": "1"}, True),  # explicit override
+])
+def test_docs_visibility_decision(env, expected):
     """The interactive docs enumerate every route, parameter and schema — a
-    complete map of the attack surface."""
-    import importlib, os, sys
+    complete map of the attack surface — so they must be off in production.
 
-    prev = os.environ.get("NEXUS_ENV")
-    os.environ["NEXUS_ENV"] = "production"
-    try:
-        for mod in ("main",):
-            sys.modules.pop(mod, None)
-        import main as prod_main
-        assert prod_main.IS_PRODUCTION is True
-        assert prod_main.app.docs_url is None, "/docs is served in production"
-        assert prod_main.app.openapi_url is None, "/openapi.json is served in production"
-    finally:
-        if prev is None:
-            os.environ.pop("NEXUS_ENV", None)
-        else:
-            os.environ["NEXUS_ENV"] = prev
-        sys.modules.pop("main", None)
-        importlib.import_module("main")
-
-
-def test_docs_available_outside_production(client):
-    """Positive control: local development keeps its docs."""
+    Tested as a pure function of the environment. The first version of this
+    test re-imported `main` under a patched environment, which mutates
+    sys.modules for every test that runs afterwards; a boolean does not need
+    that much machinery to verify.
+    """
     import main
-    assert main.IS_PRODUCTION is False
-    assert main.app.docs_url == "/docs"
+    assert main.docs_enabled(env) is expected
+
+
+def test_running_app_matches_the_decision(client):
+    """The app must actually be wired to that decision, not just agree with it
+    in the abstract."""
+    import main
+    if main.docs_enabled():
+        assert main.app.docs_url == "/docs"
+        assert main.app.openapi_url == "/openapi.json"
+    else:
+        assert main.app.docs_url is None
+        assert main.app.openapi_url is None
 
 
 # ── P4.4 unbounded limit parameters ───────────────────────────────

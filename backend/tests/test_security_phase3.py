@@ -73,10 +73,22 @@ def test_wrap_is_inert_on_empty_content():
 
 
 def test_slack_transcript_is_framed():
-    """The Slack path must use the shared wrapper, not raw concatenation."""
-    import inspect, slack_bot
-    src = inspect.getsource(slack_bot.handle_mention)
-    assert "untrusted" in src, "Slack channel messages reach the agent unframed"
+    """The Slack path must use the shared wrapper, not raw concatenation.
+
+    Read the source from disk rather than importing the module: slack_bot
+    raises at import time when SLACK_BOT_TOKEN/SLACK_APP_TOKEN are absent,
+    which is the normal state in CI and for anyone running without Slack. The
+    check is about what the code does, so it doesn't need a live Slack app.
+    """
+    import pathlib
+    src = (pathlib.Path(__file__).resolve().parent.parent / "slack_bot.py").read_text(
+        encoding="utf-8")
+    marker = "def handle_mention"
+    assert marker in src, "handle_mention no longer exists — update this test"
+    body = src[src.index(marker):]
+    body = body[:body.find("\ndef ", 1)] if "\ndef " in body[1:] else body
+    assert "untrusted" in body, "Slack channel messages reach the agent unframed"
+    assert "wrap(" in body, "the shared untrusted wrapper is not applied to the transcript"
 
 
 def test_mcp_output_note_added_when_connectors_attached():

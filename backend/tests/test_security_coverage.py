@@ -18,6 +18,18 @@ from fastapi.routing import APIRoute, APIWebSocketRoute
 
 import main
 
+
+def _app():
+    """Resolve the live app on every call.
+
+    Binding `main.app` at import time means these checks inspect whatever
+    module object existed during collection; anything that reloads `main`
+    afterwards would leave them asserting about a stale app.
+    """
+    import importlib
+    return importlib.import_module("main").app
+
+
 # Dependencies that establish an authenticated caller.
 _AUTH_DEPENDENCIES = {"get_current_user", "require_manager", "require_team_lead"}
 
@@ -56,7 +68,7 @@ def _auth_dependencies_of(dependant, seen=None) -> set:
 
 
 def _http_routes():
-    for route in main.app.routes:
+    for route in _app().routes:
         if isinstance(route, APIRoute):
             for method in sorted(route.methods - {"HEAD", "OPTIONS"}):
                 yield method, route.path, route
@@ -84,7 +96,12 @@ def test_public_allowlist_has_no_stale_entries():
     allowlist for whatever takes its path later."""
     live = {(m, p) for m, p, _ in _http_routes()}
     stale = set(PUBLIC_ROUTES) - live
-    assert not stale, f"PUBLIC_ROUTES lists routes that no longer exist: {sorted(stale)}"
+    assert not stale, (
+        f"PUBLIC_ROUTES lists routes that no longer exist: {sorted(stale)}. "
+        f"The app reports {len(live)} routes in total. If that number looks far too "
+        f"small, the app under inspection is not fully built (a partially imported "
+        f"or reloaded `main`) rather than the routes having been deleted."
+    )
 
 
 def test_allowlist_is_small_enough_to_review():
@@ -96,11 +113,13 @@ def test_allowlist_is_small_enough_to_review():
 
 
 def test_websockets_are_accounted_for():
-    live = {r.path for r in main.app.routes if isinstance(r, APIWebSocketRoute)}
+    live = {r.path for r in _app().routes if isinstance(r, APIWebSocketRoute)}
     assert live == WEBSOCKET_ROUTES, (
         f"WebSocket routes changed: {live ^ WEBSOCKET_ROUTES}. WS auth is inline "
         f"(see api/security.py::ws_token_from) — confirm the new socket "
-        f"authenticates BEFORE accept(), then update this set."
+        f"authenticates BEFORE accept(), then update this set. "
+        f"If sockets appear MISSING rather than added, suspect the app object "
+        f"rather than the routes: {len(_app().routes)} routes visible in total."
     )
 
 
