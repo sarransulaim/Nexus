@@ -184,7 +184,9 @@ async def admin_event_stream(websocket: WebSocket, token: str = Query(...)):
     # Validate token + role before accepting
     try:
         payload = _decode_token(token)
-        if payload.get("type") not in (None, "access"):
+        # Strict: a 30-day REFRESH token must not open the admin event stream
+        # (the old check also accepted a missing type).
+        if payload.get("type") != "access":
             await websocket.close(code=4001)
             return
         emp_id = int(payload.get("sub", 0))
@@ -195,7 +197,10 @@ async def admin_event_stream(websocket: WebSocket, token: str = Query(...)):
     # Lookup employee — must be manager
     db = SessionLocal()
     try:
-        emp = db.query(Employee).filter(Employee.id == emp_id).first()
+        emp = db.query(Employee).filter(
+            Employee.id == emp_id,
+            Employee.is_active == True,   # noqa: E712 — a deactivated manager kept streaming
+        ).first()
         if not emp or emp.system_role != "manager":
             await websocket.close(code=4003)
             return

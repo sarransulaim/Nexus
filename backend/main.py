@@ -13,12 +13,13 @@ Features:
   - Schema managed manually via create_tables.py (Alembic disabled)
 """
 
+import hmac
 import os
 import asyncio
 import queue
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Depends
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Depends, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -314,7 +315,14 @@ app.include_router(chat_router, prefix="/api/v1/chat", tags=["Team Chat"])
 # ── Internal sync (Slack bot pings this) ─────────────────────
 
 @app.post("/api/v1/internal/sync")
-async def internal_sync():
+async def internal_sync(x_internal_token: str = Header(default="")):
+    """In-process callers (the Slack bot) nudge every connected dashboard to
+    refetch. It was unauthenticated, so anyone who could reach the port could
+    force a fan-out to all clients. Gated on a secret derived from JWT_SECRET,
+    so there's no new env var to manage."""
+    from api.security import internal_token
+    if not hmac.compare_digest(x_internal_token or "", internal_token()):
+        raise HTTPException(status_code=401, detail="Invalid internal token.")
     await notifier.broadcast("SYNC_REQUIRED")
     return {"status": "ok"}
 

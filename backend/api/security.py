@@ -156,6 +156,14 @@ def get_current_user(
         )
     return employee
 
+def internal_token() -> str:
+    """Shared secret for in-process callers (the Slack bot -> /internal/sync).
+    Derived from JWT_SECRET so there is no extra env var to distribute or
+    rotate; it never authenticates a user, only a loopback caller."""
+    import hashlib
+    return hashlib.sha256(('internal-sync:' + JWT_SECRET).encode()).hexdigest()
+
+
 def require_manager(current_user: Employee = Depends(get_current_user)) -> Employee:
     """
     Extra layer — only managers can access routes using this dependency.

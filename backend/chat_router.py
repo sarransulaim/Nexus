@@ -197,6 +197,9 @@ def my_channels(
         db.query(Channel)
           .join(ChannelMember, ChannelMember.channel_id == Channel.id)
           .filter(ChannelMember.employee_id == employee_id,
+                  # tenant guard: without this a manager could list channels
+                  # belonging to another company by passing its employee id
+                  Channel.company_id == current_user.company_id,
                   Channel.is_archived == False)
           .all()
     )

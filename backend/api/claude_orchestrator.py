@@ -2143,6 +2143,34 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             _db.flush()   # assign id without committing the caller's transaction
         return team
 
+    def _may_access_task(_db, task_id) -> bool:
+        """Managers: any task. Team leads: their team's. Employees: their own,
+        anything in a project they're a member of, or a task they're actively
+        helping on via an accepted peer request. Used by the comment tools,
+        which previously read/wrote comments on ANY task id."""
+        if caller_id is None:          # manager (or system) — unrestricted
+            return True
+        try:
+            t = _db.query(Task).filter(Task.id == int(task_id)).first()
+        except (TypeError, ValueError):
+            return False
+        if not t:
+            return False
+        if t.owner_id == caller_id:
+            return True
+        if lead_scope_ids is not None and t.owner_id in lead_scope_ids:
+            return True
+        if t.project_id is not None:
+            proj = _db.query(Project).filter(Project.id == t.project_id).first()
+            if proj and any(m.id == caller_id for m in (proj.members or [])):
+                return True
+        helping = _db.query(PeerRequest).filter(
+            PeerRequest.task_id == t.id,
+            PeerRequest.recipient_id == caller_id,
+            PeerRequest.status.in_(["Accepted", "Completed"]),
+        ).first()
+        return helping is not None
+
     def _own_employee_id(_db):
         """The caller's own Employee id: employees directly from the token-derived
         caller_id; the manager via row lookup (their real id isn't in 'Manager_1').
@@ -2249,7 +2277,67 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             if not rag.backend_available():
                 return ("The knowledge base search backend is temporarily unavailable. "
                         "Please try again in a moment.")
-            hits = rag.search(DEFAULT_COMPANY_ID, query, k=max(1, min(limit, 10)), query_timeout=8)
+            # ── ACL the results ────────────────────────────────────────
+            # The knowledge base indexes CHAT MESSAGES (incl. private channels
+            # and DMs) and UPLOADED FILES. rag.search only filters by company,
+            # so an employee could retrieve private-channel content and the
+            # manager's documents just by asking the AI to search for them.
+            # Managers are unrestricted; everyone else is limited to channels
+            # they belong to and files they uploaded.
+            allowed_channels = None      # None = unrestricted
+            own_files_only = False
+            if caller_is_team:
+                # A shared-channel agent can't be mapped to a Nexus membership,
+                # so it gets no chat content at all (tasks/docs still work).
+                allowed_channels = set()
+                own_files_only = True
+            elif caller_id is not None:
+                from database.models import ChannelMember
+                _sdb = SessionLocal()
+                try:
+                    _me = _sdb.query(Employee).filter(Employee.id == caller_id).first()
+                    if not _me or _me.system_role != "manager":
+                        allowed_channels = {
+                            m.channel_id for m in _sdb.query(ChannelMember).filter(
+                                ChannelMember.employee_id == caller_id).all()
+                        }
+                        own_files_only = True
+                finally:
+                    _sdb.close()
+
+            # Over-fetch, then filter, so ACL removals don't shrink the answer.
+            _want = max(1, min(limit, 10))
+            hits = rag.search(DEFAULT_COMPANY_ID, query,
+                              k=_want if allowed_channels is None else _want * 4,
+                              query_timeout=8)
+
+            if allowed_channels is not None or own_files_only:
+                _file_ids = {h.get("source_id") for h in hits
+                             if h.get("source_type") == "uploaded_file"}
+                _my_files = set()
+                if _file_ids and own_files_only:
+                    from database.models import UploadedFile
+                    _fdb = SessionLocal()
+                    try:
+                        _my_files = {
+                            f.id for f in _fdb.query(UploadedFile).filter(
+                                UploadedFile.id.in_(_file_ids),
+                                UploadedFile.uploader_id == caller_id).all()
+                        }
+                    finally:
+                        _fdb.close()
+
+                def _visible(h):
+                    st = h.get("source_type")
+                    if st == "message":
+                        if allowed_channels is None:
+                            return True
+                        return (h.get("meta") or {}).get("channel_id") in allowed_channels
+                    if st == "uploaded_file" and own_files_only:
+                        return h.get("source_id") in _my_files
+                    return True
+
+                hits = [h for h in hits if _visible(h)][:_want]
             if not hits:
                 return ("Nothing relevant in the knowledge base for that. "
                         "It may not have been uploaded or indexed yet.")
@@ -2373,6 +2461,8 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             return f"Task {tool_input['task_id']} deleted."
 
         elif tool_name == "add_task_comment":
+            if not _may_access_task(db, tool_input["task_id"]):
+                return "Not authorized — that task isn't yours."
             comment = TaskComment(
                 task_id=tool_input["task_id"],
                 content=tool_input["content"],
@@ -2384,6 +2474,8 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             return f"Comment added to task {tool_input['task_id']}."
 
         elif tool_name == "view_task_comments":
+            if not _may_access_task(db, tool_input["task_id"]):
+                return "Not authorized — that task isn't yours."
             comments = db.query(TaskComment).filter(TaskComment.task_id == tool_input["task_id"]).all()
             if not comments:
                 return "No comments on this task."
@@ -3427,7 +3519,12 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             return "\n".join(f"ID:{n.id} | [{n.type}] {n.title}: {n.message}" for n in notifs)
 
         elif tool_name == "mark_notification_read":
-            notif = db.query(Notification).filter(Notification.id == tool_input["notification_id"]).first()
+            # Read the recipient too: this matched on id alone, so an employee
+            # could mark (and thereby suppress) somebody else's alerts.
+            _nq = db.query(Notification).filter(Notification.id == tool_input["notification_id"])
+            if caller_id is not None:
+                _nq = _nq.filter(Notification.recipient_id == caller_id)
+            notif = _nq.first()
             if not notif:
                 return "Notification not found."
             notif.is_read = True

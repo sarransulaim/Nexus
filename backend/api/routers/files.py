@@ -476,10 +476,15 @@ def list_recent_files(
     current_user: Employee = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """List recent uploads for the current company."""
-    files = db.query(UploadedFile).filter(
+    """Recent uploads. Managers see the company's; everyone else sees only
+    their own — this was company-scoped only, so any employee could enumerate
+    (and then open) documents uploaded by the manager."""
+    q = db.query(UploadedFile).filter(
         UploadedFile.company_id == current_user.company_id,
-    ).order_by(UploadedFile.created_at.desc()).limit(limit).all()
+    )
+    if current_user.system_role != "manager":
+        q = q.filter(UploadedFile.uploader_id == current_user.id)
+    files = q.order_by(UploadedFile.created_at.desc()).limit(limit).all()
 
     result = []
     for f in files:
@@ -509,12 +514,18 @@ def get_file_detail(
     current_user: Employee = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    """Get full detail for one file including its extraction."""
-    f = db.query(UploadedFile).filter(
+    """Full detail for one file, including its extracted contents. Managers
+    may open any company file; everyone else only their own uploads — this
+    returned the extracted TEXT of any document to any authenticated user."""
+    q = db.query(UploadedFile).filter(
         UploadedFile.id         == file_id,
         UploadedFile.company_id == current_user.company_id,
-    ).first()
+    )
+    if current_user.system_role != "manager":
+        q = q.filter(UploadedFile.uploader_id == current_user.id)
+    f = q.first()
     if not f:
+        # 404 (not 403) so a non-owner can't probe which file ids exist.
         raise HTTPException(status_code=404, detail="File not found.")
 
     extraction = db.query(FileExtraction).filter(

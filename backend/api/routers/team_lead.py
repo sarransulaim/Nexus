@@ -94,6 +94,13 @@ def team_overview(db: Session = Depends(get_db),
                       "due": str(t.due_date), "priority": t.priority} for t in due_soon_tasks[:8]],
         "escalations": [{"id": e.id, "from": _from_agent_name(e.from_agent_id, names),
                          "reason": (e.reason or "")[:160]} for e in escalations],
+        # `location` can hold a Google Meet link — a joinable credential. A lead
+        # sees the link only for meetings they're actually in; for the rest of
+        # the team's meetings they see that it exists, not how to join.
         "meetings": [{"id": m.id, "topic": m.topic, "date": str(m.scheduled_date),
-                      "time": m.scheduled_time, "location": m.location} for m in meetings],
+                      "time": m.scheduled_time,
+                      "location": (m.location
+                                   if any(a.id == current_user.id for a in m.attendees)
+                                   or m.created_by == current_user.id
+                                   else None)} for m in meetings],
     }

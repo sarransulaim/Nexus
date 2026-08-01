@@ -150,10 +150,12 @@ def _trigger_sync():
     def _call():
         try:
             import urllib.request
+            from api.security import internal_token as _internal_token
             req = urllib.request.Request(
                 "http://localhost:8000/api/v1/internal/sync",
                 method="POST",
-                headers={"Content-Type": "application/json"},
+                headers={"Content-Type": "application/json",
+                         "X-Internal-Token": _internal_token()},
                 data=b"{}",
             )
             urllib.request.urlopen(req, timeout=3)
