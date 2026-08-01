@@ -303,6 +303,10 @@ def set_employee_password(
         raise HTTPException(status_code=404, detail="Employee not found.")
 
     emp.password_hash = hash_password(payload.new_password)
+    # Resetting a password must END that person's existing sessions — otherwise
+    # a reset prompted by a suspected compromise leaves the attacker's stored
+    # refresh token working for its full 30 days.
+    emp.refresh_token = None
     db.add(AuditLog(
         company_id=current_user.company_id,
         actor_id=current_user.id,
@@ -330,6 +334,9 @@ def change_password(
         raise HTTPException(status_code=401, detail="Current password is incorrect.")
 
     current_user.password_hash = hash_password(payload.new_password)
+    # Changing your password revokes every other session (the classic reason
+    # people change it is that they think someone else has access).
+    current_user.refresh_token = None
     db.add(AuditLog(
         company_id=current_user.company_id,
         actor_id=current_user.id,

@@ -131,6 +131,18 @@ def get_current_user(
     token = credentials.credentials
     payload = decode_token(token)
 
+    # Only ACCESS tokens authenticate an API call. Refresh tokens live 30 days
+    # and are the thing /auth/logout and a password reset revoke — accepting
+    # one here meant a stolen refresh token kept working as a bearer token
+    # forever, so logging out never actually ended a hijacked session.
+    # (/auth/refresh reads its token from the body, not this dependency.)
+    if payload.get("type") != "access":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token type — use an access token.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
     employee_id = int(payload.get("sub"))
     employee = db.query(Employee).filter(
         Employee.id == employee_id,

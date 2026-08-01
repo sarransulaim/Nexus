@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 
 from database.core import get_db
 from database.models import MCPConnection, Employee
-from api.security import get_current_user
+from api.security import get_current_user, require_manager
 from api.token_crypto import encrypt_secret
 
 router = APIRouter()
@@ -29,6 +29,21 @@ class MCPOAuthStart(BaseModel):
     app: str
     label: str = ""
     url: str
+
+
+def _own_or_shared_for(db: Session, conn_id: int, user: Employee):
+    """Row this user may administer: their own always; company-SHARED ones only
+    if they're a manager. Previously any employee could disable or delete a
+    shared connector the whole company relied on."""
+    q = db.query(MCPConnection).filter(
+        MCPConnection.id == conn_id,
+        MCPConnection.company_id == user.company_id,
+    )
+    if user.system_role == "manager":
+        q = q.filter((MCPConnection.owner_id.is_(None)) | (MCPConnection.owner_id == user.id))
+    else:
+        q = q.filter(MCPConnection.owner_id == user.id)
+    return q.first()
 
 
 def _public(c: MCPConnection, viewer: Employee = None) -> dict:
@@ -133,7 +148,16 @@ def oauth_callback(state: str = "", code: str = "", error: str = "",
 
 @router.post("/")
 def connect(payload: MCPConnect, db: Session = Depends(get_db),
-            current_user: Employee = Depends(get_current_user)):
+            current_user: Employee = Depends(require_manager)):
+    """Create/update a COMPANY-SHARED connector. Manager-only.
+
+    Shared connectors are attached to EVERY agent's Claude call, including the
+    manager's, along with their decrypted token. When any employee could write
+    this row they could repoint an existing connector at a server they control
+    and inherit the company's real third-party token, while feeding attacker
+    text into the manager's agent. Per-user OAuth connections are unaffected —
+    those are created by the callback and belong to the person who consented.
+    """
     if not payload.app.strip() or not payload.url.strip():
         raise HTTPException(status_code=400, detail="app and url are required.")
     label = payload.label.strip() or payload.app.strip()
@@ -147,10 +171,15 @@ def connect(payload: MCPConnect, db: Session = Depends(get_db),
         MCPConnection.owner_id.is_(None),
     ).first()
     if c:
+        new_url = payload.url.strip()
         c.label = label
-        c.url = payload.url.strip()
         if enc is not None:
             c.auth_token_enc = enc
+        elif new_url != c.url:
+            # Defense in depth: a credential must never follow a connector to a
+            # different host. Repointing without supplying a token drops it.
+            c.auth_token_enc = None
+        c.url = new_url
         c.enabled = True
     else:
         c = MCPConnection(
@@ -166,9 +195,7 @@ def connect(payload: MCPConnect, db: Session = Depends(get_db),
 @router.patch("/{conn_id}/toggle")
 def toggle(conn_id: int, db: Session = Depends(get_db),
            current_user: Employee = Depends(get_current_user)):
-    c = db.query(MCPConnection).filter(
-        MCPConnection.id == conn_id, MCPConnection.company_id == current_user.company_id,
-        (MCPConnection.owner_id.is_(None)) | (MCPConnection.owner_id == current_user.id)).first()
+    c = _own_or_shared_for(db, conn_id, current_user)
     if not c:
         raise HTTPException(status_code=404, detail="Connection not found.")
     c.enabled = not c.enabled
@@ -179,9 +206,7 @@ def toggle(conn_id: int, db: Session = Depends(get_db),
 @router.delete("/{conn_id}")
 def disconnect(conn_id: int, db: Session = Depends(get_db),
                current_user: Employee = Depends(get_current_user)):
-    c = db.query(MCPConnection).filter(
-        MCPConnection.id == conn_id, MCPConnection.company_id == current_user.company_id,
-        (MCPConnection.owner_id.is_(None)) | (MCPConnection.owner_id == current_user.id)).first()
+    c = _own_or_shared_for(db, conn_id, current_user)
     if not c:
         raise HTTPException(status_code=404, detail="Connection not found.")
     db.delete(c); db.commit()

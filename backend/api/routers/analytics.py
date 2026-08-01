@@ -9,7 +9,7 @@ All data from existing tables — zero schema changes.
 Single-pass DB fetch — no N+1 query loops.
 """
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, HTTPException
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta, timezone, date as date_type
 from collections import defaultdict
@@ -20,7 +20,7 @@ from database.models import (
     Task, Employee, PeerRequest, Escalation,
     AgentMemory, Meeting, Goal, TimeEntry,
 )
-from api.security import get_current_user
+from api.security import get_current_user, require_manager
 
 router = APIRouter()
 
@@ -96,8 +96,11 @@ def _is_this_week(scheduled_time, week_start, week_end) -> bool:
 def get_analytics_summary(
     period: str = Query(default="month"),
     db: Session = Depends(get_db),
-    current_user: Employee = Depends(get_current_user),
+    current_user: Employee = Depends(require_manager),
 ):
+    """Org-wide performance. Manager-only: this aggregates every employee's
+    output. `current_user` used to be bound here and never checked, so any
+    logged-in employee could pull the whole company's analytics."""
     period_start, prev_start, period_label, period_days = _get_period_bounds(period)
     now   = datetime.now(timezone.utc)
     today = now.date()
@@ -292,10 +295,20 @@ def get_team_analytics(
     db: Session = Depends(get_db),
     current_user: Employee = Depends(get_current_user),
 ):
+    # Managers see any team; everyone else only their own. Previously any
+    # employee could read any team's per-person numbers by name.
+    if current_user.system_role != "manager":
+        if not current_user.team or current_user.team.lower() != (team_name or "").lower():
+            raise HTTPException(status_code=403, detail="You can only view your own team's analytics.")
+
     period_start, _, period_label, period_days = _get_period_bounds(period)
     today = datetime.now(timezone.utc).date()
 
-    members = db.query(Employee).filter(Employee.team == team_name, Employee.system_role != "manager").all()
+    members = db.query(Employee).filter(
+        Employee.team == team_name,
+        Employee.company_id == current_user.company_id,
+        Employee.system_role != "manager",
+    ).all()
     if not members:
         return {"error": f"No employees found in team '{team_name}'"}
 
@@ -368,7 +381,21 @@ def get_employee_analytics(
 ):
     today = datetime.now(timezone.utc).date()
 
-    emp = db.query(Employee).filter(Employee.id == employee_id).first()
+    # Tenant-scoped lookup first — this used to fetch by raw id with no
+    # company filter and no authorization, a full IDOR on anyone's record.
+    emp = db.query(Employee).filter(
+        Employee.id == employee_id,
+        Employee.company_id == current_user.company_id,
+    ).first()
+    if emp is not None and current_user.system_role != "manager":
+        # You may read yourself; a team lead may also read their own team.
+        same_team = (
+            current_user.system_role == "team_lead"
+            and current_user.team_id is not None
+            and emp.team_id == current_user.team_id
+        )
+        if emp.id != current_user.id and not same_team:
+            raise HTTPException(status_code=403, detail="Not authorized to view this employee's analytics.")
     if not emp:
         return {"error": "Employee not found"}
 
