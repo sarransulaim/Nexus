@@ -103,7 +103,12 @@ def test_reencrypt_all_is_idempotent_and_preserves_values():
     try:
         for _ in range(2):          # twice — rotation must be re-runnable
             stats = reencrypt_all()
-            assert stats["failed"] == 0, f"rotation failed on a row: {stats}"
+            # Assert on OUR row below, not on the global counters: reencrypt_all
+            # walks the whole table, so any pre-existing row written under a key
+            # this environment doesn't hold (a seeded fixture, a CI database
+            # with different secrets) shows up in stats["failed"] and has
+            # nothing to do with what this test is checking.
+            assert stats["migrated"] >= 1, f"rotation migrated nothing: {stats}"
         s = SessionLocal()
         try:
             row = s.query(MCPConnection).filter(MCPConnection.id == cid).first()

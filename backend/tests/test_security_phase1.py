@@ -85,17 +85,32 @@ def test_manager_recent_files_includes_own(client, actors, mgr_file):
 
 # ── P1.3 AI tools: ownership on comments + notifications ──────────
 def test_employee_cannot_read_comments_on_foreign_task(actors):
+    """The task must be one the caller has NO route to: not owner, not their
+    team lead's scope, not a shared project, no accepted peer request.
+
+    Picking an arbitrary seeded task is not good enough — on the demo data the
+    two employees share a project, and project members are *supposed* to see
+    each other's task comments, so the assertion failed against a legitimate
+    allow. Build the isolated case explicitly instead.
+    """
     from api.claude_orchestrator import execute_tool
     s = SessionLocal()
     try:
-        t = s.query(Task).filter(Task.owner_id == actors["other_id"]).first()
-        if not t:
-            pytest.skip("no task owned by the other employee")
-        tid = t.id
+        t = Task(company_id=1, owner_id=actors["other_id"], project_id=None,
+                 title="P1TEST private task", description="not yours",
+                 priority="Medium", is_completed=False)
+        s.add(t); s.commit(); tid = t.id
     finally:
         s.close()
-    out = execute_tool("view_task_comments", {"task_id": tid}, f"Employee_{actors['emp_id']}")
-    assert "not authorized" in out.lower(), f"unexpected: {out[:120]}"
+    try:
+        out = execute_tool("view_task_comments", {"task_id": tid},
+                           f"Employee_{actors['emp_id']}")
+        assert "not authorized" in out.lower(), f"unexpected: {out[:120]}"
+    finally:
+        s = SessionLocal()
+        s.query(TaskComment).filter(TaskComment.task_id == tid).delete()
+        s.query(Task).filter(Task.id == tid).delete()
+        s.commit(); s.close()
 
 
 def test_employee_can_read_comments_on_own_task(actors):
