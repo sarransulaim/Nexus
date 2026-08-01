@@ -63,9 +63,17 @@ def discover(server_url: str) -> dict:
     Returns {"authorization_endpoint", "token_endpoint", "registration_endpoint"
     (may be None), "resource"} or raises ValueError with a user-readable reason.
     """
+    # Everything below fetches this URL from the backend, so validate before
+    # the first request rather than after: an https URL pointed at
+    # 169.254.169.254 would otherwise have us read cloud instance metadata and
+    # hand the result back through the OAuth flow.
+    from api.url_guard import validate_outbound_url, UnsafeURL
+    try:
+        server_url = validate_outbound_url(server_url)
+    except UnsafeURL as e:
+        raise ValueError(str(e))
+
     p = urlparse(server_url)
-    if p.scheme != "https" and not p.netloc.startswith(("localhost", "127.0.0.1")):
-        raise ValueError("MCP server URL must be https.")
     origin = f"{p.scheme}://{p.netloc}"
     path = (p.path or "").rstrip("/")
 

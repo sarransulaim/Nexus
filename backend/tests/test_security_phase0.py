@@ -79,7 +79,7 @@ def test_employee_cannot_repoint_shared_connector(client, actors):
     s = SessionLocal()
     try:
         c = MCPConnection(company_id=1, app="sectest", label="SecTest",
-                          url="https://legit.example/mcp", owner_id=None,
+                          url="https://mcp.notion.com/mcp", owner_id=None,
                           auth_token_enc=None, enabled=True, auth_type="token")
         s.add(c); s.commit(); cid = c.id
     finally:
@@ -92,7 +92,7 @@ def test_employee_cannot_repoint_shared_connector(client, actors):
         s = SessionLocal()
         try:
             assert s.query(MCPConnection).filter(MCPConnection.id == cid).first().url \
-                == "https://legit.example/mcp", "shared connector URL was changed"
+                == "https://mcp.notion.com/mcp", "shared connector URL was changed"
         finally:
             s.close()
     finally:
@@ -105,7 +105,7 @@ def test_employee_cannot_delete_shared_connector(client, actors):
     s = SessionLocal()
     try:
         c = MCPConnection(company_id=1, app="sectest2", label="SecTest2",
-                          url="https://legit.example/mcp", owner_id=None, enabled=True,
+                          url="https://mcp.notion.com/mcp", owner_id=None, enabled=True,
                           auth_type="token")
         s.add(c); s.commit(); cid = c.id
     finally:
@@ -126,7 +126,7 @@ def test_manager_repoint_without_token_drops_the_old_secret(client, actors):
     s = SessionLocal()
     try:
         c = MCPConnection(company_id=1, app="sectest3", label="SecTest3",
-                          url="https://legit.example/mcp", owner_id=None,
+                          url="https://mcp.notion.com/mcp", owner_id=None,
                           auth_token_enc=encrypt_secret("super-secret-token"),
                           enabled=True, auth_type="token")
         s.add(c); s.commit()
@@ -135,12 +135,12 @@ def test_manager_repoint_without_token_drops_the_old_secret(client, actors):
     try:
         r = client.post("/api/v1/mcp/",
                         headers={"Authorization": f"Bearer {actors['mgr_tok']}"},
-                        json={"app": "sectest3", "url": "https://elsewhere.example/mcp"})
+                        json={"app": "sectest3", "url": "https://api.githubcopilot.com/mcp/"})
         assert r.status_code == 200
         s = SessionLocal()
         try:
             row = s.query(MCPConnection).filter(MCPConnection.app == "sectest3").first()
-            assert row.url == "https://elsewhere.example/mcp"
+            assert row.url == "https://api.githubcopilot.com/mcp/"
             assert row.auth_token_enc is None, "old token followed the connector to a new host"
         finally:
             s.close()

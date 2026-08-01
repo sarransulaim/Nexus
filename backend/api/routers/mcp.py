@@ -160,6 +160,14 @@ def connect(payload: MCPConnect, db: Session = Depends(get_db),
     """
     if not payload.app.strip() or not payload.url.strip():
         raise HTTPException(status_code=400, detail="app and url are required.")
+    # A stored connector URL is fetched later by the model's MCP connector, so
+    # it must clear the same bar as the OAuth path — no pointing it at the
+    # instance metadata service or back at our own private network.
+    from api.url_guard import validate_outbound_url, UnsafeURL
+    try:
+        validate_outbound_url(payload.url.strip())
+    except UnsafeURL as e:
+        raise HTTPException(status_code=400, detail=str(e))
     label = payload.label.strip() or payload.app.strip()
     enc = encrypt_secret(payload.auth_token) if payload.auth_token else None
     # one SHARED row per (company, app) — upsert so re-connecting updates the
