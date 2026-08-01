@@ -112,6 +112,12 @@ class Employee(Base):
     team          = Column(String(100), nullable=True)
     password_hash = Column(String(256), nullable=True)
     refresh_token = Column(String(512), nullable=True)
+    # Rotation: /auth/refresh issues a NEW refresh token every time and keeps
+    # the outgoing one here briefly, so an in-flight retry (or a second tab
+    # racing the same refresh) isn't punished. Presenting the PREVIOUS token
+    # after the grace window means two parties hold it → treated as theft.
+    refresh_token_prev       = Column(String(512), nullable=True)
+    refresh_token_rotated_at = Column(DateTime(timezone=True), nullable=True)
     is_active     = Column(Boolean, default=True, index=True)
     last_login    = Column(DateTime(timezone=True), nullable=True)
     age           = Column(Integer, nullable=True)

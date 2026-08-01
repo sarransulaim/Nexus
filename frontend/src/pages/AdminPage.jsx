@@ -104,7 +104,8 @@ export default function AdminPage() {
   const connectStream = useCallback(() => {
     const token = sessionStorage.getItem('nexus_access_token');
     if (!token) return;
-    const ws = new WebSocket(`${WS_BASE}/api/v1/admin/stream?token=${encodeURIComponent(token)}`);
+    // Token in the subprotocol, not the query string — proxies log URLs.
+    const ws = new WebSocket(`${WS_BASE}/api/v1/admin/stream`, ['nexus-auth', token]);
     wsRef.current = ws;
     ws.onopen    = () => setWsConnected(true);
     ws.onerror   = () => setWsConnected(false);

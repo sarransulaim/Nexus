@@ -299,7 +299,12 @@ export function NexusProvider({ children }) {
     const employeeId = currentUserRef.current.dbId;
     // Auth: the WS now requires a valid token whose subject matches employeeId
     const wsToken    = accessTokenRef.current || '';
-    const wsUrl      = `${WS_BASE}/api/v1/ws/${employeeId}?token=${encodeURIComponent(wsToken)}`;
+    // The token rides in Sec-WebSocket-Protocol, not the URL: query strings are
+    // written to proxy access logs and browser history, and this is an 8-hour
+    // credential. Browsers can't set arbitrary headers on a WS handshake, but
+    // the subprotocol list is one they will send. The server echoes back
+    // 'nexus-auth' to complete the handshake.
+    const wsUrl      = `${WS_BASE}/api/v1/ws/${employeeId}`;
 
     try {
       // Per-socket flag: a failed HANDSHAKE (expired token → server closes
@@ -307,7 +312,7 @@ export function NexusProvider({ children }) {
       // 1006 instead of our 1008 — so "never opened" is also treated as auth
       // failure below and triggers a token refresh before reconnecting.
       let wsEverOpened = false;
-      const ws = new WebSocket(wsUrl);
+      const ws = new WebSocket(wsUrl, ['nexus-auth', wsToken]);
       wsRef.current = ws;
 
       ws.onopen = () => {

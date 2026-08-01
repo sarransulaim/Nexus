@@ -20,6 +20,7 @@ import queue
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Depends, Header, HTTPException
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -251,6 +252,39 @@ app.add_middleware(
 )
 
 
+# ── Request body size cap ─────────────────────────────────────
+# Nothing bounded how much a client could POST. A single multi-hundred-MB
+# JSON body is read into memory before any handler sees it, and /manager/command
+# forwards its body into a paid model call — so an unbounded body is both a
+# memory-exhaustion lever and a way to run up the API bill.
+MAX_BODY_BYTES   = int(os.getenv("MAX_REQUEST_BODY_MB", "2")) * 1024 * 1024
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024   # matches file_intelligence.MAX_FILE_SIZE
+_UPLOAD_PATHS    = ("/api/v1/files/upload",)
+
+
+@app.middleware("http")
+async def limit_request_body(request: Request, call_next):
+    cap = MAX_UPLOAD_BYTES if request.url.path.startswith(_UPLOAD_PATHS) else MAX_BODY_BYTES
+    declared = request.headers.get("content-length")
+    if declared:
+        try:
+            if int(declared) > cap:
+                return JSONResponse(
+                    status_code=413,
+                    content={"detail": f"Request body too large (limit {cap // (1024*1024)} MB)."},
+                )
+        except ValueError:
+            return JSONResponse(status_code=400, content={"detail": "Invalid Content-Length."})
+    return await call_next(request)
+
+
+# NOTE: a chunked request sends no Content-Length, so this check can't see its
+# size up front. The upload route streams and counts bytes itself (files.py
+# aborts past MAX_FILE_SIZE); browsers send Content-Length for ordinary JSON.
+# A byte-counting ASGI wrapper would close the gap fully — worth doing if we
+# ever accept chunked bodies on non-upload routes.
+
+
 # ── Health check ──────────────────────────────────────────────
 
 @app.get("/health")
@@ -382,9 +416,13 @@ async def websocket_endpoint(websocket: WebSocket, employee_id: int):
     matches employee_id, so a client can only connect as itself — otherwise it
     could eavesdrop on another user's notifications and channel broadcasts.
     """
-    token = websocket.query_params.get("token")
+    from api.security import decode_token, ws_token_from, WS_AUTH_SUBPROTOCOL
+    token, from_query = ws_token_from(websocket)
+    accept_subprotocol = None if from_query else WS_AUTH_SUBPROTOCOL
+    if from_query and token:
+        print(f"⚠️  WS {employee_id} authenticated via ?token= — deprecated (proxies log "
+              f"the URL). Update the client to offer the '{WS_AUTH_SUBPROTOCOL}' subprotocol.")
     try:
-        from api.security import decode_token
         payload = decode_token(token) if token else None
         if (not payload or payload.get("type") != "access"
                 or int(payload.get("sub")) != employee_id):
@@ -401,16 +439,21 @@ async def websocket_endpoint(websocket: WebSocket, employee_id: int):
     db = SessionLocal()
     try:
         from database.models import ChannelMember, Employee
-        emp = db.query(Employee).filter(Employee.id == employee_id).first()
-        is_manager = bool(emp and emp.system_role == "manager")
+        emp = db.query(Employee).filter(
+            Employee.id == employee_id,
+            Employee.is_active == True,   # noqa: E712 — a deactivated account kept streaming
+        ).first()
+        if not emp:
+            await websocket.close(code=1008)
+            return
+        is_manager = bool(emp.system_role == "manager")
         channel_ids = [m.channel_id for m in db.query(ChannelMember).filter(
             ChannelMember.employee_id == employee_id).all()]
-    except Exception:
-        pass
     finally:
         db.close()
 
-    await notifier.connect(websocket, employee_id, is_manager=is_manager)
+    await notifier.connect(websocket, employee_id, is_manager=is_manager,
+                           subprotocol=accept_subprotocol)
     for cid in channel_ids:
         await notifier.join_channel(employee_id, cid)
 

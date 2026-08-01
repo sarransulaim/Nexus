@@ -3626,8 +3626,22 @@ def execute_tool(tool_name: str, tool_input: dict, agent_id: str) -> str:
             emp = db.query(Employee).filter(Employee.id == tool_input["employee_id"]).first()
             if not emp:
                 return "Employee not found."
+            # The AI must not be a way around the password policy the REST
+            # endpoints enforce — otherwise "set Aisha's password to 123456"
+            # quietly succeeds where the Settings form refuses.
+            from api.password_policy import validate_password, WeakPassword
+            try:
+                validate_password(tool_input["new_password"], name=emp.name)
+            except WeakPassword as e:
+                return f"That password was rejected: {e} Ask for a stronger one."
             from api.security import hash_password
             emp.password_hash = hash_password(tool_input["new_password"])
+            # Same reasoning as the REST reset: a reset must end the existing
+            # sessions, or a suspected-compromise reset leaves the attacker's
+            # refresh token alive for its full 30 days.
+            emp.refresh_token = None
+            emp.refresh_token_prev = None
+            emp.refresh_token_rotated_at = None
             db.commit()
             return f"Password set for {emp.name} (ID:{emp.id}). They can now log in with name '{emp.name}' and the new password."
 

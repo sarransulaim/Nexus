@@ -173,14 +173,27 @@ def get_recent_errors(
 # ═══════════════════════════════════════════════════════════════
 
 @router.websocket("/stream")
-async def admin_event_stream(websocket: WebSocket, token: str = Query(...)):
+async def admin_event_stream(websocket: WebSocket):
     """
     Live event stream for the admin dashboard.
-    Manager auth done via ?token=... since WS can't send headers easily.
+
+    Manager auth travels in the Sec-WebSocket-Protocol header (a token in the
+    query string is logged by every proxy in the path); ?token= still works but
+    is deprecated and warned about.
 
     Client sends "ping" periodically, server replies with "pong".
     Server streams every event in real time.
     """
+    from api.security import ws_token_from, WS_AUTH_SUBPROTOCOL
+    token, from_query = ws_token_from(websocket)
+    accept_subprotocol = None if from_query else WS_AUTH_SUBPROTOCOL
+    if from_query and token:
+        log.warning("Admin stream authenticated via ?token= — deprecated; "
+                    "offer the '%s' subprotocol instead.", WS_AUTH_SUBPROTOCOL)
+    if not token:
+        await websocket.close(code=4001)
+        return
+
     # Validate token + role before accepting
     try:
         payload = _decode_token(token)
@@ -207,7 +220,7 @@ async def admin_event_stream(websocket: WebSocket, token: str = Query(...)):
     finally:
         db.close()
 
-    await websocket.accept()
+    await websocket.accept(subprotocol=accept_subprotocol)
     q = event_bus.subscribe()
 
     log.info(f"Admin stream connected for {emp.name} (manager)")

@@ -11,6 +11,7 @@ Changes from v2:
 
 from fastapi import APIRouter, Depends, HTTPException, status, Request
 from pydantic import BaseModel
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from datetime import datetime, timezone
 
@@ -18,14 +19,29 @@ from database.core import get_db
 from database.models import Employee, Company, AuditLog
 from api.security import (
     hash_password, verify_password,
+    hash_refresh_token, verify_refresh_token,
     create_access_token, create_refresh_token,
     decode_token, get_current_user,
 )
+from api.password_policy import validate_password, WeakPassword
 from api.rate_limit import limiter
 
 router = APIRouter()
 
 DEFAULT_COMPANY_ID = 1  # Set on bootstrap — changes when multi-tenant UI is added
+
+# How long a just-replaced refresh token still works. Covers a retried request
+# or two tabs refreshing at once; short enough that a copied token replayed
+# later is unambiguous.
+REFRESH_GRACE_SECONDS = 60
+
+
+def _enforce_password(password: str, name: str | None = None) -> None:
+    """Apply the shared policy, surfacing the reason as a 400."""
+    try:
+        validate_password(password, name=name)
+    except WeakPassword as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 # ── Schemas ───────────────────────────────────────────────────
@@ -61,6 +77,8 @@ def setup_manager(request: Request, payload: SetupRequest, db: Session = Depends
     existing = db.query(Employee).filter(Employee.system_role == "manager").first()
     if existing:
         raise HTTPException(status_code=400, detail="Manager account already exists.")
+
+    _enforce_password(payload.password, payload.name)
 
     # Ensure company exists
     company = db.query(Company).filter(Company.id == DEFAULT_COMPANY_ID).first()
@@ -101,10 +119,29 @@ def login(request: Request, payload: LoginRequest, db: Session = Depends(get_db)
     Rate limited to prevent brute force.
     Returns access token (8hrs) + refresh token (30 days).
     """
-    employee = db.query(Employee).filter(
-        Employee.name.ilike(payload.name.strip()),
+    # `ilike` treats the SUBMITTED NAME as a SQL LIKE pattern, so "%" matched
+    # every employee and "_" matched any single character — a login form that
+    # accepts wildcards. Combined with .first() (no ORDER BY) it also meant an
+    # attacker could probe which names exist by watching which patterns got as
+    # far as the password check. Exact, case-insensitive comparison instead.
+    typed = payload.name.strip()
+    matches = db.query(Employee).filter(
+        func.lower(Employee.name) == typed.lower(),
         Employee.is_active == True,
-    ).first()
+    ).all()
+
+    # Names aren't unique. .first() on an ambiguous match silently picked an
+    # arbitrary row — which already bit us live: a duplicate "Mr Kurbi" account
+    # meant logging in with the manager's credentials landed in the EMPLOYEE
+    # account. Refusing is the only safe answer; a coin flip about who you are
+    # is worse than a failed login.
+    if len(matches) > 1:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="That name matches more than one account. Ask your manager to make it unique.",
+        )
+
+    employee = matches[0] if matches else None
 
     if not employee or not employee.password_hash:
         raise HTTPException(
@@ -123,8 +160,10 @@ def login(request: Request, payload: LoginRequest, db: Session = Depends(get_db)
     access_token  = create_access_token(employee.id, employee.system_role, employee.name)
     refresh_token = create_refresh_token(employee.id)
 
-    # Store bcrypt hash — so logout invalidates the token
-    employee.refresh_token = hash_password(refresh_token)
+    # Store only a hash — so logout invalidates the token
+    employee.refresh_token = hash_refresh_token(refresh_token)
+    employee.refresh_token_prev = None
+    employee.refresh_token_rotated_at = None
 
     # Audit log
     db.add(AuditLog(
@@ -176,11 +215,64 @@ def refresh_token_endpoint(request: Request, payload: RefreshRequest, db: Sessio
     if not employee.refresh_token:
         raise HTTPException(status_code=401, detail="Session expired. Please log in again.")
 
-    if not verify_password(payload.refresh_token, employee.refresh_token):
+    if not verify_refresh_token(payload.refresh_token, employee.refresh_token):
+        # Not the current token. If it's the one we JUST replaced, decide
+        # between a harmless race and an actual theft.
+        if verify_refresh_token(payload.refresh_token, employee.refresh_token_prev):
+            rotated = employee.refresh_token_rotated_at
+            if rotated is not None and rotated.tzinfo is None:
+                rotated = rotated.replace(tzinfo=timezone.utc)
+            within_grace = (
+                rotated is not None
+                and (datetime.now(timezone.utc) - rotated).total_seconds() <= REFRESH_GRACE_SECONDS
+            )
+            if within_grace:
+                # A retried request or a second tab racing the same refresh.
+                # Hand out an access token but do NOT rotate again.
+                return {
+                    "access_token": create_access_token(
+                        employee.id, employee.system_role, employee.name
+                    ),
+                    "token_type": "bearer",
+                }
+
+            # Outside the grace window, a superseded token means two parties
+            # hold refresh material for this account — the legitimate client
+            # rotated long ago, so whoever kept the old one copied it. Kill
+            # the whole session rather than guess which one is the owner.
+            employee.refresh_token = None
+            employee.refresh_token_prev = None
+            employee.refresh_token_rotated_at = None
+            db.add(AuditLog(
+                company_id=employee.company_id,
+                actor_id=employee.id,
+                action="refresh_token_reuse_detected",
+                entity_type="employee",
+                entity_id=employee.id,
+            ))
+            db.commit()
+            raise HTTPException(
+                status_code=401,
+                detail="Session ended for security reasons. Please log in again.",
+            )
+
         raise HTTPException(status_code=401, detail="Refresh token revoked.")
 
+    # Rotate: a refresh token is single-use. Without this, one captured token
+    # stayed valid for its full 30 days and nothing about the account's
+    # behaviour would ever reveal that it had been copied.
+    new_refresh_token = create_refresh_token(employee.id)
+    employee.refresh_token_prev       = employee.refresh_token
+    employee.refresh_token            = hash_refresh_token(new_refresh_token)
+    employee.refresh_token_rotated_at = datetime.now(timezone.utc)
+    db.commit()
+
     new_access_token = create_access_token(employee.id, employee.system_role, employee.name)
-    return {"access_token": new_access_token, "token_type": "bearer"}
+    return {
+        "access_token":  new_access_token,
+        "refresh_token": new_refresh_token,
+        "token_type":    "bearer",
+    }
 
 
 # ── POST /auth/logout ────────────────────────────────────────
@@ -188,6 +280,8 @@ def refresh_token_endpoint(request: Request, payload: RefreshRequest, db: Sessio
 @router.post("/logout")
 def logout(current_user: Employee = Depends(get_current_user), db: Session = Depends(get_db)):
     current_user.refresh_token = None
+    current_user.refresh_token_prev = None
+    current_user.refresh_token_rotated_at = None
     db.add(AuditLog(
         company_id=current_user.company_id,
         actor_id=current_user.id,
@@ -241,8 +335,13 @@ def create_employee(
     if current_user.system_role != "manager":
         raise HTTPException(status_code=403, detail="Manager access required.")
 
+    _enforce_password(payload.password, payload.name)
+
+    # Exact case-insensitive match, not a LIKE pattern: a name containing "%"
+    # would otherwise collide with everything and this duplicate check is the
+    # thing keeping login unambiguous.
     existing = db.query(Employee).filter(
-        Employee.name.ilike(payload.name.strip()),
+        func.lower(Employee.name) == payload.name.strip().lower(),
         Employee.company_id == current_user.company_id,
     ).first()
     if existing:
@@ -302,11 +401,15 @@ def set_employee_password(
     if not emp:
         raise HTTPException(status_code=404, detail="Employee not found.")
 
+    _enforce_password(payload.new_password, emp.name)
+
     emp.password_hash = hash_password(payload.new_password)
     # Resetting a password must END that person's existing sessions — otherwise
     # a reset prompted by a suspected compromise leaves the attacker's stored
     # refresh token working for its full 30 days.
     emp.refresh_token = None
+    emp.refresh_token_prev = None
+    emp.refresh_token_rotated_at = None
     db.add(AuditLog(
         company_id=current_user.company_id,
         actor_id=current_user.id,
@@ -333,10 +436,14 @@ def change_password(
     if not verify_password(payload.current_password, current_user.password_hash or ""):
         raise HTTPException(status_code=401, detail="Current password is incorrect.")
 
+    _enforce_password(payload.new_password, current_user.name)
+
     current_user.password_hash = hash_password(payload.new_password)
     # Changing your password revokes every other session (the classic reason
     # people change it is that they think someone else has access).
     current_user.refresh_token = None
+    current_user.refresh_token_prev = None
+    current_user.refresh_token_rotated_at = None
     db.add(AuditLog(
         company_id=current_user.company_id,
         actor_id=current_user.id,

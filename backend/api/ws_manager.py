@@ -38,8 +38,11 @@ class ConnectionManager:
         self._managers: Set[int] = set()                # connected employee_ids who are managers
         self._lock = threading.Lock()   # guards registries only; never held across an await
 
-    async def connect(self, websocket: WebSocket, employee_id: int, is_manager: bool = False):
-        await websocket.accept()
+    async def connect(self, websocket: WebSocket, employee_id: int, is_manager: bool = False,
+                      subprotocol: str | None = None):
+        # `subprotocol` must echo one the client offered, or the browser fails
+        # the handshake — it's how subprotocol-based auth is acknowledged.
+        await websocket.accept(subprotocol=subprotocol)
         with self._lock:
             old = self._connections.get(employee_id)
             self._connections[employee_id] = websocket

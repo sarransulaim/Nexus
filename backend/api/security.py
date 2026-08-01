@@ -7,6 +7,7 @@ This file handles two things:
 """
 
 import os
+import secrets
 import jwt
 from datetime import datetime, timedelta, timezone
 from passlib.context import CryptContext
@@ -82,9 +83,50 @@ def create_refresh_token(employee_id: int) -> str:
     payload = {
         "sub": str(employee_id),
         "exp": datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS),
-        "type": "refresh"
+        "type": "refresh",
+        # A JWT is a pure function of its claims, so two tokens minted for the
+        # same user in the same second used to come out byte-identical —
+        # "rotating" one returned the caller's existing token unchanged. A
+        # random jti makes every issued token distinct.
+        "jti": secrets.token_urlsafe(16),
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+
+# ---------------------------------------------------------------------------
+# REFRESH-TOKEN STORAGE
+# ---------------------------------------------------------------------------
+# Refresh tokens were stored as bcrypt hashes, reusing the password helpers.
+# bcrypt silently TRUNCATES its input at 72 bytes, and the first 72 bytes of a
+# refresh JWT are the header plus the opening of the payload — identical for
+# every token belonging to the same user. The stored hash therefore proved
+# only "some refresh token for this user", never WHICH one, so a superseded
+# token kept verifying against its replacement's hash and revocation-by-
+# rotation could not work at all.
+#
+# A refresh token is 143 bytes of high-entropy, server-generated material, not
+# a human-chosen password: it needs no salt and no key stretching, so a plain
+# SHA-256 over the WHOLE token is both correct and free of the length limit.
+def hash_refresh_token(token: str) -> str:
+    import hashlib
+    return "sha256$" + hashlib.sha256(token.encode()).hexdigest()
+
+
+def verify_refresh_token(token: str, stored: str | None) -> bool:
+    """Constant-time check against a stored refresh-token hash.
+
+    Falls back to bcrypt for rows written before the switch, so existing
+    sessions keep working and simply upgrade on their next rotation.
+    """
+    if not stored:
+        return False
+    if stored.startswith("sha256$"):
+        import hmac as _hmac
+        return _hmac.compare_digest(stored, hash_refresh_token(token))
+    try:
+        return pwd_context.verify(token, stored)   # legacy bcrypt row
+    except Exception:
+        return False
 
 # ---------------------------------------------------------------------------
 # JWT TOKEN VERIFICATION
@@ -155,6 +197,32 @@ def get_current_user(
             detail="User not found or account deactivated."
         )
     return employee
+
+# The subprotocol name the client offers alongside its token. `accept()` must
+# echo exactly one of the offered protocols back, so the token rides as a
+# second protocol value and this is what we select.
+WS_AUTH_SUBPROTOCOL = "nexus-auth"
+
+
+def ws_token_from(websocket) -> tuple[str | None, bool]:
+    """Pull a WebSocket's bearer token, preferring the Sec-WebSocket-Protocol
+    header over the query string.
+
+    A token in the URL ends up in reverse-proxy access logs, browser history,
+    and any Referer sent by a page on the same origin — none of which are
+    places an 8-hour credential should live. Browsers won't let you set headers
+    on a WebSocket handshake, but they DO let you name subprotocols, which are
+    sent as a header and never logged as part of the URL.
+
+    Returns (token, used_query_string) so the caller can warn about the
+    deprecated path.
+    """
+    offered = websocket.headers.get("sec-websocket-protocol", "")
+    for part in (p.strip() for p in offered.split(",")):
+        if part and part != WS_AUTH_SUBPROTOCOL:
+            return part, False
+    return websocket.query_params.get("token"), True
+
 
 def internal_token() -> str:
     """Shared secret for in-process callers (the Slack bot -> /internal/sync).
