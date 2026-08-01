@@ -45,7 +45,15 @@ echo ""
 # ---------------------------------------------------------------------------
 if [ ! -f .env ]; then
   echo "📝 Creating .env file..."
-  cat > .env << 'EOF'
+  # Secrets are GENERATED, never templated. This file used to ship a literal
+  # JWT_SECRET, so every install that didn't change it shared one signing key
+  # published in the repo — anyone could mint a valid manager token for it.
+  # (security.py refuses to start on that value now, but a placeholder people
+  # are told to replace is a placeholder people forget to replace.)
+  GEN_JWT_SECRET=$(python -c "import secrets; print(secrets.token_urlsafe(48))")
+  GEN_SETUP_SECRET=$(python -c "import secrets; print(secrets.token_urlsafe(24))")
+  GEN_TOKEN_KEY=$(python -c "import secrets; print(secrets.token_urlsafe(48))")
+  cat > .env << EOF
 # PostgreSQL connection string
 DATABASE_URL=postgresql://postgres:postgres@localhost:5432/nexus_core
 
@@ -55,10 +63,18 @@ GEMINI_API_KEY=your_gemini_api_key_here
 # Claude API Key (for orchestrator — Step 4 of our build)
 CLAUDE_API_KEY=your_claude_api_key_here
 
-# JWT Secret (change this to a long random string in production)
-JWT_SECRET=nexus_super_secret_change_this_in_production
+# Signing key for auth tokens. Generated per-install — never share or commit.
+JWT_SECRET=${GEN_JWT_SECRET}
+
+# One-time secret required by /auth/setup to create the first manager.
+SETUP_SECRET=${GEN_SETUP_SECRET}
+
+# Credential-encryption key (MCP + Google tokens at rest). Kept separate from
+# JWT_SECRET so rotating the signing key never bricks stored credentials.
+# If you change this, run:  python -m api.token_crypto rotate
+NEXUS_TOKEN_KEY=${GEN_TOKEN_KEY}
 EOF
-  echo "✅ .env file created — update your API keys inside it."
+  echo "✅ .env created with freshly generated secrets — add your API keys inside it."
 else
   echo "⚠️  .env already exists — skipping. Make sure DATABASE_URL is set correctly."
 fi

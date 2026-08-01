@@ -580,6 +580,33 @@ Run: `venv\Scripts\python.exe -m pytest tests/ -q`. (`pytest` is in `requirement
 
 ---
 
+## 20a. Secrets & Key-Rotation Runbook
+
+Three independent secrets. They are deliberately separate so rotating one never forces the others.
+
+| Env var | Protects | Rotating it costs |
+|---|---|---|
+| `JWT_SECRET` | Signs access + refresh tokens | Everyone is logged out (tokens no longer verify). No data loss. |
+| `SETUP_SECRET` | Guards `/auth/setup`, the one-time first-manager bootstrap | Nothing — it's only used before the first manager exists. |
+| `NEXUS_TOKEN_KEY` | **Encrypts stored credentials at rest** (MCP tokens, Google OAuth) | Requires re-encryption, see below, or every integration disconnects. |
+
+`setup_postgres.sh` **generates** all three on a fresh install. It used to write a literal `JWT_SECRET=nexus_super_secret_change_this_in_production`, so every install that didn't change it shared one signing key published in the repo — anyone could mint a valid manager token. `security.py` now refuses to start on that value, but a placeholder people are told to replace is a placeholder people forget to replace.
+
+**Rotating `JWT_SECRET`** — set the new value, restart, done. Everyone re-logs in. Stored credentials are unaffected *because* they're encrypted under `NEXUS_TOKEN_KEY`; that separation is the whole point of having two keys.
+
+**Rotating `NEXUS_TOKEN_KEY`** — the one that needs care, because the old key is what opens existing rows:
+
+1. Keep the old value reachable. `token_crypto` decrypts with **any** key it knows (`NEXUS_TOKEN_KEY`, then `JWT_SECRET`), and with both the HKDF-v2 and the legacy SHA-256 derivations — so rows written under any of those still open.
+2. Set the new `NEXUS_TOKEN_KEY`.
+3. Run `python -m api.token_crypto rotate` **before** removing access to the old key. It walks every `MCPConnection` (`auth_token_enc`, `refresh_token_enc`, `oauth_client_secret_enc`) and `OAuthToken` (`access_token`) row and re-encrypts under the new primary key. Safe to re-run; it reports `{migrated, failed, empty}`.
+4. A row that won't decrypt is **reported and left alone**, never blanked — blanking silently disconnects an integration and looks like success. Reconnect that integration through the UI instead.
+
+**Key derivation (v2, 2026-08-01).** Keys were derived with a bare `sha256(secret)`: no domain separation (the same secret used anywhere else derives the same bytes) and no KDF (a hash is not a key-derivation function, so a weak `NEXUS_TOKEN_KEY` had nothing between a guess and the plaintext). v2 uses **HKDF-SHA256** with a fixed salt and version-bound `info`. Legacy derivations remain **decrypt-only** so nothing already stored is lost. The hardcoded `"nexus_change_this_in_production"` fallback key is **gone** — it was last in the key list so it never encrypted anything, but a default key committed to a public repo should not be loaded, and anything it *had* encrypted was readable by anyone who could read the source. With no key configured at all, `token_crypto` now **raises** instead of falling back: silently encrypting under a known key looks identical to encrypting properly.
+
+Verified on the real database before shipping: all stored credentials decrypted under the new module, then migrated to v2 and re-checked.
+
+---
+
 ## 21. How to Keep This Manual Updated
 
 **This file must be updated in the same change as any code change.** Checklist when you touch the code:
