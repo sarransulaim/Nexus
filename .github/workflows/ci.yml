@@ -64,7 +64,12 @@ jobs:
       # diagnoses. On failure, post the actual failing tests as a commit
       # comment, which is readable by anyone who can see the repo.
       - name: Report failing tests on the commit
-        if: failure()
+        # Only when the tests themselves ran and failed — an infrastructure
+        # failure (the Postgres service container not starting, say) leaves no
+        # JUnit file, and a reporter that fails in that case just adds a second
+        # red step that explains nothing.
+        if: failure() && hashFiles('backend/junit.xml') != ''
+        continue-on-error: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
