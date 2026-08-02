@@ -18,12 +18,8 @@ from fastapi.routing import APIRoute, APIWebSocketRoute
 
 
 # These checks take the app from the `client` fixture rather than importing
-# `main` themselves. Importing it here inspected whatever module object
-# happened to exist at that moment — under CI that was a partially-initialised
-# `main` whose routers had not all been included yet, so the checks reported
-# real routes as missing (7 routes in one test, 31 in the next as the import
-# progressed). The TestClient holds the app that is actually being served, so
-# there is exactly one answer to "which app?".
+# `main` themselves, so there is one unambiguous answer to "which app?" and no
+# import ordering to get wrong.
 
 
 # Dependencies that establish an authenticated caller.
@@ -63,20 +59,69 @@ def _auth_dependencies_of(dependant, seen=None) -> set:
     return found
 
 
+def _names_of(dependency_list) -> set:
+    """Callable names from a list of Depends() markers."""
+    out = set()
+    for dep in dependency_list or []:
+        call = getattr(dep, "dependency", None)
+        if call is not None:
+            out.add(getattr(call, "__name__", str(call)))
+    return out
+
+
+def _walk(node, prefix="", inherited=frozenset()):
+    """Yield (route, full_path, inherited_dependency_names) for every route.
+
+    Has to recurse, and that is not a detail. FastAPI 0.141 stopped flattening
+    include_router() into app.routes and now nests each one behind an
+    _IncludedRouter holding `original_router` (relative paths) and
+    `include_context` (the prefix, plus any dependencies applied at include
+    time). A flat `for route in app.routes` sees 7 of this app's ~74 routes on
+    that version — and would have reported "every route is authenticated"
+    while inspecting almost none of them. Written against the shape rather
+    than the version so it survives the next change.
+    """
+    context = getattr(node, "include_context", None)
+    if context is not None:
+        sub = getattr(node, "original_router", None)
+        if sub is not None:
+            yield from _walk(
+                sub,
+                prefix + (getattr(context, "prefix", "") or ""),
+                inherited | _names_of(getattr(context, "dependencies", [])),
+            )
+        return
+
+    if isinstance(node, (APIRoute, APIWebSocketRoute)):
+        yield node, prefix + node.path, inherited
+        return
+
+    for route in getattr(node, "routes", []):
+        if route is node:
+            continue
+        yield from _walk(route, prefix, inherited)
+
+
 def _http_routes(app):
-    for route in app.routes:
+    for route, path, inherited in _walk(app):
         if isinstance(route, APIRoute):
             for method in sorted(route.methods - {"HEAD", "OPTIONS"}):
-                yield method, route.path, route
+                yield method, path, route, inherited
+
+
+def _websocket_paths(app):
+    return {path for route, path, _ in _walk(app) if isinstance(route, APIWebSocketRoute)}
 
 
 # ── invariant 1: no route is accidentally public ──────────────────
 def test_every_route_requires_auth_or_is_explicitly_public(client):
     unprotected = []
-    for method, path, route in _http_routes(client.app):
+    for method, path, route, inherited in _http_routes(client.app):
         if (method, path) in PUBLIC_ROUTES:
             continue
-        if not (_auth_dependencies_of(route.dependant) & _AUTH_DEPENDENCIES):
+        # Auth can come from the route itself or from dependencies applied
+        # when its router was included.
+        if not ((_auth_dependencies_of(route.dependant) | inherited) & _AUTH_DEPENDENCIES):
             unprotected.append(f"{method} {path}")
 
     assert not unprotected, (
@@ -90,7 +135,7 @@ def test_every_route_requires_auth_or_is_explicitly_public(client):
 def test_public_allowlist_has_no_stale_entries(client):
     """A route removed or renamed must not leave a permanent hole in the
     allowlist for whatever takes its path later."""
-    live = {(m, p) for m, p, _ in _http_routes(client.app)}
+    live = {(m, p) for m, p, _, _ in _http_routes(client.app)}
     stale = set(PUBLIC_ROUTES) - live
     assert not stale, (
         f"PUBLIC_ROUTES lists routes that no longer exist: {sorted(stale)}. "
@@ -109,14 +154,33 @@ def test_allowlist_is_small_enough_to_review():
 
 
 def test_websockets_are_accounted_for(client):
-    live = {r.path for r in client.app.routes if isinstance(r, APIWebSocketRoute)}
+    live = _websocket_paths(client.app)
     assert live == WEBSOCKET_ROUTES, (
         f"WebSocket routes changed: {live ^ WEBSOCKET_ROUTES}. WS auth is inline "
         f"(see api/security.py::ws_token_from) — confirm the new socket "
         f"authenticates BEFORE accept(), then update this set. "
         f"If sockets appear MISSING rather than added, suspect the app object "
-        f"rather than the routes: {len(client.app.routes)} routes visible in total."
+        f"rather than the routes: {len(_websocket_paths(client.app))} sockets found."
     )
+
+
+def test_the_route_walk_actually_sees_the_whole_app(client):
+    """A coverage guard that inspects nothing passes everything.
+
+    When FastAPI 0.141 nested included routers, a flat walk of app.routes
+    dropped from ~74 routes to 7 — and an auth check over 7 routes still
+    reports success. Pin the floor so shrinkage fails loudly instead of
+    quietly narrowing what is being checked.
+    """
+    seen = list(_http_routes(client.app))
+    assert len(seen) >= 60, (
+        f"the route walk found only {len(seen)} routes — it is no longer "
+        f"traversing the whole app, so every check in this file is inspecting "
+        f"a fraction of it. Fix _walk() before trusting these results."
+    )
+    paths = {p for _, p, _, _ in seen}
+    for expected in ("/api/v1/auth/login", "/api/v1/tasks/", "/api/v1/employees/"):
+        assert expected in paths, f"{expected} not found by the walk"
 
 
 # ── invariant 2: the AI tool tiers hold ───────────────────────────
