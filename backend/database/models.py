@@ -693,6 +693,39 @@ class AgentMemory(Base):
 # AUDIT LOG
 # ═══════════════════════════════════════════════════════════════
 
+class AiSpend(Base):
+    """One row per model API call, with its measured cost.
+
+    Cost was previously emitted to the event bus only — visible on the live
+    circuit board and gone the moment the process restarted. Nothing could
+    answer "what did we spend yesterday", and nothing could STOP a runaway:
+    one account could issue commands until the API bill said otherwise.
+    Persisted so it can be both queried and enforced (see api/spend.py).
+    """
+    __tablename__ = "ai_spend"
+
+    id             = Column(Integer, primary_key=True, index=True)
+    company_id     = Column(Integer, ForeignKey("companies.id", ondelete="CASCADE"), nullable=False, index=True)
+    # Nullable: background jobs (digests, drift alerts) spend money without a
+    # person behind them. They count toward the company total, not a user's.
+    employee_id    = Column(Integer, ForeignKey("employees.id", ondelete="SET NULL"), nullable=True)
+    agent_id       = Column(String(100), nullable=True)
+    model          = Column(String(100), nullable=True)
+    input_tokens   = Column(Integer, default=0)
+    output_tokens  = Column(Integer, default=0)
+    cache_read_tokens  = Column(Integer, default=0)
+    cache_write_tokens = Column(Integer, default=0)
+    cost_usd       = Column(Float, default=0.0)
+    created_at     = Column(DateTime(timezone=True), default=_now, index=True)
+
+    __table_args__ = (
+        # The enforcement query is "spend for this person since midnight" and
+        # "spend for this company since midnight" — both want these composites.
+        Index("ix_spend_company_created", "company_id", "created_at"),
+        Index("ix_spend_employee_created", "employee_id", "created_at"),
+    )
+
+
 class AuditLog(Base):
     __tablename__ = "audit_logs"
 

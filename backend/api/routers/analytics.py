@@ -442,3 +442,21 @@ def get_employee_analytics(
             key=lambda x: x["id"], reverse=True
         )[:20],
     }
+
+
+# ─────────────────────────────────────────────────────────────
+# AI SPEND
+# ─────────────────────────────────────────────────────────────
+@router.get("/ai-spend")
+def ai_spend(days: int = Query(7, ge=1, le=90),
+             current_user: Employee = Depends(require_manager)):
+    """What the AI has cost, by person and in total, plus the active limits.
+
+    Manager-only: it's per-person usage data, and the same reasoning that made
+    /analytics/summary manager-only applies here. Exists because a spending cap
+    nobody can see is a cap that surprises you — when someone is refused for
+    hitting their budget, this is where you check whether the limit is wrong or
+    the usage is.
+    """
+    from api import spend
+    return spend.summary(company_id=current_user.company_id, days=days)

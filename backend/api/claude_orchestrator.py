@@ -1909,6 +1909,12 @@ def _log_usage(agent_id: str, model: str, response):
         from event_bus import emit_cost
         emit_cost(model, u.input_tokens, u.output_tokens, actor=agent_id,
                   cache_read_tokens=cr, cache_write_tokens=cw)
+        # Persist it too. emit_cost only reaches the live circuit board and is
+        # gone on restart, so spend could be watched but never queried or
+        # capped. Recording every call is what makes the budget enforceable.
+        from api.spend import record
+        record(agent_id, model, u.input_tokens, u.output_tokens, cr, cw,
+               company_id=DEFAULT_COMPANY_ID)
     except Exception:
         pass
 
@@ -4399,6 +4405,18 @@ def run_orchestrator(agent_id: str, command: str, extra_context: str = None,
     and nothing persisted (no conversation memory, no preference learning) —
     otherwise injected instructions would stick to the victim's agent forever."""
     start = time.time()
+
+    # Spending ceiling, checked before any paid call. Rate limiting bounds how
+    # MANY requests an account makes, not what they cost — one long agentic
+    # turn with a dozen tool rounds is worth hundreds of trivial ones, so
+    # 30/minute was never a spending limit. Returns the reason as the agent's
+    # reply rather than raising, so the caller (HTTP, Slack, negotiation) shows
+    # a sentence instead of a 500.
+    try:
+        from api.spend import check as _check_budget, BudgetExceeded
+        _check_budget(agent_id, company_id=DEFAULT_COMPANY_ID)
+    except BudgetExceeded as _over:
+        return str(_over)
 
     # PHASE 3: emit agent activation
     try:
