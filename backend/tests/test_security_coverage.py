@@ -16,18 +16,14 @@ is the point: update the allowlist deliberately, in a diff someone reviews.
 import pytest
 from fastapi.routing import APIRoute, APIWebSocketRoute
 
-import main
 
-
-def _app():
-    """Resolve the live app on every call.
-
-    Binding `main.app` at import time means these checks inspect whatever
-    module object existed during collection; anything that reloads `main`
-    afterwards would leave them asserting about a stale app.
-    """
-    import importlib
-    return importlib.import_module("main").app
+# These checks take the app from the `client` fixture rather than importing
+# `main` themselves. Importing it here inspected whatever module object
+# happened to exist at that moment — under CI that was a partially-initialised
+# `main` whose routers had not all been included yet, so the checks reported
+# real routes as missing (7 routes in one test, 31 in the next as the import
+# progressed). The TestClient holds the app that is actually being served, so
+# there is exactly one answer to "which app?".
 
 
 # Dependencies that establish an authenticated caller.
@@ -67,17 +63,17 @@ def _auth_dependencies_of(dependant, seen=None) -> set:
     return found
 
 
-def _http_routes():
-    for route in _app().routes:
+def _http_routes(app):
+    for route in app.routes:
         if isinstance(route, APIRoute):
             for method in sorted(route.methods - {"HEAD", "OPTIONS"}):
                 yield method, route.path, route
 
 
 # ── invariant 1: no route is accidentally public ──────────────────
-def test_every_route_requires_auth_or_is_explicitly_public():
+def test_every_route_requires_auth_or_is_explicitly_public(client):
     unprotected = []
-    for method, path, route in _http_routes():
+    for method, path, route in _http_routes(client.app):
         if (method, path) in PUBLIC_ROUTES:
             continue
         if not (_auth_dependencies_of(route.dependant) & _AUTH_DEPENDENCIES):
@@ -91,10 +87,10 @@ def test_every_route_requires_auth_or_is_explicitly_public():
     )
 
 
-def test_public_allowlist_has_no_stale_entries():
+def test_public_allowlist_has_no_stale_entries(client):
     """A route removed or renamed must not leave a permanent hole in the
     allowlist for whatever takes its path later."""
-    live = {(m, p) for m, p, _ in _http_routes()}
+    live = {(m, p) for m, p, _ in _http_routes(client.app)}
     stale = set(PUBLIC_ROUTES) - live
     assert not stale, (
         f"PUBLIC_ROUTES lists routes that no longer exist: {sorted(stale)}. "
@@ -112,14 +108,14 @@ def test_allowlist_is_small_enough_to_review():
     )
 
 
-def test_websockets_are_accounted_for():
-    live = {r.path for r in _app().routes if isinstance(r, APIWebSocketRoute)}
+def test_websockets_are_accounted_for(client):
+    live = {r.path for r in client.app.routes if isinstance(r, APIWebSocketRoute)}
     assert live == WEBSOCKET_ROUTES, (
         f"WebSocket routes changed: {live ^ WEBSOCKET_ROUTES}. WS auth is inline "
         f"(see api/security.py::ws_token_from) — confirm the new socket "
         f"authenticates BEFORE accept(), then update this set. "
         f"If sockets appear MISSING rather than added, suspect the app object "
-        f"rather than the routes: {len(_app().routes)} routes visible in total."
+        f"rather than the routes: {len(client.app.routes)} routes visible in total."
     )
 
 
