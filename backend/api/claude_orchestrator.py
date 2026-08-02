@@ -4484,6 +4484,11 @@ def run_orchestrator(agent_id: str, command: str, extra_context: str = None,
     # tier — MCP tools run server-side, OUTSIDE the execute_tool allow-list, so an
     # @mention in a public channel could otherwise reach the company's GitHub/DB
     # connectors. Manager + employees (authenticated, private DM/web) still get MCP.
+    # Bound before the branch: the team tier skips the else-block entirely, and
+    # anything reading _own later would otherwise raise a NameError that the
+    # surrounding best-effort try/except would swallow — leaving the shared
+    # channel agent silently missing context rather than visibly broken.
+    _own = None
     if is_team:
         mcp_servers = []
     else:
@@ -4499,6 +4504,15 @@ def run_orchestrator(agent_id: str, command: str, extra_context: str = None,
         # Same rule as the public-channel Team tier: a run driven by someone
         # else's text never gets this person's connectors.
         mcp_servers = [] if negotiation else _load_mcp_servers(_own)
+    # The agent had nothing in its prompt about integrations at all, so asked
+    # what it connects to it improvised from the tools it could see, answered
+    # "three", and told users apps in our own catalogue weren't supported.
+    try:
+        from api.connector_catalog import static_capability_note
+        static_prompt += static_capability_note()
+    except Exception:
+        pass
+
     if mcp_servers:
         tools = list(tools) + [{"type": "mcp_toolset", "mcp_server_name": s["name"]} for s in mcp_servers]
         # MCP tool results are produced by Anthropic's server-side connector and
@@ -4530,6 +4544,11 @@ def run_orchestrator(agent_id: str, command: str, extra_context: str = None,
         snapshot = assemble_context_snapshot(agent_id, is_employee, emp_id if is_employee else None)
         if snapshot:
             dynamic_prompt += snapshot
+        from api.connector_catalog import current_connections_note
+        dynamic_prompt += current_connections_note(
+            company_id=DEFAULT_COMPANY_ID,
+            employee_id=emp_id if is_employee else _own,
+        )
     except Exception:
         pass   # best-effort — never block the orchestrator
 
