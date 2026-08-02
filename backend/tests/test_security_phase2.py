@@ -265,3 +265,34 @@ def test_replaying_a_rotated_token_later_kills_the_session(client, rotating_user
     # legitimate client's current token usable either
     after = client.post("/api/v1/auth/refresh", json={"refresh_token": new_token})
     assert after.status_code == 401, "session was not revoked after reuse was detected"
+
+
+# ── retiring the deprecated query-string WS token ─────────────────
+def test_query_string_ws_token_still_works_by_default(client, manager):
+    """It is deprecated, not gone. Production logs showed most WebSocket
+    handshakes still arriving this way (browser tabs open since before the
+    subprotocol shipped), so switching it off is a decision about live users,
+    not about code."""
+    with client.websocket_connect(f"/api/v1/ws/{manager['id']}?token={manager['tok']}") as ws:
+        assert ws is not None
+
+
+def test_query_string_ws_token_can_be_switched_off(client, manager, monkeypatch):
+    """NEXUS_ALLOW_WS_QUERY_TOKEN=0 retires it as a config flip, once the
+    deprecation warnings stop appearing in the logs."""
+    from starlette.websockets import WebSocketDisconnect
+    import api.security as sec
+    monkeypatch.setattr(sec, "ALLOW_WS_QUERY_TOKEN", False)
+
+    with pytest.raises(WebSocketDisconnect):
+        with client.websocket_connect(
+            f"/api/v1/ws/{manager['id']}?token={manager['tok']}"
+        ) as ws:
+            ws.receive_text()
+
+    # the supported path must keep working when the fallback is off
+    with client.websocket_connect(
+        f"/api/v1/ws/{manager['id']}",
+        subprotocols=[WS_AUTH_SUBPROTOCOL, manager["tok"]],
+    ) as ws:
+        assert ws is not None

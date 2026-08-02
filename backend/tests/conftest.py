@@ -63,3 +63,42 @@ def mgr_headers(people):
 @pytest.fixture()
 def emp_headers(people):
     return {"Authorization": f"Bearer {people['emp_tok']}"}
+
+
+@pytest.fixture(autouse=True)
+def _isolate_login_throttle():
+    """Clear recorded sign-in failures between tests.
+
+    Every test shares one TestClient address, so tests that deliberately fail
+    logins (wildcards, wrong passwords, the throttle's own tests) otherwise
+    accumulate against each other and trip the guard for whatever runs next.
+    That is the guard working correctly on data that is an artefact of the
+    suite, so isolate the tests rather than loosen the control.
+    """
+    from database.models import LoginAttempt
+    from api.rate_limit import limiter
+
+    def _reset_in_process_limiter():
+        # slowapi's counters are per-address and in-memory, and the whole suite
+        # shares one client address. Once the suite makes more than the
+        # configured logins-per-window in total, every later login test gets a
+        # 429 from the limiter rather than the status it is asserting about.
+        try:
+            limiter.reset()
+        except Exception:
+            pass
+
+    def _purge():
+        s = SessionLocal()
+        try:
+            s.query(LoginAttempt).delete()
+            s.commit()
+        except Exception:
+            s.rollback()
+        finally:
+            s.close()
+    _purge()
+    _reset_in_process_limiter()
+    yield
+    _purge()
+    _reset_in_process_limiter()

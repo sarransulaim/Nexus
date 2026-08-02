@@ -97,6 +97,19 @@ async def proactive_agent_loop():
     await asyncio.sleep(10)
     while True:
         await asyncio.sleep(3600)
+
+        # Retention: failed sign-in rows are only useful for the current
+        # throttle window plus a little history for incident review. Without a
+        # sweep the table grows forever, and a login-attempt table is exactly
+        # the sort of thing that quietly becomes the largest in the database.
+        try:
+            from api.login_guard import purge_old
+            removed = purge_old(days=7)
+            if removed:
+                print(f"🧹 purged {removed} login attempts older than 7 days")
+        except Exception:
+            pass
+
         db = SessionLocal()
         try:
             active_tasks = db.query(Task).filter(Task.is_completed == False).count()

@@ -24,7 +24,8 @@ from api.security import (
     decode_token, get_current_user,
 )
 from api.password_policy import validate_password, WeakPassword
-from api.rate_limit import limiter
+from api.rate_limit import limiter, client_ip
+from api import login_guard
 
 router = APIRouter()
 
@@ -125,6 +126,17 @@ def login(request: Request, payload: LoginRequest, db: Session = Depends(get_db)
     # attacker could probe which names exist by watching which patterns got as
     # far as the password check. Exact, case-insensitive comparison instead.
     typed = payload.name.strip()
+
+    # Account-aware throttle, backed by the database. The @limiter decorator
+    # above is keyed on the caller's address only, so rotating addresses walks
+    # straight past it; and its counters live in the worker, so a restart
+    # forgets them. See api/login_guard.py.
+    caller_ip = client_ip(request)
+    try:
+        login_guard.check(typed, caller_ip)
+    except login_guard.TooManyAttempts as e:
+        raise HTTPException(status_code=429, detail=str(e))
+
     matches = db.query(Employee).filter(
         func.lower(Employee.name) == typed.lower(),
         Employee.is_active == True,
@@ -144,16 +156,24 @@ def login(request: Request, payload: LoginRequest, db: Session = Depends(get_db)
     employee = matches[0] if matches else None
 
     if not employee or not employee.password_hash:
+        # Counted even though no such account exists: a spray across guessed
+        # names is exactly what this is meant to see.
+        login_guard.record_failure(typed, caller_ip)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid name or password.",
         )
 
     if not verify_password(payload.password, employee.password_hash):
+        login_guard.record_failure(typed, caller_ip)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid name or password.",
         )
+
+    # A run of typos followed by a real sign-in must not strand the person
+    # later in the same window.
+    login_guard.clear(typed)
 
     employee.last_login = datetime.now(timezone.utc)
 

@@ -204,6 +204,15 @@ def get_current_user(
 WS_AUTH_SUBPROTOCOL = "nexus-auth"
 
 
+# The query-string fallback is deprecated but still accepted, because turning
+# it off is a decision about live users rather than about code: a browser tab
+# opened before the subprotocol shipped is still running the old bundle, and
+# production logs showed most WebSocket handshakes still arriving that way.
+# Set NEXUS_ALLOW_WS_QUERY_TOKEN=0 to switch it off once the deprecation
+# warnings stop appearing — a config flip, not a deploy.
+ALLOW_WS_QUERY_TOKEN = os.getenv("NEXUS_ALLOW_WS_QUERY_TOKEN", "1") != "0"
+
+
 def ws_token_from(websocket) -> tuple[str | None, bool]:
     """Pull a WebSocket's bearer token, preferring the Sec-WebSocket-Protocol
     header over the query string.
@@ -221,6 +230,8 @@ def ws_token_from(websocket) -> tuple[str | None, bool]:
     for part in (p.strip() for p in offered.split(",")):
         if part and part != WS_AUTH_SUBPROTOCOL:
             return part, False
+    if not ALLOW_WS_QUERY_TOKEN:
+        return None, True      # refuse rather than read it from the URL
     return websocket.query_params.get("token"), True
 
 

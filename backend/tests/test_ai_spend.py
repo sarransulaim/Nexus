@@ -119,8 +119,11 @@ def test_personal_cap_does_not_block_background_work(clean_spend, actors, monkey
     monkeypatch.setattr(spend_mod, "DAILY_USD_PER_USER", 0.01)
     monkeypatch.setattr(spend_mod, "DAILY_USD_PER_COMPANY", 1000.0)
     _add_spend(actors["emp_id"], 5.0)
-    spend_mod.check("Team_C123")     # background agent — company cap only
-    spend_mod.check("Manager_1")
+    # The shared-channel agent has no person behind it, so a colleague's
+    # exhausted budget must not silence it. ("Manager_1" is NOT in this list:
+    # it resolves to a real person and is deliberately subject to the personal
+    # cap — see test_manager_is_subject_to_the_personal_cap.)
+    spend_mod.check("Team_C123")
 
 
 def test_company_cap_stops_everyone_including_background(clean_spend, actors, monkeypatch):

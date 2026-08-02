@@ -693,6 +693,34 @@ class AgentMemory(Base):
 # AUDIT LOG
 # ═══════════════════════════════════════════════════════════════
 
+class LoginAttempt(Base):
+    """Failed sign-in attempts, kept in the database rather than in memory.
+
+    Two problems with the in-process rate limiter this backs up:
+      * It is keyed only on IP. An attacker who rotates addresses — trivial
+        from any cloud — never hits the limit, so the control did nothing
+        against the attack it exists to stop. Adding Redis would not have
+        fixed that; it is a design gap, not a storage gap.
+      * Its counters live in the worker and reset on every restart and deploy.
+
+    Recording attempts here lets the throttle key on the ACCOUNT as well as
+    the address, and survive a restart.
+    """
+    __tablename__ = "login_attempts"
+
+    id         = Column(Integer, primary_key=True, index=True)
+    # Lowercased submitted name. Stored even when no such account exists, so a
+    # spray across many guessed names is still visible.
+    identifier = Column(String(200), nullable=False, index=True)
+    ip_address = Column(String(45), nullable=True, index=True)
+    created_at = Column(DateTime(timezone=True), default=_now, index=True)
+
+    __table_args__ = (
+        Index("ix_login_attempt_identifier_created", "identifier", "created_at"),
+        Index("ix_login_attempt_ip_created", "ip_address", "created_at"),
+    )
+
+
 class AiSpend(Base):
     """One row per model API call, with its measured cost.
 
