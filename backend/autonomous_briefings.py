@@ -169,27 +169,24 @@ def _compose_employee_briefing(employee: Employee, db) -> str | None:
     today = date.today()
     week_end = today + timedelta(days=7)
 
-    # Fresh task pull — this employee's open tasks
-    open_tasks = db.query(Task).filter(
-        Task.owner_id     == employee.id,
-        Task.is_completed == False,
-        Task.company_id   == employee.company_id,
-    ).all()
+    # Work is pulled through the source layer rather than queried directly, so
+    # the same briefing can be built from Jira or GitHub for a company that
+    # never migrates into Nexus. With nothing external connected this resolves
+    # to Nexus's own tables and behaves exactly as it always has.
+    from api.work_sources import collect_open_items, collect_meetings_today
 
+    open_tasks = collect_open_items(db, employee.id, employee.company_id)
+
+    # Partitioned by explicit predicate rather than by excluding membership of
+    # the other lists: WorkItem is a dataclass, so two genuinely different
+    # tasks that happen to share every field compare equal, and `not in` would
+    # silently drop one of them.
     overdue   = [t for t in open_tasks if t.due_date and t.due_date < today]
     due_today = [t for t in open_tasks if t.due_date and t.due_date == today]
     due_week  = [t for t in open_tasks if t.due_date and today < t.due_date <= week_end]
-    # Tasks with a due date further out, or no due date at all
-    later     = [t for t in open_tasks if t not in overdue and t not in due_today and t not in due_week]
+    later     = [t for t in open_tasks if not t.due_date or t.due_date > week_end]
 
-    # Meetings today (via attendee relationship)
-    meetings_today = []
-    try:
-        for m in employee.meetings:
-            if m.scheduled_date == today and (m.status or "scheduled") != "cancelled":
-                meetings_today.append(m)
-    except Exception:
-        pass
+    meetings_today = collect_meetings_today(db, employee.id, employee.company_id)
 
     # Skip ONLY if the person has truly nothing at all
     if not open_tasks and not meetings_today:
@@ -215,8 +212,8 @@ def _compose_employee_briefing(employee: Employee, db) -> str | None:
         lines.append("")
         lines.append(f"📅 Meetings today ({len(meetings_today)}):")
         for m in meetings_today[:5]:
-            when = m.scheduled_time or "time TBD"
-            lines.append(f"  • {m.topic} at {when}")
+            when = m.time_label or "time TBD"
+            lines.append(f"  • {m.title} at {when}")
 
     if due_week:
         lines.append("")
